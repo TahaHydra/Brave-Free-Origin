@@ -20,6 +20,55 @@ Add-Type -AssemblyName System.Drawing
 
 $script:BravePolicyPath = 'HKLM:\Software\Policies\BraveSoftware\Brave'
 
+# ---- Multi-channel support (v1.5) -------------------------------------------
+# Each Brave channel keeps its own policy hive. Default target is Stable.
+# If user picks "All installed channels", every detected install gets the apply.
+$script:Channels = [ordered]@{
+    'Stable'  = @{
+        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave'
+        InstallProbes = @(
+            "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
+            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
+            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
+        )
+    }
+    'Beta'    = @{
+        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave-Beta'
+        InstallProbes = @(
+            "$env:ProgramFiles\BraveSoftware\Brave-Browser-Beta\Application\brave.exe",
+            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser-Beta\Application\brave.exe",
+            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Beta\Application\brave.exe"
+        )
+    }
+    'Nightly' = @{
+        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave-Nightly'
+        InstallProbes = @(
+            "$env:ProgramFiles\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe",
+            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe",
+            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe"
+        )
+    }
+    'Dev'     = @{
+        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave-Dev'
+        InstallProbes = @(
+            "$env:ProgramFiles\BraveSoftware\Brave-Browser-Dev\Application\brave.exe",
+            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser-Dev\Application\brave.exe",
+            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Dev\Application\brave.exe"
+        )
+    }
+}
+$script:TargetChannels = @('Stable')
+
+function Get-DetectedChannels {
+    $found = @()
+    foreach ($name in $script:Channels.Keys) {
+        foreach ($probe in $script:Channels[$name].InstallProbes) {
+            if (Test-Path $probe) { $found += $name; break }
+        }
+    }
+    return $found
+}
+
 #region Policy Data -----------------------------------------------------------
 # Each policy: Name, Type (DWORD/STRING), ApplyValue (what to write when ticked),
 #              Recommended (true = tick by default in "Recommended" preset),
@@ -149,6 +198,60 @@ $script:Services = @(
     @{Name='BraveVPNService';         Description='Brave VPN Service (present only if VPN feature installed).'},
     @{Name='BraveVpnWireguardService';Description='Brave VPN Wireguard Service (present only if VPN feature installed).'}
 )
+
+# ---- Hosts blocklist groups (v1.5) ------------------------------------------
+# DNS-level kill switch via the Windows hosts file. Conservative on purpose -
+# only the two safest groups are pre-ticked. Anything that could break browsing
+# or Brave updates is off by default with a warning label.
+$script:HostsBlocks = @(
+    @{Name='Brave P3A telemetry';     Recommended=$true;  Domains=@('p3a.brave.com','p3a-creative.brave.com','p2a.brave.com','p2a-creative.brave.com');                Description='Privacy-preserving analytics endpoints. Pure telemetry, never user-facing. Safe to block.'},
+    @{Name='Brave Variations';        Recommended=$true;  Domains=@('variations.brave.com','go-updater.brave.com');                                                    Description='Field-trial / experiment config. Safe to block - matches ChromeVariations=2 policy.'},
+    @{Name='Brave Stats ping';        Recommended=$true;  Domains=@('laptop-updates.brave.com');                                                                       Description='Daily/weekly/monthly anonymous usage ping. Safe to block.'},
+    @{Name='Brave Rewards / BAT';     Recommended=$false; Domains=@('rewards.brave.com','grant.rewards.brave.com','creators.brave.com');                               Description='Brave Rewards (BAT) servers. Block ONLY if you do not use Rewards. Will break the feature if you turn it on later.'},
+    @{Name='Brave News CDN';          Recommended=$false; Domains=@('brave-today-cdn.brave.com','brave-today.brave.com');                                              Description='News content CDN. Block ONLY if you have disabled News - unblocking is needed if you ever re-enable it.'},
+    @{Name='Component Updates';       Recommended=$false; Domains=@('componentupdater.brave.com','brave-core-ext.s3.brave.com');                                       Description='WARNING: blocking this stops Widevine/CRX/iOS-style components from updating. Use only if ComponentUpdatesEnabled is also off.'},
+    @{Name='Web Discovery';           Recommended=$false; Domains=@('search.anonymous.brave.com','wdp.brave.com');                                                     Description='Web Discovery Project endpoints. Already covered by BraveWebDiscoveryEnabled policy; only useful if policy is bypassed.'}
+)
+$script:HostsSentinelStart = '# === Brave-Free-Origin START - managed block, do not edit between sentinels ==='
+$script:HostsSentinelEnd   = '# === Brave-Free-Origin END ==='
+$script:HostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
+
+# ---- Search engines (v1.6) -------------------------------------------------
+# Used for the optional "force default search engine via policy" feature.
+# {searchTerms} is the standard Chromium placeholder Brave fills in.
+$script:SearchEngines = [ordered]@{
+    'Brave Search'   = @{ URL='https://search.brave.com/search?q={searchTerms}';     Suggest='https://search.brave.com/api/suggest?q={searchTerms}';                       Keyword='brave';     Home='https://search.brave.com' }
+    'DuckDuckGo'     = @{ URL='https://duckduckgo.com/?q={searchTerms}';             Suggest='https://duckduckgo.com/ac/?q={searchTerms}&type=list';                      Keyword='ddg';       Home='https://duckduckgo.com' }
+    'Startpage'      = @{ URL='https://www.startpage.com/do/search?q={searchTerms}';  Suggest='';                                                                          Keyword='startpage'; Home='https://www.startpage.com' }
+    'Qwant'          = @{ URL='https://www.qwant.com/?q={searchTerms}';               Suggest='https://api.qwant.com/api/suggest?q={searchTerms}';                         Keyword='qwant';     Home='https://www.qwant.com' }
+    'Ecosia'         = @{ URL='https://www.ecosia.org/search?q={searchTerms}';        Suggest='https://ac.ecosia.org/?q={searchTerms}';                                    Keyword='ecosia';    Home='https://www.ecosia.org' }
+    'Mojeek'         = @{ URL='https://www.mojeek.com/search?q={searchTerms}';        Suggest='';                                                                          Keyword='mojeek';    Home='https://www.mojeek.com' }
+    'Kagi (paid)'    = @{ URL='https://kagi.com/search?q={searchTerms}';              Suggest='https://kagi.com/api/autosuggest?q={searchTerms}';                          Keyword='kagi';      Home='https://kagi.com' }
+    'Google'         = @{ URL='https://www.google.com/search?q={searchTerms}';        Suggest='https://www.google.com/complete/search?output=chrome&q={searchTerms}';     Keyword='google';    Home='https://www.google.com' }
+    'Bing'           = @{ URL='https://www.bing.com/search?q={searchTerms}';          Suggest='https://www.bing.com/osjson.aspx?query={searchTerms}';                      Keyword='bing';      Home='https://www.bing.com' }
+    'Yandex'         = @{ URL='https://yandex.com/search/?text={searchTerms}';        Suggest='https://suggest.yandex.com/suggest-ff.cgi?part={searchTerms}';             Keyword='yandex';    Home='https://yandex.com' }
+    'Custom...'      = @{ URL='';                                                     Suggest='';                                                                          Keyword='custom';    Home='';                                IsCustom=$true }
+}
+
+# Destination presets for "new tab" and "startup specific page" dropdowns.
+# Anything '__SEARCH__' resolves at apply-time to the chosen engine's home URL.
+$script:DestinationOptions = [ordered]@{
+    'Blank page (about:blank)'                  = 'about:blank'
+    'Default new tab page (do not override)'    = '__SKIP__'
+    'Match the search engine I picked above'    = '__SEARCH__'
+    'Brave Search homepage'                     = 'https://search.brave.com'
+    'DuckDuckGo homepage'                       = 'https://duckduckgo.com'
+    'Google homepage'                           = 'https://www.google.com'
+    'Custom URL...'                             = '__CUSTOM__'
+}
+
+# Startup behavior modes (RestoreOnStartup policy values).
+$script:StartupModes = [ordered]@{
+    'Open the new tab page'        = @{ Code=5; UsesURL=$false }
+    'Restore my last session'      = @{ Code=1; UsesURL=$false }
+    'Open a blank page'            = @{ Code=4; UsesURL=$true; FixedURL='about:blank' }
+    'Open a specific page or set'  = @{ Code=4; UsesURL=$true; FixedURL=$null }
+}
 #endregion
 
 #region Helpers ---------------------------------------------------------------
@@ -214,6 +317,76 @@ function Test-BraveInstalled {
     return $null
 }
 
+# ---- Hosts file helpers (v1.5) ----------------------------------------------
+function Backup-HostsFile {
+    if (-not (Test-Path $script:HostsFile)) { return $null }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dir = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    $file = Join-Path $dir "hosts-backup-$stamp.bak"
+    Copy-Item $script:HostsFile $file -Force
+    Write-Log "Hosts backup saved: $file" 'OK'
+    return $file
+}
+
+function Get-HostsCurrentDomains {
+    if (-not (Test-Path $script:HostsFile)) { return @() }
+    $lines = Get-Content $script:HostsFile -ErrorAction SilentlyContinue
+    $inBlock = $false
+    $domains = @()
+    foreach ($line in $lines) {
+        if ($line -eq $script:HostsSentinelStart) { $inBlock = $true; continue }
+        if ($line -eq $script:HostsSentinelEnd)   { $inBlock = $false; continue }
+        if ($inBlock -and $line -match '^\s*0\.0\.0\.0\s+(\S+)') {
+            $domains += $Matches[1]
+        }
+    }
+    return $domains
+}
+
+function Set-HostsBlockDomains {
+    param([string[]]$Domains)
+    [void](Backup-HostsFile)
+
+    # Read all lines, strip out our existing sentinel block (if any)
+    $lines = if (Test-Path $script:HostsFile) { Get-Content $script:HostsFile } else { @() }
+    $kept = New-Object System.Collections.ArrayList
+    $skipping = $false
+    foreach ($line in $lines) {
+        if ($line -eq $script:HostsSentinelStart) { $skipping = $true; continue }
+        if ($line -eq $script:HostsSentinelEnd)   { $skipping = $false; continue }
+        if (-not $skipping) { [void]$kept.Add($line) }
+    }
+
+    # Trim trailing blank lines from existing content for tidiness
+    while ($kept.Count -gt 0 -and [string]::IsNullOrWhiteSpace($kept[$kept.Count - 1])) {
+        $kept.RemoveAt($kept.Count - 1)
+    }
+
+    if ($Domains -and $Domains.Count -gt 0) {
+        [void]$kept.Add('')
+        [void]$kept.Add($script:HostsSentinelStart)
+        [void]$kept.Add("# Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by Brave Free Origin. Remove via the GUI.")
+        foreach ($d in ($Domains | Sort-Object -Unique)) {
+            [void]$kept.Add("0.0.0.0 $d")
+        }
+        [void]$kept.Add($script:HostsSentinelEnd)
+    }
+
+    # ASCII encoding - matches what Windows expects for hosts. Some AVs flag UTF-16 hosts.
+    Set-Content -Path $script:HostsFile -Value $kept -Encoding ASCII -Force
+
+    # Flush DNS so the change takes effect immediately for new connections
+    & ipconfig.exe /flushdns | Out-Null
+    Write-Log "Hosts block written: $($Domains.Count) domain(s). DNS cache flushed." 'OK'
+}
+
+function Clear-HostsBlock {
+    Set-HostsBlockDomains -Domains @()
+    Write-Log 'Hosts sentinel block removed.' 'OK'
+}
+# -----------------------------------------------------------------------------
+
 function Get-BraveVersion {
     $exe = Test-BraveInstalled
     if ($exe) {
@@ -225,7 +398,7 @@ function Get-BraveVersion {
 
 #region GUI Build -------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Brave Free Origin v1.4  -  the free answer to Brave Origin's paywalled minimal mode"
+$form.Text = "Brave Free Origin v1.7  -  the free answer to Brave Origin's paywalled minimal mode"
 $form.Size = New-Object System.Drawing.Size(1180, 900)
 $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(1080, 820)
@@ -253,7 +426,16 @@ $script:OriginPolicies = @(
     'BraveWaybackMachineEnabled',
     'BraveWebDiscoveryEnabled',
     'MetricsReportingEnabled',
-    'TorDisabled'
+    'TorDisabled',
+    # Shields / privacy-engine policies - keeping ad-block ON is a *performance* win
+    # (fewer requests, less DOM, less JS). It's also Brave's identity. Origin Mode
+    # and everything that derives from it (Privacy + Boost) now enforces these.
+    'DefaultBraveAdblockSetting',
+    'DefaultBraveFingerprintingV2Setting',
+    'DefaultBraveReferrersSetting',
+    'BraveTrackingQueryParametersFilteringEnabled',
+    'BraveDeAmpEnabled',
+    'BraveDebouncingEnabled'
 )
 $script:PerformancePolicies = @(
     $script:OriginPolicies +
@@ -335,6 +517,13 @@ $script:ProfileRisks = @{
 function Get-PresetPayload {
     param([string]$Preset)
 
+    # Hosts groups: only auto-tick a group when the corresponding feature is
+    # ALSO disabled by policy in this preset. No orphan blocks.
+    $hostsAlwaysSafe   = @('Brave P3A telemetry','Brave Variations','Brave Stats ping','Web Discovery')
+    $hostsRewards      = @('Brave Rewards / BAT')
+    $hostsNews         = @('Brave News CDN')
+    $hostsComponents   = @('Component Updates')
+
     switch ($Preset) {
         'Recommended' {
             return @{
@@ -347,6 +536,7 @@ function Get-PresetPayload {
                 )
                 Tasks    = @($script:ScheduledTasks.Name)
                 Services = @()
+                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews
             }
         }
         'MaxPrivacy' {
@@ -354,6 +544,7 @@ function Get-PresetPayload {
                 Policies = @($script:MaxPrivacyPolicies)
                 Tasks    = @($script:ScheduledTasks.Name)
                 Services = @($script:Services.Name)
+                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews + $hostsComponents
             }
         }
         'Minimal' {
@@ -361,6 +552,7 @@ function Get-PresetPayload {
                 Policies = @($script:MinimalPolicies)
                 Tasks    = @()
                 Services = @()
+                Hosts    = $hostsAlwaysSafe + $hostsRewards   # Quick disables Rewards, leaves News on
             }
         }
         'Origin' {
@@ -368,6 +560,7 @@ function Get-PresetPayload {
                 Policies = @($script:OriginPolicies)
                 Tasks    = @()
                 Services = @()
+                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews   # Origin disables both
             }
         }
         'Performance' {
@@ -375,6 +568,7 @@ function Get-PresetPayload {
                 Policies = @($script:PerformancePolicies)
                 Tasks    = @($script:ScheduledTasks.Name)
                 Services = @()
+                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews
             }
         }
         'MaxPerformance' {
@@ -382,6 +576,7 @@ function Get-PresetPayload {
                 Policies = @($script:MaxPerformancePolicies)
                 Tasks    = @($script:ScheduledTasks.Name)
                 Services = @($script:Services.Name)
+                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews + $hostsComponents
             }
         }
         default {
@@ -389,6 +584,7 @@ function Get-PresetPayload {
                 Policies = @()
                 Tasks    = @()
                 Services = @()
+                Hosts    = @()
             }
         }
     }
@@ -432,6 +628,12 @@ function Apply-Preset {
     foreach ($cb in $script:ServiceCheckBoxes) {
         $cb.Checked = $payload.Services -contains $cb.Tag.Name
     }
+    # Hosts checkboxes (created later in the GUI; guard if not yet built)
+    if ($script:HostsCheckBoxes) {
+        foreach ($cb in $script:HostsCheckBoxes) {
+            $cb.Checked = $payload.Hosts -contains $cb.Tag.Name
+        }
+    }
 
     $script:SuppressSelectionEvents = $false
     $script:ActiveProfile = $Preset
@@ -463,12 +665,59 @@ $subLabel.Size = New-Object System.Drawing.Size(760, 18)
 $header.Controls.Add($subLabel)
 
 $metaLabel = New-Object System.Windows.Forms.Label
-$metaLabel.Text = "Brave detected: $braveVer    |    Target: HKLM\Software\Policies\BraveSoftware\Brave"
+$metaLabel.Text = "Brave detected: $braveVer"
 $metaLabel.ForeColor = [System.Drawing.Color]::LightSteelBlue
 $metaLabel.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
 $metaLabel.Location = New-Object System.Drawing.Point(20, 70)
-$metaLabel.Size = New-Object System.Drawing.Size(780, 18)
+$metaLabel.Size = New-Object System.Drawing.Size(280, 18)
 $header.Controls.Add($metaLabel)
+
+# Channel selector (multi-channel support)
+$detectedChannels = Get-DetectedChannels
+$channelLabel = New-Object System.Windows.Forms.Label
+$channelLabel.Text = 'Target channel:'
+$channelLabel.ForeColor = [System.Drawing.Color]::LightSteelBlue
+$channelLabel.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+$channelLabel.Location = New-Object System.Drawing.Point(310, 70)
+$channelLabel.Size = New-Object System.Drawing.Size(95, 18)
+$header.Controls.Add($channelLabel)
+
+$script:ChannelCombo = New-Object System.Windows.Forms.ComboBox
+$script:ChannelCombo.Location = New-Object System.Drawing.Point(405, 67)
+$script:ChannelCombo.Size = New-Object System.Drawing.Size(220, 22)
+$script:ChannelCombo.DropDownStyle = 'DropDownList'
+$script:ChannelCombo.FlatStyle = 'Flat'
+foreach ($name in $script:Channels.Keys) {
+    $marker = if ($detectedChannels -contains $name) { '  (installed)' } else { '  (not installed)' }
+    [void]$script:ChannelCombo.Items.Add("$name$marker")
+}
+if ($detectedChannels.Count -gt 1) { [void]$script:ChannelCombo.Items.Add('All installed channels') }
+$script:ChannelCombo.SelectedIndex = 0
+$header.Controls.Add($script:ChannelCombo)
+
+$script:TargetPathLabel = New-Object System.Windows.Forms.Label
+$script:TargetPathLabel.Text = "-> $($script:Channels['Stable'].Path)"
+$script:TargetPathLabel.ForeColor = [System.Drawing.Color]::Gray
+$script:TargetPathLabel.Font = New-Object System.Drawing.Font('Consolas', 8)
+$script:TargetPathLabel.Location = New-Object System.Drawing.Point(635, 70)
+$script:TargetPathLabel.Size = New-Object System.Drawing.Size(500, 18)
+$header.Controls.Add($script:TargetPathLabel)
+
+$script:ChannelCombo.Add_SelectedIndexChanged({
+    $sel = $script:ChannelCombo.SelectedItem.ToString()
+    if ($sel -eq 'All installed channels') {
+        $script:TargetChannels = Get-DetectedChannels
+        if ($script:TargetChannels.Count -eq 0) { $script:TargetChannels = @('Stable') }
+        $script:BravePolicyPath = $script:Channels[$script:TargetChannels[0]].Path
+        $script:TargetPathLabel.Text = "-> $($script:TargetChannels -join ', ') ($($script:TargetChannels.Count) hives)"
+    } else {
+        $name = ($sel -split '  ')[0]
+        $script:TargetChannels = @($name)
+        $script:BravePolicyPath = $script:Channels[$name].Path
+        $script:TargetPathLabel.Text = "-> $($script:Channels[$name].Path)"
+    }
+    Write-Log "Target channel(s): $($script:TargetChannels -join ', ')"
+})
 
 $originNote = New-Object System.Windows.Forms.Label
 $originNote.Text = 'Context: Brave described Origin on April 16, 2026 as a minimalist build, then put that stripped-down idea behind a paywall. This is the free local version.'
@@ -704,6 +953,475 @@ foreach ($s in $script:Services) {
 
 $tabs.TabPages.Add($sysTab)
 
+# ---- Hosts blocklist tab (v1.5) --------------------------------------------
+# Independent from the main Apply button - has its own Apply/Remove inside the tab.
+# Sentinel-tagged so revert is surgical. Auto-backs up hosts file before any write.
+$hostsTab = New-Object System.Windows.Forms.TabPage
+$hostsTab.Text = 'Hosts Blocklist (DNS-level)'
+$hostsTab.AutoScroll = $true
+$hostsTab.BackColor = [System.Drawing.Color]::White
+
+$hostsIntro = New-Object System.Windows.Forms.Label
+$hostsIntro.Text = "Optional second layer of defense: nullroute Brave telemetry domains in C:\Windows\System32\drivers\etc\hosts. Even if a policy is bypassed by an update, the network call still fails. Sentinel-tagged for clean revert. Backups land in Documents\Brave-Free-Origin-Backups."
+$hostsIntro.Location = New-Object System.Drawing.Point(10, 8)
+$hostsIntro.Size = New-Object System.Drawing.Size(1100, 36)
+$hostsIntro.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 90)
+$hostsTab.Controls.Add($hostsIntro)
+
+$hostsWarn = New-Object System.Windows.Forms.Label
+$hostsWarn.Text = 'Independent of the "Apply to Brave" button. Use the buttons in this tab to apply or remove the hosts block.'
+$hostsWarn.Location = New-Object System.Drawing.Point(10, 44)
+$hostsWarn.Size = New-Object System.Drawing.Size(1100, 18)
+$hostsWarn.ForeColor = [System.Drawing.Color]::FromArgb(160, 70, 30)
+$hostsWarn.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$hostsTab.Controls.Add($hostsWarn)
+
+$script:HostsCheckBoxes = @()
+$y = 70
+foreach ($block in $script:HostsBlocks) {
+    $cb = New-Object System.Windows.Forms.CheckBox
+    $cb.Text = "$($block.Name)  [$($block.Domains.Count) domain$(if($block.Domains.Count -ne 1){'s'})]"
+    $cb.Location = New-Object System.Drawing.Point(15, $y)
+    $cb.Size = New-Object System.Drawing.Size(360, 20)
+    $cb.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $cb.Checked = [bool]$block.Recommended
+    $cb.Tag = $block
+    $tt.SetToolTip($cb, $block.Description)
+    $hostsTab.Controls.Add($cb)
+    $script:HostsCheckBoxes += $cb
+
+    $desc = New-Object System.Windows.Forms.Label
+    $desc.Text = $block.Description
+    $desc.Location = New-Object System.Drawing.Point(385, ($y + 2))
+    $desc.Size = New-Object System.Drawing.Size(720, 32)
+    $desc.ForeColor = [System.Drawing.Color]::DimGray
+    $desc.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $hostsTab.Controls.Add($desc)
+
+    $domLabel = New-Object System.Windows.Forms.Label
+    $domLabel.Text = ($block.Domains -join ', ')
+    $domLabel.Location = New-Object System.Drawing.Point(35, ($y + 22))
+    $domLabel.Size = New-Object System.Drawing.Size(340, 16)
+    $domLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
+    $domLabel.Font = New-Object System.Drawing.Font('Consolas', 8)
+    $hostsTab.Controls.Add($domLabel)
+
+    $y += 44
+}
+
+$btnApplyHosts = New-Object System.Windows.Forms.Button
+$btnApplyHosts.Text = 'Apply hosts blocks'
+$btnApplyHosts.Size = New-Object System.Drawing.Size(160, 30)
+$btnApplyHosts.Location = New-Object System.Drawing.Point(15, ($y + 10))
+$btnApplyHosts.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 63)
+$btnApplyHosts.ForeColor = [System.Drawing.Color]::White
+$btnApplyHosts.Add_Click({
+    $domains = @()
+    foreach ($cb in $script:HostsCheckBoxes) {
+        if ($cb.Checked) { $domains += $cb.Tag.Domains }
+    }
+    if ($domains.Count -eq 0) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            'No groups ticked. This will remove the existing hosts block (if any). Continue?',
+            'Hosts blocklist', 'YesNo', 'Question')
+        if ($ans -ne 'Yes') { return }
+    } else {
+        $msg = "About to add $($domains.Count) entries to:`r`n$($script:HostsFile)`r`n`r`nA timestamped backup will be saved first. Continue?"
+        $ans = [System.Windows.Forms.MessageBox]::Show($msg, 'Hosts blocklist', 'YesNo', 'Question')
+        if ($ans -ne 'Yes') { return }
+    }
+    try {
+        Set-HostsBlockDomains -Domains $domains
+        [System.Windows.Forms.MessageBox]::Show("Hosts file updated. $($domains.Count) domain(s) blocked.`r`nDNS cache flushed.", 'Done', 'OK', 'Information') | Out-Null
+    } catch {
+        Write-Log "Hosts apply failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Failed: $_", 'Error', 'OK', 'Error') | Out-Null
+    }
+})
+$hostsTab.Controls.Add($btnApplyHosts)
+
+$btnClearHosts = New-Object System.Windows.Forms.Button
+$btnClearHosts.Text = 'Remove hosts block'
+$btnClearHosts.Size = New-Object System.Drawing.Size(160, 30)
+$btnClearHosts.Location = New-Object System.Drawing.Point(185, ($y + 10))
+$btnClearHosts.Add_Click({
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Remove the Brave-Free-Origin sentinel block from hosts?`r`n(Your other hosts entries are not touched.)",
+        'Hosts blocklist', 'YesNo', 'Warning')
+    if ($ans -ne 'Yes') { return }
+    try {
+        Clear-HostsBlock
+        foreach ($cb in $script:HostsCheckBoxes) { $cb.Checked = $false }
+        [System.Windows.Forms.MessageBox]::Show('Sentinel block removed.', 'Done', 'OK', 'Information') | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Failed: $_", 'Error', 'OK', 'Error') | Out-Null
+    }
+})
+$hostsTab.Controls.Add($btnClearHosts)
+
+$btnLoadHosts = New-Object System.Windows.Forms.Button
+$btnLoadHosts.Text = 'Load current state'
+$btnLoadHosts.Size = New-Object System.Drawing.Size(160, 30)
+$btnLoadHosts.Location = New-Object System.Drawing.Point(355, ($y + 10))
+$btnLoadHosts.Add_Click({
+    $current = Get-HostsCurrentDomains
+    foreach ($cb in $script:HostsCheckBoxes) {
+        $blockDomains = $cb.Tag.Domains
+        $allPresent = $true
+        foreach ($d in $blockDomains) { if ($current -notcontains $d) { $allPresent = $false; break } }
+        $cb.Checked = $allPresent
+    }
+    Write-Log "Hosts state loaded: $($current.Count) domain(s) currently blocked."
+})
+$hostsTab.Controls.Add($btnLoadHosts)
+
+$btnOpenHosts = New-Object System.Windows.Forms.Button
+$btnOpenHosts.Text = 'Open hosts file'
+$btnOpenHosts.Size = New-Object System.Drawing.Size(140, 30)
+$btnOpenHosts.Location = New-Object System.Drawing.Point(525, ($y + 10))
+$btnOpenHosts.Add_Click({ Start-Process notepad.exe $script:HostsFile })
+$hostsTab.Controls.Add($btnOpenHosts)
+
+$tabs.TabPages.Add($hostsTab)
+
+# ---- Search & Startup tab (v1.6) -------------------------------------------
+# Three independent, opt-in sections. Each has its own "Override" checkbox.
+# Off by default: Brave's user-chosen search engine and startup behavior stay
+# untouched unless the user actively ticks an override.
+$searchTab = New-Object System.Windows.Forms.TabPage
+$searchTab.Text = 'Search & Startup'
+$searchTab.AutoScroll = $true
+$searchTab.BackColor = [System.Drawing.Color]::White
+
+$searchIntro = New-Object System.Windows.Forms.Label
+$searchIntro.Text = 'Pick the omnibox search engine and what opens when Brave launches / when you open a new tab. Each section is independent and only fires when its checkbox is ticked. Unticking + Apply removes the override.'
+$searchIntro.Location = New-Object System.Drawing.Point(10, 8)
+$searchIntro.Size = New-Object System.Drawing.Size(1100, 36)
+$searchIntro.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 90)
+$searchTab.Controls.Add($searchIntro)
+
+# --- Section 1: Default search engine ---
+$secSearch = New-Object System.Windows.Forms.GroupBox
+$secSearch.Text = 'Default search engine (omnibox / address bar)'
+$secSearch.Location = New-Object System.Drawing.Point(10, 50)
+$secSearch.Size = New-Object System.Drawing.Size(1110, 110)
+$secSearch.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+$searchTab.Controls.Add($secSearch)
+
+$script:ChkSearchOverride = New-Object System.Windows.Forms.CheckBox
+$script:ChkSearchOverride.Text = 'Force a default search engine (writes DefaultSearchProvider* policies)'
+$script:ChkSearchOverride.Location = New-Object System.Drawing.Point(15, 22)
+$script:ChkSearchOverride.Size = New-Object System.Drawing.Size(530, 20)
+$script:ChkSearchOverride.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$secSearch.Controls.Add($script:ChkSearchOverride)
+
+$lblEngine = New-Object System.Windows.Forms.Label
+$lblEngine.Text = 'Engine:'
+$lblEngine.Location = New-Object System.Drawing.Point(35, 50)
+$lblEngine.Size = New-Object System.Drawing.Size(60, 18)
+$lblEngine.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$secSearch.Controls.Add($lblEngine)
+
+$script:CmbSearchEngine = New-Object System.Windows.Forms.ComboBox
+$script:CmbSearchEngine.Location = New-Object System.Drawing.Point(95, 47)
+$script:CmbSearchEngine.Size = New-Object System.Drawing.Size(200, 22)
+$script:CmbSearchEngine.DropDownStyle = 'DropDownList'
+foreach ($name in $script:SearchEngines.Keys) { [void]$script:CmbSearchEngine.Items.Add($name) }
+$script:CmbSearchEngine.SelectedIndex = 0
+$secSearch.Controls.Add($script:CmbSearchEngine)
+
+$lblCustomSearch = New-Object System.Windows.Forms.Label
+$lblCustomSearch.Text = 'Custom search URL:'
+$lblCustomSearch.Location = New-Object System.Drawing.Point(310, 50)
+$lblCustomSearch.Size = New-Object System.Drawing.Size(115, 18)
+$lblCustomSearch.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$secSearch.Controls.Add($lblCustomSearch)
+
+$script:TxtCustomSearchUrl = New-Object System.Windows.Forms.TextBox
+$script:TxtCustomSearchUrl.Location = New-Object System.Drawing.Point(425, 47)
+$script:TxtCustomSearchUrl.Size = New-Object System.Drawing.Size(370, 22)
+$script:TxtCustomSearchUrl.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$script:TxtCustomSearchUrl.Enabled = $false
+$secSearch.Controls.Add($script:TxtCustomSearchUrl)
+
+$searchHelp = New-Object System.Windows.Forms.Label
+$searchHelp.Text = 'Custom must use {searchTerms} as the placeholder. Example: https://my-searx/search?q={searchTerms}'
+$searchHelp.Location = New-Object System.Drawing.Point(35, 78)
+$searchHelp.Size = New-Object System.Drawing.Size(900, 18)
+$searchHelp.ForeColor = [System.Drawing.Color]::DimGray
+$searchHelp.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$secSearch.Controls.Add($searchHelp)
+
+$script:CmbSearchEngine.Add_SelectedIndexChanged({
+    $isCustom = ($script:CmbSearchEngine.SelectedItem -eq 'Custom...')
+    $script:TxtCustomSearchUrl.Enabled = $isCustom
+})
+
+# --- Section 2: New tab page ---
+$secNtp = New-Object System.Windows.Forms.GroupBox
+$secNtp.Text = 'New Tab Page'
+$secNtp.Location = New-Object System.Drawing.Point(10, 168)
+$secNtp.Size = New-Object System.Drawing.Size(1110, 90)
+$secNtp.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+$searchTab.Controls.Add($secNtp)
+
+$script:ChkNtpOverride = New-Object System.Windows.Forms.CheckBox
+$script:ChkNtpOverride.Text = 'Override new tab page (writes NewTabPageLocation policy)'
+$script:ChkNtpOverride.Location = New-Object System.Drawing.Point(15, 22)
+$script:ChkNtpOverride.Size = New-Object System.Drawing.Size(450, 20)
+$script:ChkNtpOverride.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$secNtp.Controls.Add($script:ChkNtpOverride)
+
+$lblNtpDest = New-Object System.Windows.Forms.Label
+$lblNtpDest.Text = 'Open:'
+$lblNtpDest.Location = New-Object System.Drawing.Point(35, 50)
+$lblNtpDest.Size = New-Object System.Drawing.Size(50, 18)
+$secNtp.Controls.Add($lblNtpDest)
+
+$script:CmbNtpDest = New-Object System.Windows.Forms.ComboBox
+$script:CmbNtpDest.Location = New-Object System.Drawing.Point(85, 47)
+$script:CmbNtpDest.Size = New-Object System.Drawing.Size(310, 22)
+$script:CmbNtpDest.DropDownStyle = 'DropDownList'
+foreach ($name in $script:DestinationOptions.Keys) {
+    if ($name -ne 'Default new tab page (do not override)') { [void]$script:CmbNtpDest.Items.Add($name) }
+}
+$script:CmbNtpDest.SelectedIndex = 0
+$secNtp.Controls.Add($script:CmbNtpDest)
+
+$lblNtpCustom = New-Object System.Windows.Forms.Label
+$lblNtpCustom.Text = 'Custom URL:'
+$lblNtpCustom.Location = New-Object System.Drawing.Point(410, 50)
+$lblNtpCustom.Size = New-Object System.Drawing.Size(80, 18)
+$secNtp.Controls.Add($lblNtpCustom)
+
+$script:TxtNtpCustomUrl = New-Object System.Windows.Forms.TextBox
+$script:TxtNtpCustomUrl.Location = New-Object System.Drawing.Point(490, 47)
+$script:TxtNtpCustomUrl.Size = New-Object System.Drawing.Size(305, 22)
+$script:TxtNtpCustomUrl.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$script:TxtNtpCustomUrl.Enabled = $false
+$secNtp.Controls.Add($script:TxtNtpCustomUrl)
+
+$script:CmbNtpDest.Add_SelectedIndexChanged({
+    $isCustom = ($script:CmbNtpDest.SelectedItem -eq 'Custom URL...')
+    $script:TxtNtpCustomUrl.Enabled = $isCustom
+})
+
+# --- Section 3: Startup behavior ---
+$secStartup = New-Object System.Windows.Forms.GroupBox
+$secStartup.Text = 'Startup Behavior (what opens when you launch Brave)'
+$secStartup.Location = New-Object System.Drawing.Point(10, 266)
+$secStartup.Size = New-Object System.Drawing.Size(1110, 110)
+$secStartup.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+$searchTab.Controls.Add($secStartup)
+
+$script:ChkStartupOverride = New-Object System.Windows.Forms.CheckBox
+$script:ChkStartupOverride.Text = 'Override startup behavior (writes RestoreOnStartup + RestoreOnStartupURLs policies)'
+$script:ChkStartupOverride.Location = New-Object System.Drawing.Point(15, 22)
+$script:ChkStartupOverride.Size = New-Object System.Drawing.Size(550, 20)
+$script:ChkStartupOverride.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$secStartup.Controls.Add($script:ChkStartupOverride)
+
+$lblStartMode = New-Object System.Windows.Forms.Label
+$lblStartMode.Text = 'Mode:'
+$lblStartMode.Location = New-Object System.Drawing.Point(35, 50)
+$lblStartMode.Size = New-Object System.Drawing.Size(50, 18)
+$secStartup.Controls.Add($lblStartMode)
+
+$script:CmbStartupMode = New-Object System.Windows.Forms.ComboBox
+$script:CmbStartupMode.Location = New-Object System.Drawing.Point(85, 47)
+$script:CmbStartupMode.Size = New-Object System.Drawing.Size(310, 22)
+$script:CmbStartupMode.DropDownStyle = 'DropDownList'
+foreach ($name in $script:StartupModes.Keys) { [void]$script:CmbStartupMode.Items.Add($name) }
+$script:CmbStartupMode.SelectedIndex = 0
+$secStartup.Controls.Add($script:CmbStartupMode)
+
+$lblStartUrl = New-Object System.Windows.Forms.Label
+$lblStartUrl.Text = 'URL(s):'
+$lblStartUrl.Location = New-Object System.Drawing.Point(410, 50)
+$lblStartUrl.Size = New-Object System.Drawing.Size(60, 18)
+$secStartup.Controls.Add($lblStartUrl)
+
+$script:TxtStartupUrl = New-Object System.Windows.Forms.TextBox
+$script:TxtStartupUrl.Location = New-Object System.Drawing.Point(470, 47)
+$script:TxtStartupUrl.Size = New-Object System.Drawing.Size(325, 22)
+$script:TxtStartupUrl.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$script:TxtStartupUrl.Enabled = $false
+$secStartup.Controls.Add($script:TxtStartupUrl)
+
+$startupHelp = New-Object System.Windows.Forms.Label
+$startupHelp.Text = 'For "specific page or set", separate multiple URLs with a comma. Each opens in its own tab.'
+$startupHelp.Location = New-Object System.Drawing.Point(35, 78)
+$startupHelp.Size = New-Object System.Drawing.Size(900, 18)
+$startupHelp.ForeColor = [System.Drawing.Color]::DimGray
+$startupHelp.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$secStartup.Controls.Add($startupHelp)
+
+$script:CmbStartupMode.Add_SelectedIndexChanged({
+    $sel = $script:CmbStartupMode.SelectedItem
+    $mode = $script:StartupModes[$sel]
+    $script:TxtStartupUrl.Enabled = ($mode.UsesURL -and -not $mode.FixedURL)
+})
+
+# Conflict note
+$conflictNote = New-Object System.Windows.Forms.Label
+$conflictNote.Text = "Note: this tab is processed AFTER the Performance / Startup tab, so it cleanly overrides any 'NewTabPageLocation' / 'HomepageLocation' / 'RestoreOnStartup' values set there. Untick + Apply removes the override and lets your Performance tab values (or stock Brave) take back over."
+$conflictNote.Location = New-Object System.Drawing.Point(10, 384)
+$conflictNote.Size = New-Object System.Drawing.Size(1100, 36)
+$conflictNote.ForeColor = [System.Drawing.Color]::FromArgb(120, 60, 30)
+$conflictNote.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$searchTab.Controls.Add($conflictNote)
+
+# --- Section 4: Extensions (manual installs, no force-push) -----------------
+$secExt = New-Object System.Windows.Forms.GroupBox
+$secExt.Text = 'Extensions (optional, manual install)'
+$secExt.Location = New-Object System.Drawing.Point(10, 426)
+$secExt.Size = New-Object System.Drawing.Size(1110, 130)
+$secExt.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+$searchTab.Controls.Add($secExt)
+
+$extIntro = New-Object System.Windows.Forms.Label
+$extIntro.Text = "Brave Shields is already a native ad/tracker blocker (same filter-list lineage as uBlock Origin, runs in-engine so slightly faster). We do NOT force-install anything - that would show a 'Managed by your organization' banner and lock the extension on. These buttons just open the install pages in Brave so you can decide."
+$extIntro.Location = New-Object System.Drawing.Point(15, 22)
+$extIntro.Size = New-Object System.Drawing.Size(1080, 36)
+$extIntro.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+$extIntro.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+$secExt.Controls.Add($extIntro)
+
+$extWarn = New-Object System.Windows.Forms.Label
+$extWarn.Text = 'Caution: running uBlock Origin on top of Shields = double-blocking. Wastes CPU per tab and can break sites Shields handles fine. If you install uBO, consider switching Shields to Standard (not Aggressive) to reduce overlap.'
+$extWarn.Location = New-Object System.Drawing.Point(15, 60)
+$extWarn.Size = New-Object System.Drawing.Size(1080, 32)
+$extWarn.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$extWarn.ForeColor = [System.Drawing.Color]::FromArgb(160, 70, 30)
+$secExt.Controls.Add($extWarn)
+
+$btnUboLite = New-Object System.Windows.Forms.Button
+$btnUboLite.Text = 'Install uBlock Origin Lite (MV3)'
+$btnUboLite.Size = New-Object System.Drawing.Size(220, 28)
+$btnUboLite.Location = New-Object System.Drawing.Point(15, 95)
+$btnUboLite.Add_Click({
+    $exe = Test-BraveInstalled
+    $url = 'https://chromewebstore.google.com/detail/ublock-origin-lite/ddkjiahejlhfcafbddmgiahcphecmpfh'
+    if ($exe) { Start-Process $exe $url } else { Start-Process $url }
+    Write-Log 'Opened uBlock Origin Lite install page.'
+})
+$secExt.Controls.Add($btnUboLite)
+
+$btnShieldsSettings = New-Object System.Windows.Forms.Button
+$btnShieldsSettings.Text = 'Open Brave Shields settings'
+$btnShieldsSettings.Size = New-Object System.Drawing.Size(200, 28)
+$btnShieldsSettings.Location = New-Object System.Drawing.Point(245, 95)
+$btnShieldsSettings.Add_Click({
+    $exe = Test-BraveInstalled
+    if ($exe) { Start-Process $exe 'brave://settings/shields' } else { Write-Log 'Brave not found.' 'WARN' }
+})
+$secExt.Controls.Add($btnShieldsSettings)
+
+$btnBitwarden = New-Object System.Windows.Forms.Button
+$btnBitwarden.Text = 'Install Bitwarden (password manager)'
+$btnBitwarden.Size = New-Object System.Drawing.Size(240, 28)
+$btnBitwarden.Location = New-Object System.Drawing.Point(455, 95)
+$btnBitwarden.Add_Click({
+    $exe = Test-BraveInstalled
+    $url = 'https://chromewebstore.google.com/detail/bitwarden-password-manage/nngceckbapebfimnlniiiahkandclblb'
+    if ($exe) { Start-Process $exe $url } else { Start-Process $url }
+    Write-Log 'Opened Bitwarden install page.'
+})
+$secExt.Controls.Add($btnBitwarden)
+
+$tabs.TabPages.Add($searchTab)
+
+# ---- Helpers: write search-engine + startup overrides into one channel ------
+function Resolve-Destination {
+    param([string]$DropdownLabel, [string]$CustomUrl, [string]$SearchEngineHome)
+    $code = $script:DestinationOptions[$DropdownLabel]
+    switch ($code) {
+        '__SKIP__'   { return $null }
+        '__SEARCH__' { return $SearchEngineHome }
+        '__CUSTOM__' { return $CustomUrl.Trim() }
+        default      { return $code }
+    }
+}
+
+function Apply-SearchEngineOverride {
+    param([string]$Path)
+    # Always clear first so toggling off truly removes them
+    foreach ($n in @('DefaultSearchProviderEnabled','DefaultSearchProviderName','DefaultSearchProviderKeyword','DefaultSearchProviderSearchURL','DefaultSearchProviderSuggestURL')) {
+        try { Remove-ItemProperty -Path $Path -Name $n -ErrorAction Stop } catch {}
+    }
+    if (-not $script:ChkSearchOverride.Checked) { return $false }
+
+    $engineKey = $script:CmbSearchEngine.SelectedItem
+    $eng = $script:SearchEngines[$engineKey]
+    $url = $eng.URL
+    $sug = $eng.Suggest
+    $name = $engineKey
+    $keyword = $eng.Keyword
+    if ($eng.IsCustom) {
+        $url = $script:TxtCustomSearchUrl.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($url)) { Write-Log 'Search override skipped: custom URL is empty.' 'WARN'; return $false }
+        if ($url -notmatch '\{searchTerms\}') { Write-Log 'Search override skipped: custom URL must contain {searchTerms}.' 'WARN'; return $false }
+        $name = 'Custom Search'
+    }
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderEnabled'   -Value 1     -PropertyType DWord  -Force | Out-Null
+    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderName'      -Value $name -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderKeyword'   -Value $keyword -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderSearchURL' -Value $url  -PropertyType String -Force | Out-Null
+    if ($sug) {
+        New-ItemProperty -Path $Path -Name 'DefaultSearchProviderSuggestURL' -Value $sug -PropertyType String -Force | Out-Null
+    }
+    Write-Log "Search engine override -> $name" 'OK'
+    return $true
+}
+
+function Apply-NtpOverride {
+    param([string]$Path)
+    # Clear first
+    try { Remove-ItemProperty -Path $Path -Name 'NewTabPageLocation' -ErrorAction Stop } catch {}
+    if (-not $script:ChkNtpOverride.Checked) { return $false }
+
+    # Resolve destination
+    $engineKey = $script:CmbSearchEngine.SelectedItem
+    $engineHome = if ($script:SearchEngines[$engineKey].IsCustom) { '' } else { $script:SearchEngines[$engineKey].Home }
+    $url = Resolve-Destination -DropdownLabel $script:CmbNtpDest.SelectedItem -CustomUrl $script:TxtNtpCustomUrl.Text -SearchEngineHome $engineHome
+    if (-not $url) { Write-Log 'NTP override skipped: no resolvable URL.' 'WARN'; return $false }
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    New-ItemProperty -Path $Path -Name 'NewTabPageLocation' -Value $url -PropertyType String -Force | Out-Null
+    Write-Log "New tab page override -> $url" 'OK'
+    return $true
+}
+
+function Apply-StartupOverride {
+    param([string]$Path)
+    # Clear first
+    try { Remove-ItemProperty -Path $Path -Name 'RestoreOnStartup' -ErrorAction Stop } catch {}
+    try { Remove-Item -Path (Join-Path $Path 'RestoreOnStartupURLs') -Recurse -Force -ErrorAction Stop } catch {}
+    if (-not $script:ChkStartupOverride.Checked) { return $false }
+
+    $modeKey = $script:CmbStartupMode.SelectedItem
+    $mode = $script:StartupModes[$modeKey]
+    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+    New-ItemProperty -Path $Path -Name 'RestoreOnStartup' -Value $mode.Code -PropertyType DWord -Force | Out-Null
+
+    if ($mode.UsesURL) {
+        $listPath = Join-Path $Path 'RestoreOnStartupURLs'
+        New-Item -Path $listPath -Force | Out-Null
+        $urls = if ($mode.FixedURL) { @($mode.FixedURL) }
+                else { ($script:TxtStartupUrl.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        if ($urls.Count -eq 0) { Write-Log 'Startup override skipped: no URL provided.' 'WARN'; return $false }
+        $i = 1
+        foreach ($u in $urls) {
+            New-ItemProperty -Path $listPath -Name "$i" -Value $u -PropertyType String -Force | Out-Null
+            $i++
+        }
+        Write-Log "Startup override -> code $($mode.Code), URLs: $($urls -join ', ')" 'OK'
+    } else {
+        Write-Log "Startup override -> $modeKey (code $($mode.Code))" 'OK'
+    }
+    return $true
+}
+
 # ---- Utility buttons --------------------------------------------------------
 $utilityPanel = New-Object System.Windows.Forms.Panel
 $utilityPanel.Location = New-Object System.Drawing.Point(10, 676)
@@ -711,17 +1429,244 @@ $utilityPanel.Size = New-Object System.Drawing.Size(1145, 40)
 $utilityPanel.Anchor = 'Left, Right, Bottom'
 $form.Controls.Add($utilityPanel)
 
+# Export config to JSON
+$btnExport = New-Object System.Windows.Forms.Button
+$btnExport.Text = 'Export config'
+$btnExport.Size = New-Object System.Drawing.Size(110, 30)
+$btnExport.Location = New-Object System.Drawing.Point(420, 5)
+$btnExport.Add_Click({
+    $sfd = New-Object System.Windows.Forms.SaveFileDialog
+    $sfd.Filter = 'JSON config (*.json)|*.json'
+    $sfd.FileName = "brave-free-origin-config-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+    $sfd.InitialDirectory = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
+    if (-not (Test-Path $sfd.InitialDirectory)) { New-Item -ItemType Directory -Path $sfd.InitialDirectory | Out-Null }
+    if ($sfd.ShowDialog() -ne 'OK') { return }
+
+    $cfg = [ordered]@{
+        version  = '1.6'
+        exported = (Get-Date -Format 's')
+        channel  = $script:TargetChannels
+        profile  = $script:ActiveProfile
+        policies = [ordered]@{}
+        tasks    = [ordered]@{}
+        services = [ordered]@{}
+        hosts    = [ordered]@{}
+        search   = [ordered]@{
+            enabled    = [bool]$script:ChkSearchOverride.Checked
+            engine     = "$($script:CmbSearchEngine.SelectedItem)"
+            customUrl  = "$($script:TxtCustomSearchUrl.Text)"
+        }
+        ntp = [ordered]@{
+            enabled    = [bool]$script:ChkNtpOverride.Checked
+            destination= "$($script:CmbNtpDest.SelectedItem)"
+            customUrl  = "$($script:TxtNtpCustomUrl.Text)"
+        }
+        startup = [ordered]@{
+            enabled    = [bool]$script:ChkStartupOverride.Checked
+            mode       = "$($script:CmbStartupMode.SelectedItem)"
+            urls       = "$($script:TxtStartupUrl.Text)"
+        }
+    }
+    foreach ($cb in $script:CheckBoxes)        { $cfg.policies[$cb.Tag.Policy.Name] = [bool]$cb.Checked }
+    foreach ($cb in $script:TaskCheckBoxes)    { $cfg.tasks[$cb.Tag.Name]            = [bool]$cb.Checked }
+    foreach ($cb in $script:ServiceCheckBoxes) { $cfg.services[$cb.Tag.Name]         = [bool]$cb.Checked }
+    foreach ($cb in $script:HostsCheckBoxes)   { $cfg.hosts[$cb.Tag.Name]            = [bool]$cb.Checked }
+
+    $cfg | ConvertTo-Json -Depth 5 | Set-Content -Path $sfd.FileName -Encoding UTF8
+    Write-Log "Config exported: $($sfd.FileName)" 'OK'
+})
+$utilityPanel.Controls.Add($btnExport)
+
+# Import config from JSON
+$btnImport = New-Object System.Windows.Forms.Button
+$btnImport.Text = 'Import config'
+$btnImport.Size = New-Object System.Drawing.Size(110, 30)
+$btnImport.Location = New-Object System.Drawing.Point(535, 5)
+$btnImport.Add_Click({
+    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+    $ofd.Filter = 'JSON config (*.json)|*.json'
+    $ofd.InitialDirectory = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
+    if ($ofd.ShowDialog() -ne 'OK') { return }
+    try {
+        $cfg = Get-Content $ofd.FileName -Raw | ConvertFrom-Json
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Bad JSON: $_", 'Import error', 'OK', 'Error') | Out-Null
+        return
+    }
+    $script:SuppressSelectionEvents = $true
+    if ($cfg.policies) {
+        foreach ($cb in $script:CheckBoxes) {
+            $name = $cb.Tag.Policy.Name
+            if ($cfg.policies.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.policies.$name }
+        }
+    }
+    if ($cfg.tasks) {
+        foreach ($cb in $script:TaskCheckBoxes) {
+            $name = $cb.Tag.Name
+            if ($cfg.tasks.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.tasks.$name }
+        }
+    }
+    if ($cfg.services) {
+        foreach ($cb in $script:ServiceCheckBoxes) {
+            $name = $cb.Tag.Name
+            if ($cfg.services.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.services.$name }
+        }
+    }
+    if ($cfg.hosts) {
+        foreach ($cb in $script:HostsCheckBoxes) {
+            $name = $cb.Tag.Name
+            if ($cfg.hosts.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.hosts.$name }
+        }
+    }
+    if ($cfg.search) {
+        $script:ChkSearchOverride.Checked = [bool]$cfg.search.enabled
+        if ($cfg.search.engine -and $script:CmbSearchEngine.Items.Contains($cfg.search.engine)) {
+            $script:CmbSearchEngine.SelectedItem = $cfg.search.engine
+        }
+        if ($cfg.search.customUrl) { $script:TxtCustomSearchUrl.Text = $cfg.search.customUrl }
+    }
+    if ($cfg.ntp) {
+        $script:ChkNtpOverride.Checked = [bool]$cfg.ntp.enabled
+        if ($cfg.ntp.destination -and $script:CmbNtpDest.Items.Contains($cfg.ntp.destination)) {
+            $script:CmbNtpDest.SelectedItem = $cfg.ntp.destination
+        }
+        if ($cfg.ntp.customUrl) { $script:TxtNtpCustomUrl.Text = $cfg.ntp.customUrl }
+    }
+    if ($cfg.startup) {
+        $script:ChkStartupOverride.Checked = [bool]$cfg.startup.enabled
+        if ($cfg.startup.mode -and $script:CmbStartupMode.Items.Contains($cfg.startup.mode)) {
+            $script:CmbStartupMode.SelectedItem = $cfg.startup.mode
+        }
+        if ($cfg.startup.urls) { $script:TxtStartupUrl.Text = $cfg.startup.urls }
+    }
+    $script:SuppressSelectionEvents = $false
+    $script:ActiveProfile = if ($cfg.profile) { "$($cfg.profile)" } else { 'Custom' }
+    Update-SelectionSummary
+    Write-Log "Config imported from $($ofd.FileName) (version $($cfg.version))" 'OK'
+    [System.Windows.Forms.MessageBox]::Show(
+        "Config loaded into checkboxes.`r`nClick 'Apply to Brave' (and the Hosts tab if needed) to commit.",
+        'Imported', 'OK', 'Information') | Out-Null
+})
+$utilityPanel.Controls.Add($btnImport)
+
+# Verify - read registry, compare to UI selections
+$btnVerify = New-Object System.Windows.Forms.Button
+$btnVerify.Text = 'Verify'
+$btnVerify.Size = New-Object System.Drawing.Size(80, 30)
+$btnVerify.Location = New-Object System.Drawing.Point(650, 5)
+$btnVerify.Add_Click({
+    $report = New-Object System.Text.StringBuilder
+    foreach ($channel in $script:TargetChannels) {
+        $path = $script:Channels[$channel].Path
+        [void]$report.AppendLine("=== $channel  ($path) ===")
+        if (-not (Test-Path $path)) {
+            [void]$report.AppendLine('  (no policy key exists - nothing applied)')
+            [void]$report.AppendLine('')
+            continue
+        }
+        $matchCount = 0; $missingCount = 0; $mismatchCount = 0; $tickedCount = 0
+        $missingList = @(); $mismatchList = @()
+        foreach ($cb in $script:CheckBoxes) {
+            if (-not $cb.Checked) { continue }
+            $tickedCount++
+            $p = $cb.Tag.Policy
+            try {
+                $cur = (Get-ItemProperty -Path $path -Name $p.Name -ErrorAction Stop).$($p.Name)
+                if ("$cur" -eq "$($p.ApplyValue)") { $matchCount++ }
+                else { $mismatchCount++; $mismatchList += "$($p.Name): registry=$cur, expected=$($p.ApplyValue)" }
+            } catch {
+                $missingCount++; $missingList += $p.Name
+            }
+        }
+        [void]$report.AppendLine("  Ticked in UI: $tickedCount")
+        [void]$report.AppendLine("  Match in registry: $matchCount")
+        [void]$report.AppendLine("  Missing (not in registry): $missingCount")
+        [void]$report.AppendLine("  Mismatch (wrong value): $mismatchCount")
+        if ($missingList) {
+            [void]$report.AppendLine('  -- missing:')
+            foreach ($n in $missingList) { [void]$report.AppendLine("     - $n") }
+        }
+        if ($mismatchList) {
+            [void]$report.AppendLine('  -- mismatch:')
+            foreach ($n in $mismatchList) { [void]$report.AppendLine("     - $n") }
+        }
+        [void]$report.AppendLine('')
+    }
+
+    # Hosts state
+    $hostsCurrent = Get-HostsCurrentDomains
+    [void]$report.AppendLine("=== Hosts blocklist ===")
+    [void]$report.AppendLine("  Currently blocked domains: $($hostsCurrent.Count)")
+    if ($hostsCurrent.Count -gt 0) {
+        foreach ($d in $hostsCurrent) { [void]$report.AppendLine("     - $d") }
+    }
+    [void]$report.AppendLine('')
+
+    # Search / NTP / Startup overrides
+    [void]$report.AppendLine('=== Search & Startup overrides ===')
+    foreach ($channel in $script:TargetChannels) {
+        $path = $script:Channels[$channel].Path
+        [void]$report.AppendLine("  [$channel]")
+        if (-not (Test-Path $path)) { [void]$report.AppendLine('     (no policy key - nothing set)'); continue }
+        try {
+            $se = (Get-ItemProperty -Path $path -Name 'DefaultSearchProviderEnabled' -ErrorAction Stop).DefaultSearchProviderEnabled
+            $name = (Get-ItemProperty -Path $path -Name 'DefaultSearchProviderName' -ErrorAction SilentlyContinue).DefaultSearchProviderName
+            $url  = (Get-ItemProperty -Path $path -Name 'DefaultSearchProviderSearchURL' -ErrorAction SilentlyContinue).DefaultSearchProviderSearchURL
+            if ($se -eq 1) { [void]$report.AppendLine("     Search engine forced: $name ($url)") }
+            else           { [void]$report.AppendLine('     Search engine override: not set') }
+        } catch { [void]$report.AppendLine('     Search engine override: not set') }
+        try {
+            $ntp = (Get-ItemProperty -Path $path -Name 'NewTabPageLocation' -ErrorAction Stop).NewTabPageLocation
+            [void]$report.AppendLine("     New tab page forced: $ntp")
+        } catch { [void]$report.AppendLine('     New tab page override: not set') }
+        try {
+            $rc = (Get-ItemProperty -Path $path -Name 'RestoreOnStartup' -ErrorAction Stop).RestoreOnStartup
+            $listPath = Join-Path $path 'RestoreOnStartupURLs'
+            $urls = @()
+            if (Test-Path $listPath) {
+                $props = Get-ItemProperty -Path $listPath
+                foreach ($p in $props.PSObject.Properties) {
+                    if ($p.Name -match '^\d+$') { $urls += $p.Value }
+                }
+            }
+            $extra = if ($urls.Count -gt 0) { " URLs: $($urls -join ', ')" } else { '' }
+            [void]$report.AppendLine("     Startup forced: code $rc$extra")
+        } catch { [void]$report.AppendLine('     Startup override: not set') }
+    }
+
+    # Show in a scrollable dialog
+    $vf = New-Object System.Windows.Forms.Form
+    $vf.Text = 'Verify - registry vs selections'
+    $vf.Size = New-Object System.Drawing.Size(700, 520)
+    $vf.StartPosition = 'CenterParent'
+    $vt = New-Object System.Windows.Forms.TextBox
+    $vt.Multiline = $true
+    $vt.ReadOnly = $true
+    $vt.ScrollBars = 'Vertical'
+    $vt.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $vt.Dock = 'Fill'
+    $vt.Text = $report.ToString()
+    $vf.Controls.Add($vt)
+    [void]$vf.ShowDialog()
+})
+$utilityPanel.Controls.Add($btnVerify)
+
 $btnLoad = New-Object System.Windows.Forms.Button
 $btnLoad.Text = 'Load current state'
 $btnLoad.Size = New-Object System.Drawing.Size(145, 30)
 $btnLoad.Location = New-Object System.Drawing.Point(0, 5)
 $btnLoad.Add_Click({
     $script:SuppressSelectionEvents = $true
+    # Read from the FIRST target channel (loading is single-source by design)
+    $loadPath = $script:Channels[$script:TargetChannels[0]].Path
+    $originalPath = $script:BravePolicyPath
+    $script:BravePolicyPath = $loadPath
     foreach ($cb in $script:CheckBoxes) {
         $p = $cb.Tag.Policy
         $cur = Get-ExistingPolicy $p.Name
         $cb.Checked = ($null -ne $cur -and "$cur" -eq "$($p.ApplyValue)")
     }
+    $script:BravePolicyPath = $originalPath
     foreach ($cb in $script:TaskCheckBoxes) {
         $t = $cb.Tag
         $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
@@ -731,6 +1676,78 @@ $btnLoad.Add_Click({
         $s = $cb.Tag
         $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
         $cb.Checked = ($svc -and $svc.StartType -eq 'Disabled')
+    }
+    # Hosts state
+    if ($script:HostsCheckBoxes) {
+        $current = Get-HostsCurrentDomains
+        foreach ($cb in $script:HostsCheckBoxes) {
+            $blockDomains = $cb.Tag.Domains
+            $allPresent = $true
+            foreach ($d in $blockDomains) { if ($current -notcontains $d) { $allPresent = $false; break } }
+            $cb.Checked = $allPresent
+        }
+    }
+    # Search engine override state
+    if ($script:ChkSearchOverride) {
+        $sePath = $loadPath
+        $seEnabled = $false
+        try {
+            $val = (Get-ItemProperty -Path $sePath -Name 'DefaultSearchProviderEnabled' -ErrorAction Stop).DefaultSearchProviderEnabled
+            $seEnabled = ($val -eq 1)
+        } catch { $seEnabled = $false }
+        $script:ChkSearchOverride.Checked = $seEnabled
+        if ($seEnabled) {
+            try {
+                $url = (Get-ItemProperty -Path $sePath -Name 'DefaultSearchProviderSearchURL' -ErrorAction Stop).DefaultSearchProviderSearchURL
+                $matched = $false
+                foreach ($key in $script:SearchEngines.Keys) {
+                    if (-not $script:SearchEngines[$key].IsCustom -and $script:SearchEngines[$key].URL -eq $url) {
+                        $script:CmbSearchEngine.SelectedItem = $key
+                        $matched = $true; break
+                    }
+                }
+                if (-not $matched) {
+                    $script:CmbSearchEngine.SelectedItem = 'Custom...'
+                    $script:TxtCustomSearchUrl.Text = $url
+                }
+            } catch {}
+        }
+    }
+    # NTP override state
+    if ($script:ChkNtpOverride) {
+        try {
+            $ntpUrl = (Get-ItemProperty -Path $loadPath -Name 'NewTabPageLocation' -ErrorAction Stop).NewTabPageLocation
+            $script:ChkNtpOverride.Checked = $true
+            $matched = $false
+            foreach ($k in $script:DestinationOptions.Keys) {
+                if ($script:DestinationOptions[$k] -eq $ntpUrl) {
+                    $script:CmbNtpDest.SelectedItem = $k; $matched = $true; break
+                }
+            }
+            if (-not $matched) {
+                $script:CmbNtpDest.SelectedItem = 'Custom URL...'
+                $script:TxtNtpCustomUrl.Text = $ntpUrl
+            }
+        } catch { $script:ChkNtpOverride.Checked = $false }
+    }
+    # Startup override state
+    if ($script:ChkStartupOverride) {
+        try {
+            $code = (Get-ItemProperty -Path $loadPath -Name 'RestoreOnStartup' -ErrorAction Stop).RestoreOnStartup
+            $script:ChkStartupOverride.Checked = $true
+            foreach ($k in $script:StartupModes.Keys) {
+                if ($script:StartupModes[$k].Code -eq $code) { $script:CmbStartupMode.SelectedItem = $k; break }
+            }
+            $listPath = Join-Path $loadPath 'RestoreOnStartupURLs'
+            if (Test-Path $listPath) {
+                $props = Get-ItemProperty -Path $listPath
+                $urls = @()
+                foreach ($p in $props.PSObject.Properties) {
+                    if ($p.Name -match '^\d+$') { $urls += $p.Value }
+                }
+                if ($urls.Count -gt 0) { $script:TxtStartupUrl.Text = ($urls -join ', ') }
+            }
+        } catch { $script:ChkStartupOverride.Checked = $false }
     }
     $script:SuppressSelectionEvents = $false
     $script:ActiveProfile = 'CurrentState'
@@ -758,9 +1775,9 @@ $btnClose.Add_Click({ $form.Close() })
 $utilityPanel.Controls.Add($btnClose)
 
 $flowLabel = New-Object System.Windows.Forms.Label
-$flowLabel.Text = 'Suggested flow: pick a mode -> tweak categories -> apply -> restart Brave -> verify at brave://policy'
-$flowLabel.Location = New-Object System.Drawing.Point(430, 11)
-$flowLabel.Size = New-Object System.Drawing.Size(690, 18)
+$flowLabel.Text = 'Pick mode -> tweak -> Apply -> restart Brave -> Verify'
+$flowLabel.Location = New-Object System.Drawing.Point(740, 11)
+$flowLabel.Size = New-Object System.Drawing.Size(400, 18)
 $flowLabel.ForeColor = [System.Drawing.Color]::DimGray
 $utilityPanel.Controls.Add($flowLabel)
 
@@ -790,23 +1807,44 @@ $btnApply.Add_Click({
 
     $applied = 0
     $cleared = 0
-    foreach ($cb in $script:CheckBoxes) {
-        $p = $cb.Tag.Policy
-        if ($cb.Checked) {
-            try {
-                Set-PolicyValue -Name $p.Name -Type $p.Type -Value $p.ApplyValue
-                Write-Log "SET $($p.Name) = $($p.ApplyValue)" 'OK'
-                $applied++
-            } catch {
-                Write-Log "FAIL $($p.Name): $_" 'ERR'
-            }
-        } else {
-            if (Remove-PolicyValue -Name $p.Name) {
-                Write-Log "CLEARED $($p.Name)" 'OK'
-                $cleared++
+    $originalPath = $script:BravePolicyPath
+    foreach ($channel in $script:TargetChannels) {
+        $script:BravePolicyPath = $script:Channels[$channel].Path
+        Write-Log "--- Applying to channel: $channel ($($script:BravePolicyPath)) ---"
+        foreach ($cb in $script:CheckBoxes) {
+            $p = $cb.Tag.Policy
+            if ($cb.Checked) {
+                try {
+                    Set-PolicyValue -Name $p.Name -Type $p.Type -Value $p.ApplyValue
+                    Write-Log "[$channel] SET $($p.Name) = $($p.ApplyValue)" 'OK'
+                    $applied++
+                } catch {
+                    Write-Log "[$channel] FAIL $($p.Name): $_" 'ERR'
+                }
+            } else {
+                if (Remove-PolicyValue -Name $p.Name) {
+                    Write-Log "[$channel] CLEARED $($p.Name)" 'OK'
+                    $cleared++
+                }
             }
         }
+
+        # Search/NTP/Startup overrides run LAST so they always win over any
+        # NewTabPageLocation/HomepageLocation/RestoreOnStartup ticks above.
+        # Each helper clears its own keys first, so unticking + Apply truly removes them.
+        if ($script:BravePolicyPath -and (Test-Path $script:BravePolicyPath)) {
+            try { [void](Apply-SearchEngineOverride -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Search override: $_" 'ERR' }
+            try { [void](Apply-NtpOverride          -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] NTP override: $_" 'ERR' }
+            try { [void](Apply-StartupOverride      -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Startup override: $_" 'ERR' }
+        } elseif ($script:ChkSearchOverride.Checked -or $script:ChkNtpOverride.Checked -or $script:ChkStartupOverride.Checked) {
+            # No policy key yet but overrides are requested - create the key and run them
+            New-Item -Path $script:BravePolicyPath -Force | Out-Null
+            try { [void](Apply-SearchEngineOverride -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Search override: $_" 'ERR' }
+            try { [void](Apply-NtpOverride          -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] NTP override: $_" 'ERR' }
+            try { [void](Apply-StartupOverride      -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Startup override: $_" 'ERR' }
+        }
     }
+    $script:BravePolicyPath = $originalPath
 
     foreach ($cb in $script:TaskCheckBoxes) {
         $t = $cb.Tag
@@ -867,18 +1905,26 @@ $btnRemoveAll.Location = New-Object System.Drawing.Point(460, 4)
 $btnRemoveAll.BackColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
 $btnRemoveAll.ForeColor = [System.Drawing.Color]::White
 $btnRemoveAll.Add_Click({
+    $targets = $script:TargetChannels -join ', '
     $ans = [System.Windows.Forms.MessageBox]::Show(
-        "This will delete the entire HKLM\Software\Policies\BraveSoftware\Brave key.`r`nBrave returns to stock behaviour. Continue?",
+        "This will delete the policy keys for: $targets`r`nBrave returns to stock behaviour for those channel(s). Continue?",
         'Confirm',
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($ans -ne 'Yes') { return }
     if ($chkBackup.Checked) { [void](Export-Backup) }
-    try {
-        Remove-Item -Path $script:BravePolicyPath -Recurse -Force -ErrorAction Stop
-        Write-Log 'Removed entire Brave policy key.' 'OK'
-    } catch {
-        Write-Log "Remove-Item: $_" 'ERR'
+    foreach ($channel in $script:TargetChannels) {
+        $path = $script:Channels[$channel].Path
+        try {
+            if (Test-Path $path) {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                Write-Log "Removed policy key for $channel ($path)" 'OK'
+            } else {
+                Write-Log "$channel had no policy key - skipped." 'INFO'
+            }
+        } catch {
+            Write-Log "Remove-Item [$channel]: $_" 'ERR'
+        }
     }
     $script:SuppressSelectionEvents = $true
     foreach ($cb in $script:CheckBoxes) { $cb.Checked = $false }

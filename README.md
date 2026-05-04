@@ -1,10 +1,130 @@
-# Brave Free Origin (v1.4)
+# Brave Free Origin (v1.7)
 
 `Brave Free Origin` is a Windows GUI tool that turns normal Brave into a leaner, stripped-down build without paying for Brave Origin.
 
 The point is simple: Brave took the "remove the AI, crypto, VPN, promo junk" idea, called it Origin, and put it behind a paid upgrade. This project does the local Windows policy version of that idea for free, and then goes further with extra performance-focused modes.
 
 It is inspired by [MulesGaming/brave-debullshitinator](https://github.com/MulesGaming/brave-debullshitinator), but reshaped into a cleaner WinForms app with one-click modes, screenshots, backups, and a more normal Windows-user flow.
+
+![Brave Free Origin GUI](images/screenshot.png)
+
+---
+
+## Quick Start (read this first)
+
+**1. Extract the whole folder out of the ZIP.** Don't try to run anything from inside the ZIP — Windows blocks PowerShell scripts launched from compressed archives.
+
+**2. Double-click `Brave-Free-Origin.bat`.**
+
+That is the launcher. It opens PowerShell with the right execution-policy flag and asks Windows for administrator permission.
+
+> ⚠️ **Important:** do **not** double-click `Brave-Free-Origin.ps1` directly. Windows opens `.ps1` files in Notepad by default — the GUI will *not* appear and you will think the tool is broken. **Always use the `.bat`.**
+
+**3. Click "Yes" on the UAC prompt.** Admin rights are required because the tool writes to `HKEY_LOCAL_MACHINE\Software\Policies\BraveSoftware\Brave` — the same place corporate IT writes group policies. No admin = no policies = nothing happens.
+
+**4. In the GUI, click `Load current state`** (top-left) if you want to see what's already configured on your machine. The boxes light up to show what is already enforced.
+
+**5. Pick a mode** in the colored button row at the top:
+
+| Button | What it does |
+|---|---|
+| **Quick Debloat** | Lightest cleanup. Removes the loudest extras (Rewards, Wallet, VPN, AI, password manager). Safest. |
+| **Recommended** | Sensible daily-driver setup. Good privacy + lighter UI + media-friendly defaults. |
+| **Origin Mode** | The free local answer to Brave's paywalled "Origin" build. |
+| **Privacy + Boost** | Origin Mode + startup and latency tuning. The performance default. |
+| **Max Performance** | Origin + Boost + Max Privacy unioned + extra UI trims. Aggressive. |
+| **Max Privacy** | Hard lockdown — disables sync, sign-in, imports, Brave update services. |
+| **Stock / None** | Unticks everything. Click `Apply to Brave` after to revert to default Brave. |
+
+**6. (Optional) Tweak the tabs** below the buttons if you want to add/remove individual policies.
+
+**7. Click `Apply to Brave`** (the big green button). Then **fully close and reopen Brave** — running tabs need a restart to pick up the new policies.
+
+**8. (Recommended)** Click the `Verify` button in the app. It reads the registry back and confirms your selections actually landed. Or open `brave://policy` and check that each policy shows `Source: Platform`, `Scope: Machine`, `Status: OK`.
+
+### Files in this folder
+
+```
+Brave-Free-Origin/
+├── Brave-Free-Origin.bat   ← double-click THIS one
+├── Brave-Free-Origin.ps1   ← never double-click this (opens in Notepad)
+├── README.md               ← you are here
+├── LICENSE
+└── images/
+    ├── screenshot.png      ← GUI preview shown above
+    ├── Brave-before.png    ← memory comparison: before
+    └── Brave-after.png     ← memory comparison: after
+```
+
+The launcher (`.bat`) is essentially one line: it runs the PowerShell script with `-ExecutionPolicy Bypass`. That bypass is scoped only to that single launch — it does **not** weaken your machine's PowerShell policy.
+
+---
+
+<details>
+<summary><strong>📜 Changelog (click to expand)</strong></summary>
+
+### What's new in v1.7
+
+Two fixes / additions, both about the ad blocker.
+
+- **Preset bug fix: Origin Mode and Privacy + Boost now enforce ad blocking.** Earlier versions used a hand-curated list that omitted the Shields policies, so picking those modes left ad blocking at Brave's default instead of `Block`. Ad blocking is a **performance win** (fewer requests, less DOM, less JS) on top of being Brave's whole identity, so it belongs in the boost preset. Origin Mode and everything that derives from it now also force `DefaultBraveAdblockSetting=Block`, fingerprint protection to Standard, strict referrers, tracking-param stripping, De-AMP, and debouncing.
+- **Extensions section in the Search & Startup tab.** Two convenience buttons that just open install pages in Brave — no force-install, no "Managed by your organization" banner. uBlock Origin Lite (MV3-safe), Brave Shields settings, Bitwarden. Includes a one-line warning about double-blocking if you stack uBO on top of Shields.
+
+#### Why we don't auto-install uBlock Origin
+
+Brave Shields and uBO are roughly equivalent — same filter-list lineage, Shields runs native in the engine so it's marginally faster than uBO-as-an-extension. Stacking both wastes CPU per tab and breaks sites Shields handles fine because their default filter sets differ. Force-installing extensions via `ExtensionInstallForcelist` shows users a "Managed by your organization" banner and locks the extension on, which is invasive UX. Manifest V2 is also being deprecated, so pinning users to full uBO would age badly. uBO Lite (MV3) is the future-proof choice if you want a second blocker, hence the button.
+
+### What's new in v1.6
+
+Two additions, both opt-in.
+
+- **Search & Startup tab.** Three independent sections, each gated by its own checkbox so nothing fires unless you explicitly tick it.
+  - **Default search engine** for the omnibox: Brave Search, DuckDuckGo, Startpage, Qwant, Ecosia, Mojeek, Kagi, Google, Bing, Yandex, or a custom URL (must contain `{searchTerms}`). Writes the `DefaultSearchProvider*` policies. Untick + Apply removes the override and lets Brave's user-chosen engine come back.
+  - **New tab page**: blank / search engine homepage / custom URL. Writes `NewTabPageLocation`. Replaces and overrides anything the Performance tab set.
+  - **Startup behavior**: open new tab / restore last session / open blank / open a specific page or comma-separated set. Writes `RestoreOnStartup` and (when applicable) the `RestoreOnStartupURLs` list policy.
+  - All three run **last** in the apply order, so they cleanly win over any matching policy ticks in the Performance / Startup tab. They also clear their own keys before writing, so unticking + Apply truly removes the override (no orphan registry entries).
+  - Round-trips through Export/Import config and is included in the Verify report.
+
+- **Hosts blocks now wire into presets, with a strict no-orphan rule.** Picking a mode now also pre-ticks the hosts groups whose underlying feature is *also* being disabled by that mode's policies. Specifically:
+  - Quick Debloat → P3A, Variations, Stats ping, Web Discovery, Rewards (matches its policy set; News stays unblocked because Quick leaves News policy on).
+  - Recommended / Origin / Privacy + Boost → above + News CDN.
+  - Max Performance / Max Privacy → above + Component Updates (matches `ComponentUpdatesEnabled = 0`).
+  - Stock / None → all unticked.
+  - Hosts apply still has its own button in the Hosts tab — presets only suggest, they never write hosts entries silently.
+
+### What's new in v1.5
+
+Four additions, all opt-in and reversible. Nothing changes in existing modes — the new features sit alongside what you already know.
+
+- **Multi-channel target selector.** A dropdown in the header now lets you point the apply at Brave Stable, Beta, Nightly, Dev, or all installed channels at once. Other channels share the same policy schema but live under separate registry hives.
+- **Hosts file blocklist tab.** Optional DNS-level kill switch for Brave telemetry domains. Even if a Brave update bypasses a policy, the network call still fails. Sentinel-tagged in the hosts file (`# === Brave-Free-Origin START ===` / `=== END ===`) so removal is surgical and never touches your other entries. Auto-backs up `hosts` before any write. Has its own Apply / Remove buttons inside the tab — does **not** fire from the main "Apply to Brave" button, so you can never edit hosts by accident.
+- **Export / Import config.** Save your tuned checkbox state to a JSON file and reuse it on another machine, or share a community preset. Round-trips policies, tasks, services, and hosts groups.
+- **Verify button.** Reads the registry of every target channel and reports back which selected policies are present, missing, or have a wrong value. Also lists currently-blocked hosts entries. Useful when [Brave bug 45106](https://github.com/brave/brave-browser/issues/45106) leaves a feature visible despite the policy being set — `Verify` proves the registry is correct so you know whose problem it is.
+
+#### Will antivirus flag any of this?
+
+Short answer: no, by design.
+
+- No executable modification, no code-signing changes, no hex-edited binaries.
+- No new scheduled tasks, no auto-startup entries, no persistence mechanism.
+- Registry writes target the standard enterprise-policy hive — exactly what corporate IT does to manage browsers.
+- Hosts file edits use a clearly-labeled sentinel block that an admin can read or remove with Notepad. We use ASCII encoding (the format Windows expects); some AVs flag UTF-16 hosts files, ours does not.
+- Every destructive operation backs up first, into `Documents\Brave-Free-Origin-Backups\`.
+
+If your AV does flag the script, it's flagging the act of registry writes from PowerShell, not anything specific we do. Reading the script confirms it.
+
+#### Conflict notes
+
+The new features don't conflict with each other or with the existing modes. A few things to know:
+
+- Hosts blocking is a layered defense **on top of** policies, not a replacement. Picking a mode + ticking hosts blocks is the intended use.
+- The **Components** hosts group will stop Widevine and similar from updating. Only tick it if you also have `ComponentUpdatesEnabled` policy off (the same caveat as in Max Privacy mode).
+- Multi-channel apply does the same set of policies to every selected channel. If you only have Stable installed, leave the dropdown on Stable.
+- `Verify` reads from the dropdown's selected channel(s). Switch the dropdown, click Verify again to check a different channel.
+
+</details>
+
+---
 
 ## What It Does
 
@@ -38,18 +158,6 @@ It can also tune Brave for a lighter footprint:
 - disk cache cap
 - less background browser noise
 
-## Modes
-
-| Mode | What it is for |
-|------|----------------|
-| **Quick Debloat** | Light cleanup. Removes the loudest commercial extras without changing too much. |
-| **Recommended** | Good default. Debloat + privacy + compatibility-friendly settings. |
-| **Origin Mode** | The free local answer to Brave Origin. Focused on disabling non-core extras. |
-| **Privacy + Boost** | Origin-style cleanup plus startup and responsiveness tuning. |
-| **Max Performance** | Most aggressive speed/footprint profile. Cuts more features and also disables Brave updater tasks/services. |
-| **Max Privacy** | Hard privacy lockdown. Strongest privacy stance, but it can break updates and convenience features. |
-| **Stock / None** | Clears selections so you can remove enforced policies and go back toward stock behavior. |
-
 ## Before / After
 
 These screenshots are included in the project folder and show the exact comparison you added.
@@ -58,23 +166,11 @@ In your example, `Brave Browser (7)` drops from about **305.7 MB** to **222.4 MB
 
 ### Before
 
-![Brave before optimization](Brave-before.png)
+![Brave before optimization](images/Brave-before.png)
 
 ### After
 
-![Brave after optimization](Brave-after.png)
-
-## Windows Quick Start
-
-1. Extract the whole folder somewhere normal first.
-2. Do not run it from inside a ZIP.
-3. Double-click `Brave-Free-Origin.bat`.
-4. Accept the UAC prompt when Windows asks for administrator rights.
-5. In the app, click `Load current state` if you want to inspect what is already active.
-6. Pick a mode.
-7. Click `Apply to Brave`.
-8. Fully restart Brave.
-9. Open `brave://policy` and verify the policies show `Platform / Machine / OK`.
+![Brave after optimization](images/Brave-after.png)
 
 ## Important Windows Notes
 
@@ -184,14 +280,24 @@ Or:
 ## File Layout
 
 ```text
-BraveDebullshitinator-Pro/
-├── Brave-Free-Origin.ps1
-├── Brave-Free-Origin.bat
-├── Brave-before.png
-├── Brave-after.png
-├── README.md
-├── Brave-before.png
-└── Brave-after.png
+Brave-Free-Origin/
+├── Brave-Free-Origin.bat     # UAC-elevating launcher  ← double-click THIS
+├── Brave-Free-Origin.ps1     # Main GUI (~1800 lines, single file)
+├── README.md                 # this file
+├── LICENSE
+└── images/
+    ├── screenshot.png        # GUI preview
+    ├── Brave-before.png      # Memory comparison: before
+    └── Brave-after.png       # Memory comparison: after
+```
+
+Backups land here:
+
+```text
+%USERPROFILE%\Documents\Brave-Free-Origin-Backups\
+├── brave-policies-backup-YYYYMMDD-HHMMSS.reg   # registry snapshot before each apply
+├── hosts-backup-YYYYMMDD-HHMMSS.bak            # hosts snapshot before each hosts apply
+└── brave-free-origin-config-YYYYMMDD-HHMMSS.json   # exported configs
 ```
 
 ## Sources
