@@ -1,0 +1,24 @@
+# Default: let Git auto-detect text vs binary, normalize to LF in the repo.
+* text=auto
+
+# Windows-only files must use CRLF on disk - .bat and .cmd literally
+# require it (CMD parses CRLF), and .ps1 conventionally uses CRLF on Windows.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+
+# Cross-platform text files: keep LF in repo, let Git checkout-convert if needed.
+*.md    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.reg   text eol=crlf
+
+# Binary - never normalize.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.zip   binary
