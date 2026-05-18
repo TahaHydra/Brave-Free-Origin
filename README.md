@@ -1,4 +1,4 @@
-# Brave Free Origin (v1.7)
+# Brave Free Origin (v1.8)
 
 `Brave Free Origin` is a Windows GUI tool that turns normal Brave into a leaner, stripped-down build without paying for Brave Origin.
 
@@ -38,9 +38,11 @@ That is the launcher. It opens PowerShell with the right execution-policy flag a
 
 **6. (Optional) Tweak the tabs** below the buttons if you want to add/remove individual policies.
 
-**7. Click `Apply to Brave`** (the big green button). Then **fully close and reopen Brave** — running tabs need a restart to pick up the new policies.
+**7. Click `Preview changes`** before applying. It shows exactly what will be added, changed, cleared, disabled, or reset. Nothing is written from Preview.
 
-**8. (Recommended)** Click the `Verify` button in the app. It reads the registry back and confirms your selections actually landed. Or open `brave://policy` and check that each policy shows `Source: Platform`, `Scope: Machine`, `Status: OK`.
+**8. Click `Apply to Brave`** (the big green button). Then **fully close and reopen Brave** — running tabs need a restart to pick up the new policies.
+
+**9. (Recommended)** Click the `Verify` button in the app. It reads the registry back and confirms your selections actually landed. You can copy or save the report. Or open `brave://policy` and check that each policy shows `Source: Platform`, `Scope: Machine`, `Status: OK`.
 
 ### Files in this folder
 
@@ -62,6 +64,16 @@ The launcher (`.bat`) is essentially one line: it runs the PowerShell script wit
 
 <details>
 <summary><strong>📜 Changelog (click to expand)</strong></summary>
+
+### What's new in v1.8
+
+This is the trust-and-restore release. No random checkbox pile-on; the point is making the tool safer to use and easier to audit.
+
+- **Preview changes button.** Generates a dry-run report before writing anything. It shows per-channel policy adds, changes, clears, already-correct values, search/new-tab/startup override changes, scheduled task actions, service actions, and a reminder that hosts are managed separately.
+- **Preview hosts button.** The Hosts tab now shows what domains will be added, kept, or removed from the Brave-Free-Origin sentinel block before editing `hosts`.
+- **Full restore / stock button.** Replaces the old narrow "Remove ALL policies" behavior. It now removes Brave policy keys, clears the Brave-Free-Origin hosts block, re-enables known Brave update scheduled tasks, and resets known disabled Brave services to Manual.
+- **Copy/save reports.** Preview and Verify reports open in a scrollable dialog with Copy and Save report buttons. This makes support/debugging cleaner.
+- **Config export version bumped to `1.8`.** Exported JSON now reflects the current app generation.
 
 ### What's new in v1.7
 
@@ -248,26 +260,44 @@ Then do a real-world check:
 - startup should feel lighter in the performance modes
 - update services/tasks should only be disabled in the aggressive modes
 
+The in-app `Verify` report can be copied or saved to a text file. That is useful if Brave's UI still looks wrong but `brave://policy` says the registry policy is applied correctly.
+
 ## Restore / Undo
 
-The app can export backups before applying changes.
+The app can export backups before applying changes, and v1.8 adds a stronger stock restore path.
 
 Backups go to:
 
 `%USERPROFILE%\Documents\Brave-Free-Origin-Backups\`
 
-To undo:
+To preview a change before committing it:
+
+1. Pick a mode or tweak checkboxes
+2. Click `Preview changes`
+3. Review the report
+4. Click `Apply to Brave` only if it looks right
+
+To fully restore stock behavior:
 
 1. Re-run the app
-2. Use `Stock / None` and click `Apply to Brave`
+2. Select the target channel, or `All installed channels`
+3. Click `Full restore / stock`
 
-Or:
+That removes Brave policy keys, clears the Brave-Free-Origin hosts block, re-enables known Brave update tasks, and resets known disabled Brave services to Manual.
 
-1. Use `Remove ALL policies`
+For a lighter policy-only revert:
+
+1. Use `Stock / None`
+2. Click `Preview changes`
+3. Click `Apply to Brave`
 
 Or:
 
 1. Double-click a `.reg` backup file to restore a previous registry state
+
+Or:
+
+1. Use the Hosts tab's `Remove hosts block` button to clear only the DNS-level blocklist
 
 ## Caveats
 
@@ -282,7 +312,7 @@ Or:
 ```text
 Brave-Free-Origin/
 ├── Brave-Free-Origin.bat     # UAC-elevating launcher  ← double-click THIS
-├── Brave-Free-Origin.ps1     # Main GUI (~1800 lines, single file)
+├── Brave-Free-Origin.ps1     # Main GUI, single-file WinForms app
 ├── README.md                 # this file
 ├── LICENSE
 └── images/

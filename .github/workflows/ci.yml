@@ -1,0 +1,57 @@
+name: Validate and package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  powershell-validate:
+    name: PowerShell validation
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse PowerShell script
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'Brave-Free-Origin.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors) {
+            $errors | Format-List *
+            exit 1
+          }
+          'PowerShell parse OK'
+
+      - name: Check launcher target
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'Brave-Free-Origin.bat')) { throw 'Launcher is missing.' }
+          if (-not (Test-Path 'Brave-Free-Origin.ps1')) { throw 'PowerShell app is missing.' }
+          $bat = Get-Content 'Brave-Free-Origin.bat' -Raw
+          if ($bat -notmatch 'Brave-Free-Origin\.ps1') { throw 'Launcher does not reference Brave-Free-Origin.ps1.' }
+          'Launcher check OK'
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $out = 'Brave-Free-Origin.zip'
+          if (Test-Path $out) { Remove-Item $out -Force }
+          Compress-Archive -Path @(
+            'Brave-Free-Origin.bat',
+            'Brave-Free-Origin.ps1',
+            'README.md',
+            'LICENSE',
+            'images'
+          ) -DestinationPath $out -Force
+          Get-FileHash $out -Algorithm SHA256 | Format-List
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Brave-Free-Origin
+          path: Brave-Free-Origin.zip

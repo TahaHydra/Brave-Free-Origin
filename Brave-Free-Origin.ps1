@@ -394,11 +394,426 @@ function Get-BraveVersion {
     }
     return 'not installed'
 }
+
+function Show-TextReport {
+    param(
+        [string]$Title,
+        [string]$Text,
+        [string]$DefaultFileName = 'brave-free-origin-report.txt'
+    )
+
+    $rf = New-Object System.Windows.Forms.Form
+    $rf.Text = $Title
+    $rf.Size = New-Object System.Drawing.Size(760, 560)
+    $rf.StartPosition = 'CenterParent'
+    $rf.MinimumSize = New-Object System.Drawing.Size(620, 420)
+
+    $buttons = New-Object System.Windows.Forms.Panel
+    $buttons.Dock = 'Bottom'
+    $buttons.Height = 44
+    $rf.Controls.Add($buttons)
+
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Multiline = $true
+    $tb.ReadOnly = $true
+    $tb.ScrollBars = 'Both'
+    $tb.WordWrap = $false
+    $tb.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $tb.Dock = 'Fill'
+    $tb.Text = $Text
+    $rf.Controls.Add($tb)
+
+    $copy = New-Object System.Windows.Forms.Button
+    $copy.Text = 'Copy'
+    $copy.Size = New-Object System.Drawing.Size(90, 28)
+    $copy.Location = New-Object System.Drawing.Point(10, 8)
+    $copy.Add_Click({
+        [System.Windows.Forms.Clipboard]::SetText($tb.Text)
+    })
+    $buttons.Controls.Add($copy)
+
+    $save = New-Object System.Windows.Forms.Button
+    $save.Text = 'Save report'
+    $save.Size = New-Object System.Drawing.Size(110, 28)
+    $save.Location = New-Object System.Drawing.Point(110, 8)
+    $save.Add_Click({
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.Filter = 'Text report (*.txt)|*.txt'
+        $sfd.FileName = $DefaultFileName
+        $sfd.InitialDirectory = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
+        if (-not (Test-Path $sfd.InitialDirectory)) { New-Item -ItemType Directory -Path $sfd.InitialDirectory | Out-Null }
+        if ($sfd.ShowDialog() -eq 'OK') {
+            Set-Content -Path $sfd.FileName -Value $tb.Text -Encoding UTF8
+            Write-Log "Report saved: $($sfd.FileName)" 'OK'
+        }
+    })
+    $buttons.Controls.Add($save)
+
+    $close = New-Object System.Windows.Forms.Button
+    $close.Text = 'Close'
+    $close.Size = New-Object System.Drawing.Size(90, 28)
+    $close.Location = New-Object System.Drawing.Point(230, 8)
+    $close.Add_Click({ $rf.Close() })
+    $buttons.Controls.Add($close)
+
+    $buttons.BringToFront()
+    [void]$rf.ShowDialog()
+}
+
+function Get-RegistryValueState {
+    param([string]$Path, [string]$Name)
+    if (-not (Test-Path $Path)) {
+        return [pscustomobject]@{ Exists = $false; Value = $null }
+    }
+    try {
+        $props = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        return [pscustomobject]@{ Exists = $true; Value = $props.PSObject.Properties[$Name].Value }
+    } catch {
+        return [pscustomobject]@{ Exists = $false; Value = $null }
+    }
+}
+
+function Get-RegistryNumberedValues {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return @() }
+    $props = Get-ItemProperty -Path $Path
+    $items = @()
+    foreach ($p in $props.PSObject.Properties) {
+        if ($p.Name -match '^\d+$') {
+            $items += [pscustomobject]@{ Index = [int]$p.Name; Value = $p.Value }
+        }
+    }
+    return @($items | Sort-Object Index | ForEach-Object { $_.Value })
+}
+
+function Get-SelectedHostsDomains {
+    $domains = @()
+    if ($script:HostsCheckBoxes) {
+        foreach ($cb in $script:HostsCheckBoxes) {
+            if ($cb.Checked) { $domains += $cb.Tag.Domains }
+        }
+    }
+    return @($domains | Sort-Object -Unique)
+}
+
+function Get-DesiredSearchOverride {
+    $desired = [ordered]@{}
+    if (-not $script:ChkSearchOverride.Checked) { return $desired }
+
+    $engineKey = $script:CmbSearchEngine.SelectedItem
+    $eng = $script:SearchEngines[$engineKey]
+    $url = $eng.URL
+    $sug = $eng.Suggest
+    $name = $engineKey
+    $keyword = $eng.Keyword
+
+    if ($eng.IsCustom) {
+        $url = $script:TxtCustomSearchUrl.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($url)) { throw 'Custom search URL is empty.' }
+        if ($url -notmatch '\{searchTerms\}') { throw 'Custom search URL must contain {searchTerms}.' }
+        $name = 'Custom Search'
+    }
+
+    $desired['DefaultSearchProviderEnabled'] = @{ Type='DWORD'; Value=1 }
+    $desired['DefaultSearchProviderName'] = @{ Type='STRING'; Value=$name }
+    $desired['DefaultSearchProviderKeyword'] = @{ Type='STRING'; Value=$keyword }
+    $desired['DefaultSearchProviderSearchURL'] = @{ Type='STRING'; Value=$url }
+    if ($sug) { $desired['DefaultSearchProviderSuggestURL'] = @{ Type='STRING'; Value=$sug } }
+    return $desired
+}
+
+function Get-DesiredNtpOverride {
+    $desired = [ordered]@{}
+    if (-not $script:ChkNtpOverride.Checked) { return $desired }
+
+    $engineKey = $script:CmbSearchEngine.SelectedItem
+    $engineHome = if ($script:SearchEngines[$engineKey].IsCustom) { '' } else { $script:SearchEngines[$engineKey].Home }
+    $url = Resolve-Destination -DropdownLabel $script:CmbNtpDest.SelectedItem -CustomUrl $script:TxtNtpCustomUrl.Text -SearchEngineHome $engineHome
+    if ([string]::IsNullOrWhiteSpace($url)) { throw 'New tab override has no resolvable URL.' }
+    $desired['NewTabPageLocation'] = @{ Type='STRING'; Value=$url }
+    return $desired
+}
+
+function Get-DesiredStartupOverride {
+    if (-not $script:ChkStartupOverride.Checked) {
+        return [pscustomobject]@{ Enabled = $false; Code = $null; Urls = @() }
+    }
+
+    $modeKey = $script:CmbStartupMode.SelectedItem
+    $mode = $script:StartupModes[$modeKey]
+    $urls = @()
+    if ($mode.UsesURL) {
+        $urls = if ($mode.FixedURL) { @($mode.FixedURL) }
+                else { @($script:TxtStartupUrl.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        if ($urls.Count -eq 0) { throw 'Startup override has no URL.' }
+    }
+    return [pscustomobject]@{ Enabled = $true; Code = $mode.Code; Urls = $urls }
+}
+
+function Add-RegistryPlanLines {
+    param(
+        [System.Text.StringBuilder]$Report,
+        [string]$Path,
+        [System.Collections.IDictionary]$Desired,
+        [string[]]$Names,
+        [string]$Title
+    )
+
+    [void]$Report.AppendLine("  -- $Title")
+    $changes = 0
+    foreach ($name in $Names) {
+        $state = Get-RegistryValueState -Path $Path -Name $name
+        if ($Desired.Contains($name)) {
+            $target = $Desired[$name].Value
+            if (-not $state.Exists) {
+                [void]$Report.AppendLine("     ADD    $name = $target")
+                $changes++
+            } elseif ("$($state.Value)" -eq "$target") {
+                [void]$Report.AppendLine("     KEEP   $name = $target")
+            } else {
+                [void]$Report.AppendLine("     CHANGE $name : $($state.Value) -> $target")
+                $changes++
+            }
+        } elseif ($state.Exists) {
+            [void]$Report.AppendLine("     CLEAR  $name (currently $($state.Value))")
+            $changes++
+        }
+    }
+    if ($changes -eq 0) { [void]$Report.AppendLine('     No write needed.') }
+}
+
+function New-HostsPlanReport {
+    $desired = @(Get-SelectedHostsDomains)
+    $current = @(Get-HostsCurrentDomains)
+    $toAdd = @($desired | Where-Object { $current -notcontains $_ })
+    $toKeep = @($desired | Where-Object { $current -contains $_ })
+    $toRemove = @($current | Where-Object { $desired -notcontains $_ })
+
+    $report = New-Object System.Text.StringBuilder
+    [void]$report.AppendLine('Brave Free Origin hosts preview')
+    [void]$report.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$report.AppendLine("File: $($script:HostsFile)")
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine("Selected groups: $(@($script:HostsCheckBoxes | Where-Object { $_.Checked }).Count)")
+    [void]$report.AppendLine("Current managed domains: $($current.Count)")
+    [void]$report.AppendLine("Desired managed domains: $($desired.Count)")
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine("Add: $($toAdd.Count)")
+    foreach ($d in $toAdd) { [void]$report.AppendLine("  + $d") }
+    [void]$report.AppendLine("Keep: $($toKeep.Count)")
+    foreach ($d in $toKeep) { [void]$report.AppendLine("  = $d") }
+    [void]$report.AppendLine("Remove from managed block: $($toRemove.Count)")
+    foreach ($d in $toRemove) { [void]$report.AppendLine("  - $d") }
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine('No other hosts entries are touched. The GUI only replaces the Brave-Free-Origin sentinel block.')
+    return $report.ToString()
+}
+
+function New-ApplyPlanReport {
+    $report = New-Object System.Text.StringBuilder
+    $modeKey = if ([string]::IsNullOrWhiteSpace($script:ActiveProfile)) { 'Custom' } else { $script:ActiveProfile }
+    $modeLabel = if ($script:ProfileDisplayNames.ContainsKey($modeKey)) { $script:ProfileDisplayNames[$modeKey] } else { $modeKey }
+
+    [void]$report.AppendLine('Brave Free Origin apply preview')
+    [void]$report.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$report.AppendLine("Mode: $modeLabel")
+    [void]$report.AppendLine("Target channel(s): $($script:TargetChannels -join ', ')")
+    [void]$report.AppendLine("Backup before apply: $($chkBackup.Checked)")
+    [void]$report.AppendLine('')
+    [void]$report.AppendLine('This is a dry run. Nothing has been written.')
+    [void]$report.AppendLine('')
+
+    foreach ($channel in $script:TargetChannels) {
+        $path = $script:Channels[$channel].Path
+        [void]$report.AppendLine("=== $channel  ($path) ===")
+        $adds = 0; $changes = 0; $clears = 0; $keeps = 0
+
+        foreach ($cb in $script:CheckBoxes) {
+            $p = $cb.Tag.Policy
+            $state = Get-RegistryValueState -Path $path -Name $p.Name
+            if ($cb.Checked) {
+                if (-not $state.Exists) {
+                    [void]$report.AppendLine("  ADD    $($p.Name) = $($p.ApplyValue)")
+                    $adds++
+                } elseif ("$($state.Value)" -eq "$($p.ApplyValue)") {
+                    [void]$report.AppendLine("  KEEP   $($p.Name) = $($p.ApplyValue)")
+                    $keeps++
+                } else {
+                    [void]$report.AppendLine("  CHANGE $($p.Name) : $($state.Value) -> $($p.ApplyValue)")
+                    $changes++
+                }
+            } elseif ($state.Exists) {
+                [void]$report.AppendLine("  CLEAR  $($p.Name) (currently $($state.Value))")
+                $clears++
+            }
+        }
+        [void]$report.AppendLine("  Summary: $adds add, $changes change, $clears clear, $keeps already correct")
+        [void]$report.AppendLine('')
+
+        try {
+            $searchDesired = Get-DesiredSearchOverride
+            Add-RegistryPlanLines -Report $report -Path $path -Desired $searchDesired -Names @(
+                'DefaultSearchProviderEnabled',
+                'DefaultSearchProviderName',
+                'DefaultSearchProviderKeyword',
+                'DefaultSearchProviderSearchURL',
+                'DefaultSearchProviderSuggestURL'
+            ) -Title 'Search override'
+        } catch {
+            [void]$report.AppendLine("  -- Search override")
+            [void]$report.AppendLine("     ERROR: $_")
+        }
+        [void]$report.AppendLine('')
+
+        try {
+            $ntpDesired = Get-DesiredNtpOverride
+            Add-RegistryPlanLines -Report $report -Path $path -Desired $ntpDesired -Names @('NewTabPageLocation') -Title 'New tab override'
+        } catch {
+            [void]$report.AppendLine("  -- New tab override")
+            [void]$report.AppendLine("     ERROR: $_")
+        }
+        [void]$report.AppendLine('')
+
+        try {
+            $startup = Get-DesiredStartupOverride
+            [void]$report.AppendLine('  -- Startup override')
+            $curStartup = Get-RegistryValueState -Path $path -Name 'RestoreOnStartup'
+            $urlPath = Join-Path $path 'RestoreOnStartupURLs'
+            $curUrls = @(Get-RegistryNumberedValues -Path $urlPath)
+            if ($startup.Enabled) {
+                if (-not $curStartup.Exists) {
+                    [void]$report.AppendLine("     ADD    RestoreOnStartup = $($startup.Code)")
+                } elseif ("$($curStartup.Value)" -eq "$($startup.Code)") {
+                    [void]$report.AppendLine("     KEEP   RestoreOnStartup = $($startup.Code)")
+                } else {
+                    [void]$report.AppendLine("     CHANGE RestoreOnStartup : $($curStartup.Value) -> $($startup.Code)")
+                }
+                if ($startup.Urls.Count -gt 0) {
+                    [void]$report.AppendLine("     REPLACE RestoreOnStartupURLs with $($startup.Urls.Count) URL(s): $($startup.Urls -join ', ')")
+                } elseif ($curUrls.Count -gt 0) {
+                    [void]$report.AppendLine('     CLEAR  RestoreOnStartupURLs')
+                } else {
+                    [void]$report.AppendLine('     No startup URL list needed.')
+                }
+            } else {
+                if ($curStartup.Exists) { [void]$report.AppendLine("     CLEAR  RestoreOnStartup (currently $($curStartup.Value))") }
+                if ($curUrls.Count -gt 0) { [void]$report.AppendLine("     CLEAR  RestoreOnStartupURLs ($($curUrls.Count) URL(s))") }
+                if (-not $curStartup.Exists -and $curUrls.Count -eq 0) { [void]$report.AppendLine('     No write needed.') }
+            }
+        } catch {
+            [void]$report.AppendLine('  -- Startup override')
+            [void]$report.AppendLine("     ERROR: $_")
+        }
+        [void]$report.AppendLine('')
+    }
+
+    [void]$report.AppendLine('=== Scheduled tasks ===')
+    foreach ($cb in $script:TaskCheckBoxes) {
+        $t = $cb.Tag
+        $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
+        if (-not $task) {
+            [void]$report.AppendLine("  MISSING $($t.Name) - skipped")
+        } elseif ($cb.Checked) {
+            if ($task.State -eq 'Disabled') { [void]$report.AppendLine("  KEEP    $($t.Name) disabled") }
+            else { [void]$report.AppendLine("  DISABLE $($t.Name) (currently $($task.State))") }
+        } else {
+            if ($task.State -eq 'Disabled') { [void]$report.AppendLine("  ENABLE  $($t.Name)") }
+            else { [void]$report.AppendLine("  KEEP    $($t.Name) enabled/current state $($task.State)") }
+        }
+    }
+    [void]$report.AppendLine('')
+
+    [void]$report.AppendLine('=== Services ===')
+    foreach ($cb in $script:ServiceCheckBoxes) {
+        $s = $cb.Tag
+        $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            [void]$report.AppendLine("  MISSING $($s.Name) - skipped")
+        } elseif ($cb.Checked) {
+            if ($svc.StartType -eq 'Disabled') { [void]$report.AppendLine("  KEEP    $($s.Name) disabled") }
+            else { [void]$report.AppendLine("  DISABLE $($s.Name) (currently $($svc.StartType), $($svc.Status))") }
+        } else {
+            if ($svc.StartType -eq 'Disabled') { [void]$report.AppendLine("  RESET   $($s.Name) startup type to Manual") }
+            else { [void]$report.AppendLine("  KEEP    $($s.Name) startup type $($svc.StartType)") }
+        }
+    }
+    [void]$report.AppendLine('')
+
+    [void]$report.AppendLine('=== Hosts blocklist ===')
+    [void]$report.AppendLine('Main Apply does not edit hosts. Use Preview hosts / Apply hosts blocks inside the Hosts tab.')
+    [void]$report.AppendLine("Selected hosts domains right now: $(@(Get-SelectedHostsDomains).Count)")
+
+    return $report.ToString()
+}
+
+function Invoke-FullRestore {
+    param([bool]$Backup)
+
+    if ($Backup) { [void](Export-Backup) }
+
+    foreach ($channel in $script:TargetChannels) {
+        $path = $script:Channels[$channel].Path
+        try {
+            if (Test-Path $path) {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                Write-Log "Removed policy key for $channel ($path)" 'OK'
+            } else {
+                Write-Log "$channel had no policy key - skipped." 'INFO'
+            }
+        } catch {
+            Write-Log "Full restore policy remove [$channel]: $_" 'ERR'
+        }
+    }
+
+    $currentHosts = @(Get-HostsCurrentDomains)
+    if ($currentHosts.Count -gt 0) {
+        try { Clear-HostsBlock } catch { Write-Log "Full restore hosts clear: $_" 'ERR' }
+    } else {
+        Write-Log 'No Brave-Free-Origin hosts block present.' 'INFO'
+    }
+
+    foreach ($t in $script:ScheduledTasks) {
+        try {
+            $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
+            if ($task -and $task.State -eq 'Disabled') {
+                Enable-ScheduledTask -TaskName $t.Name -ErrorAction Stop | Out-Null
+                Write-Log "ENABLED task $($t.Name)" 'OK'
+            }
+        } catch {
+            Write-Log "Full restore task $($t.Name): $_" 'WARN'
+        }
+    }
+
+    foreach ($s in $script:Services) {
+        try {
+            $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
+            if ($svc -and $svc.StartType -eq 'Disabled') {
+                Set-Service -Name $s.Name -StartupType Manual -ErrorAction Stop
+                Write-Log "RESET service $($s.Name) to Manual" 'OK'
+            }
+        } catch {
+            Write-Log "Full restore service $($s.Name): $_" 'WARN'
+        }
+    }
+
+    $script:SuppressSelectionEvents = $true
+    foreach ($cb in $script:CheckBoxes)        { $cb.Checked = $false }
+    foreach ($cb in $script:TaskCheckBoxes)    { $cb.Checked = $false }
+    foreach ($cb in $script:ServiceCheckBoxes) { $cb.Checked = $false }
+    foreach ($cb in $script:HostsCheckBoxes)   { $cb.Checked = $false }
+    if ($script:ChkSearchOverride)  { $script:ChkSearchOverride.Checked = $false }
+    if ($script:ChkNtpOverride)     { $script:ChkNtpOverride.Checked = $false }
+    if ($script:ChkStartupOverride) { $script:ChkStartupOverride.Checked = $false }
+    $script:SuppressSelectionEvents = $false
+    $script:ActiveProfile = 'None'
+    Update-SelectionSummary
+    Write-Log 'Full restore completed. Restart Brave to see stock behavior.' 'DONE'
+}
 #endregion
 
 #region GUI Build -------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Brave Free Origin v1.7  -  the free answer to Brave Origin's paywalled minimal mode"
+$form.Text = "Brave Free Origin v1.8  -  the free answer to Brave Origin's paywalled minimal mode"
 $form.Size = New-Object System.Drawing.Size(1180, 900)
 $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(1080, 820)
@@ -1075,10 +1490,19 @@ $btnLoadHosts.Add_Click({
 })
 $hostsTab.Controls.Add($btnLoadHosts)
 
+$btnPreviewHosts = New-Object System.Windows.Forms.Button
+$btnPreviewHosts.Text = 'Preview hosts'
+$btnPreviewHosts.Size = New-Object System.Drawing.Size(130, 30)
+$btnPreviewHosts.Location = New-Object System.Drawing.Point(525, ($y + 10))
+$btnPreviewHosts.Add_Click({
+    Show-TextReport -Title 'Preview hosts blocklist' -Text (New-HostsPlanReport) -DefaultFileName "brave-free-origin-hosts-preview-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+})
+$hostsTab.Controls.Add($btnPreviewHosts)
+
 $btnOpenHosts = New-Object System.Windows.Forms.Button
 $btnOpenHosts.Text = 'Open hosts file'
 $btnOpenHosts.Size = New-Object System.Drawing.Size(140, 30)
-$btnOpenHosts.Location = New-Object System.Drawing.Point(525, ($y + 10))
+$btnOpenHosts.Location = New-Object System.Drawing.Point(665, ($y + 10))
 $btnOpenHosts.Add_Click({ Start-Process notepad.exe $script:HostsFile })
 $hostsTab.Controls.Add($btnOpenHosts)
 
@@ -1443,7 +1867,7 @@ $btnExport.Add_Click({
     if ($sfd.ShowDialog() -ne 'OK') { return }
 
     $cfg = [ordered]@{
-        version  = '1.6'
+        version  = '1.8'
         exported = (Get-Date -Format 's')
         channel  = $script:TargetChannels
         profile  = $script:ActiveProfile
@@ -1634,20 +2058,7 @@ $btnVerify.Add_Click({
         } catch { [void]$report.AppendLine('     Startup override: not set') }
     }
 
-    # Show in a scrollable dialog
-    $vf = New-Object System.Windows.Forms.Form
-    $vf.Text = 'Verify - registry vs selections'
-    $vf.Size = New-Object System.Drawing.Size(700, 520)
-    $vf.StartPosition = 'CenterParent'
-    $vt = New-Object System.Windows.Forms.TextBox
-    $vt.Multiline = $true
-    $vt.ReadOnly = $true
-    $vt.ScrollBars = 'Vertical'
-    $vt.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $vt.Dock = 'Fill'
-    $vt.Text = $report.ToString()
-    $vf.Controls.Add($vt)
-    [void]$vf.ShowDialog()
+    Show-TextReport -Title 'Verify - registry vs selections' -Text ($report.ToString()) -DefaultFileName "brave-free-origin-verify-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 })
 $utilityPanel.Controls.Add($btnVerify)
 
@@ -1775,7 +2186,7 @@ $btnClose.Add_Click({ $form.Close() })
 $utilityPanel.Controls.Add($btnClose)
 
 $flowLabel = New-Object System.Windows.Forms.Label
-$flowLabel.Text = 'Pick mode -> tweak -> Apply -> restart Brave -> Verify'
+$flowLabel.Text = 'Pick mode -> tweak -> Preview -> Apply -> restart Brave -> Verify'
 $flowLabel.Location = New-Object System.Drawing.Point(740, 11)
 $flowLabel.Size = New-Object System.Drawing.Size(400, 18)
 $flowLabel.ForeColor = [System.Drawing.Color]::DimGray
@@ -1795,10 +2206,19 @@ $chkBackup.Location = New-Object System.Drawing.Point(0, 12)
 $chkBackup.Size = New-Object System.Drawing.Size(270, 20)
 $actionPanel.Controls.Add($chkBackup)
 
+$btnPreview = New-Object System.Windows.Forms.Button
+$btnPreview.Text = 'Preview changes'
+$btnPreview.Size = New-Object System.Drawing.Size(140, 34)
+$btnPreview.Location = New-Object System.Drawing.Point(280, 4)
+$btnPreview.Add_Click({
+    Show-TextReport -Title 'Preview apply changes' -Text (New-ApplyPlanReport) -DefaultFileName "brave-free-origin-apply-preview-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+})
+$actionPanel.Controls.Add($btnPreview)
+
 $btnApply = New-Object System.Windows.Forms.Button
 $btnApply.Text = 'Apply to Brave'
 $btnApply.Size = New-Object System.Drawing.Size(150, 34)
-$btnApply.Location = New-Object System.Drawing.Point(300, 4)
+$btnApply.Location = New-Object System.Drawing.Point(430, 4)
 $btnApply.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 63)
 $btnApply.ForeColor = [System.Drawing.Color]::White
 $btnApply.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
@@ -1899,40 +2319,21 @@ $btnApply.Add_Click({
 $actionPanel.Controls.Add($btnApply)
 
 $btnRemoveAll = New-Object System.Windows.Forms.Button
-$btnRemoveAll.Text = 'Remove ALL policies'
-$btnRemoveAll.Size = New-Object System.Drawing.Size(160, 34)
-$btnRemoveAll.Location = New-Object System.Drawing.Point(460, 4)
+$btnRemoveAll.Text = 'Full restore / stock'
+$btnRemoveAll.Size = New-Object System.Drawing.Size(170, 34)
+$btnRemoveAll.Location = New-Object System.Drawing.Point(590, 4)
 $btnRemoveAll.BackColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
 $btnRemoveAll.ForeColor = [System.Drawing.Color]::White
 $btnRemoveAll.Add_Click({
     $targets = $script:TargetChannels -join ', '
     $ans = [System.Windows.Forms.MessageBox]::Show(
-        "This will delete the policy keys for: $targets`r`nBrave returns to stock behaviour for those channel(s). Continue?",
-        'Confirm',
+        "This will restore stock behavior for: $targets`r`n`r`nIt removes Brave policy keys, clears the Brave-Free-Origin hosts block, re-enables known Brave update tasks, and resets known disabled Brave services to Manual.`r`n`r`nContinue?",
+        'Full restore / stock',
         [System.Windows.Forms.MessageBoxButtons]::YesNo,
         [System.Windows.Forms.MessageBoxIcon]::Warning)
     if ($ans -ne 'Yes') { return }
-    if ($chkBackup.Checked) { [void](Export-Backup) }
-    foreach ($channel in $script:TargetChannels) {
-        $path = $script:Channels[$channel].Path
-        try {
-            if (Test-Path $path) {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                Write-Log "Removed policy key for $channel ($path)" 'OK'
-            } else {
-                Write-Log "$channel had no policy key - skipped." 'INFO'
-            }
-        } catch {
-            Write-Log "Remove-Item [$channel]: $_" 'ERR'
-        }
-    }
-    $script:SuppressSelectionEvents = $true
-    foreach ($cb in $script:CheckBoxes) { $cb.Checked = $false }
-    foreach ($cb in $script:TaskCheckBoxes) { $cb.Checked = $false }
-    foreach ($cb in $script:ServiceCheckBoxes) { $cb.Checked = $false }
-    $script:SuppressSelectionEvents = $false
-    $script:ActiveProfile = 'None'
-    Update-SelectionSummary
+    Invoke-FullRestore -Backup $chkBackup.Checked
+    [System.Windows.Forms.MessageBox]::Show('Full restore completed. Restart Brave to see stock behavior.', 'Brave Free Origin', 'OK', 'Information') | Out-Null
 })
 $actionPanel.Controls.Add($btnRemoveAll)
 
