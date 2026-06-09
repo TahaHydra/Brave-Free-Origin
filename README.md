@@ -1,4 +1,4 @@
-# Brave Free Origin (v1.10)
+# Brave Free Origin (v1.11)
 
 `Brave Free Origin` is a Windows GUI tool that turns normal Brave into a leaner, stripped-down build without paying for Brave Origin.
 
@@ -66,6 +66,14 @@ The launcher (`.bat`) is essentially one line: it runs the PowerShell script wit
 
 <details>
 <summary><strong>📜 Changelog (click to expand)</strong></summary>
+
+### What's new in v1.11
+
+This fixes the scriptlet scan hang from v1.10.
+
+- **Chunked in-app scanner.** Replaces the background-job scan with a timer-based chunk scanner, avoiding the slow PowerShell job serialization step that could sit on `Loading scriptlet scan results...` for minutes.
+- **Real progress bar.** The Scriptlets tab now shows a blue progress bar and live status based on files/bytes processed, current file, elapsed seconds, and rules found.
+- **Responsive during scan.** The scan yields back to the GUI every small chunk, so Windows should not mark the app as Not Responding while large Brave lists are being read.
 
 ### What's new in v1.10
 

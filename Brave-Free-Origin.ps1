@@ -67,7 +67,7 @@ $script:ScriptletUserDataRoots = [ordered]@{
 $script:ScriptletDisablePrefix = '! BFO disabled: '
 $script:ScriptletRules = @()
 $script:ScriptletVisibleRules = @()
-$script:ScriptletScanWorker = $null
+$script:ScriptletScanState = $null
 $script:ScriptletScanTimer = $null
 $script:ScriptletFilterTimer = $null
 $script:SuppressScriptletStatusEvents = $false
@@ -1278,200 +1278,217 @@ function Set-ScriptletVisibleChecks {
     Update-ScriptletStatusText
 }
 
+function Update-ScriptletScanProgress {
+    param([string]$Message = '')
+
+    $state = $script:ScriptletScanState
+    if (-not $state) { return }
+
+    $currentBytes = 0L
+    if ($state.Reader -and $state.Reader.BaseStream) {
+        try { $currentBytes = [int64]$state.Reader.BaseStream.Position } catch { $currentBytes = 0L }
+    }
+    $doneBytes = [Math]::Min([int64]$state.TotalBytes, [int64]($state.ProcessedBytes + $currentBytes))
+    $percent = if ($state.TotalBytes -gt 0) { [int](($doneBytes * 1000L) / $state.TotalBytes) } else { 0 }
+    $percent = [Math]::Max(0, [Math]::Min(1000, $percent))
+
+    if ($script:ScriptletProgress) {
+        $script:ScriptletProgress.Visible = $true
+        $script:ScriptletProgress.Style = 'Continuous'
+        $script:ScriptletProgress.Value = $percent
+    }
+
+    if ($script:LblScriptletStatus) {
+        if ([string]::IsNullOrWhiteSpace($Message)) {
+            $fileName = if ($state.CurrentFile) { Split-Path $state.CurrentFile.FullName -Leaf } else { 'starting...' }
+            $seconds = [Math]::Max(1, [int]$state.Stopwatch.Elapsed.TotalSeconds)
+            $Message = "Scanning file $($state.FileIndex) / $($state.Files.Count): $fileName. Found $($state.Records.Count) rule(s). $([int]($percent / 10))%. ${seconds}s"
+        }
+        $script:LblScriptletStatus.Text = $Message
+    }
+}
+
+function Stop-ScriptletScan {
+    if ($script:ScriptletScanTimer) { $script:ScriptletScanTimer.Stop() }
+    if ($script:ScriptletScanState -and $script:ScriptletScanState.Reader) {
+        try { $script:ScriptletScanState.Reader.Dispose() } catch {}
+    }
+    $script:ScriptletScanState = $null
+    Set-ScriptletUiBusy $false
+}
+
+function Complete-ScriptletScan {
+    $state = $script:ScriptletScanState
+    if (-not $state) { return }
+
+    if ($script:ScriptletScanTimer) { $script:ScriptletScanTimer.Stop() }
+    if ($state.Reader) {
+        try { $state.Reader.Dispose() } catch {}
+        $state.Reader = $null
+    }
+    $state.Stopwatch.Stop()
+
+    $script:ScriptletRules = @($state.Records.ToArray())
+    foreach ($warning in @($state.Warnings)) { Write-Log $warning 'WARN' }
+
+    if ($script:ScriptletProgress) {
+        $script:ScriptletProgress.Visible = $true
+        $script:ScriptletProgress.Style = 'Continuous'
+        $script:ScriptletProgress.Value = 1000
+    }
+
+    $elapsed = [Math]::Round($state.Stopwatch.Elapsed.TotalSeconds, 1)
+    $root = $state.Root
+    $script:ScriptletScanState = $null
+    if ($script:LblScriptletStatus) {
+        $script:LblScriptletStatus.Text = "Rendering $($script:ScriptletRules.Count) scriptlet row(s)..."
+    }
+    [System.Windows.Forms.Application]::DoEvents()
+    Update-ScriptletListView
+    Set-ScriptletUiBusy $false
+    Write-Log "Scriptlet scan complete: $($script:ScriptletRules.Count) rule(s) from $root in ${elapsed}s" 'OK'
+
+    if ($script:LblScriptletStatus) {
+        $script:LblScriptletStatus.Text += " Scan completed in ${elapsed}s."
+    }
+    if ($script:ScriptletRules.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "No Brave scriptlet rules were found in:`r`n$root`r`n`r`nUse Browse if your Brave User Data folder lives somewhere else.",
+            'Scriptlet manager',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    }
+}
+
+function Step-ScriptletScan {
+    $state = $script:ScriptletScanState
+    if (-not $state) {
+        if ($script:ScriptletScanTimer) { $script:ScriptletScanTimer.Stop() }
+        return
+    }
+
+    $startTick = [Environment]::TickCount64
+    $linesThisTick = 0
+    while ((([Environment]::TickCount64 - $startTick) -lt 35) -and ($linesThisTick -lt 2500)) {
+        if (-not $state.Reader) {
+            if ($state.FileIndex -ge $state.Files.Count) {
+                Complete-ScriptletScan
+                return
+            }
+
+            $file = $state.Files[$state.FileIndex]
+            $state.FileIndex++
+            $state.CurrentFile = $file
+            $state.CurrentLine = 0
+            try {
+                $state.Reader = [System.IO.File]::OpenText($file.FullName)
+            } catch {
+                [void]$state.Warnings.Add("Scriptlet scan failed $($file.FullName): $_")
+                $state.ProcessedBytes += [int64]$file.Length
+                $state.Reader = $null
+                continue
+            }
+        }
+
+        try {
+            $line = $state.Reader.ReadLine()
+        } catch {
+            [void]$state.Warnings.Add("Scriptlet scan failed $($state.CurrentFile.FullName): $_")
+            try { $state.Reader.Dispose() } catch {}
+            $state.ProcessedBytes += [int64]$state.CurrentFile.Length
+            $state.Reader = $null
+            continue
+        }
+
+        if ($null -eq $line) {
+            try { $state.Reader.Dispose() } catch {}
+            $state.ProcessedBytes += [int64]$state.CurrentFile.Length
+            $state.Reader = $null
+            continue
+        }
+
+        $state.CurrentLine++
+        $linesThisTick++
+        $record = ConvertTo-ScriptletRecord -File $state.CurrentFile.FullName -Root $state.Root -Line $line -LineNumber $state.CurrentLine
+        if ($record) { [void]$state.Records.Add($record) }
+    }
+
+    Update-ScriptletScanProgress
+}
+
 function Invoke-ScriptletScan {
     $root = $script:TxtScriptletRoot.Text.Trim()
-    if ($script:ScriptletScanWorker -and $script:ScriptletScanWorker.State -in @('NotStarted', 'Running')) {
+    if ($script:ScriptletScanState) {
         Write-Log 'Scriptlet scan is already running.' 'INFO'
         return
     }
 
-    Set-ScriptletUiBusy $true "Scanning scriptlets in the background... You can keep using the app."
-    Write-Log "Scriptlet scan started in background: $root" 'INFO'
-
-    $scanner = {
-        param([string]$Root, [hashtable]$ComponentNames)
-
-        function Get-BfoDisabledScriptletRuleInJob {
-            param([string]$Line)
-            if ($Line -match '^\s*!\s*BFO disabled:\s*(?<rule>.+)$') {
-                return $Matches.rule.Trim()
-            }
-            return $null
-        }
-
-        function Get-ScriptletComponentInfoInJob {
-            param([string]$File, [string]$Root, [hashtable]$ComponentNames)
-
-            $componentId = 'unknown'
-            $version = 'unknown'
-            $source = 'Unknown filter list'
-            try {
-                $full = [System.IO.Path]::GetFullPath($File)
-                $base = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
-                if ($full.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $relative = $full.Substring($base.Length)
-                    $parts = $relative -split '[\\/]'
-                    if ($parts.Count -ge 1) { $componentId = $parts[0] }
-                    if ($parts.Count -ge 2) { $version = $parts[1] }
-                }
-                if ($ComponentNames.ContainsKey($componentId)) {
-                    $source = $ComponentNames[$componentId]
-                } elseif ($componentId -ne 'unknown') {
-                    $source = $componentId
-                }
-            } catch {}
-
-            return [pscustomobject]@{
-                ComponentId = $componentId
-                Version     = $version
-                Source      = $source
-            }
-        }
-
-        function ConvertTo-ScriptletRecordInJob {
-            param([string]$File, [string]$Root, [string]$Line, [int]$LineNumber, [hashtable]$ComponentNames)
-
-            $disabledRule = Get-BfoDisabledScriptletRuleInJob -Line $Line
-            $enabled = -not [bool]$disabledRule
-            $rule = if ($disabledRule) { $disabledRule } else { $Line.Trim() }
-            if ([string]::IsNullOrWhiteSpace($rule)) { return $null }
-            if ($rule.StartsWith('!')) { return $null }
-            if ($rule -notmatch '##\+js\((?<body>.*)\)') { return $null }
-
-            $marker = $rule.IndexOf('##+js(', [System.StringComparison]::Ordinal)
-            if ($marker -lt 0) { return $null }
-            $domain = $rule.Substring(0, $marker)
-            $body = $Matches.body
-            $scriptlet = $body
-            $arguments = ''
-            $comma = $body.IndexOf(',')
-            if ($comma -ge 0) {
-                $scriptlet = $body.Substring(0, $comma).Trim()
-                $arguments = $body.Substring($comma + 1).Trim()
-            } else {
-                $scriptlet = $body.Trim()
-            }
-
-            $info = Get-ScriptletComponentInfoInJob -File $File -Root $Root -ComponentNames $ComponentNames
-            return [pscustomobject]@{
-                Enabled     = $enabled
-                Domain      = $domain
-                Scriptlet   = $scriptlet
-                Arguments   = $arguments
-                Source      = $info.Source
-                ComponentId = $info.ComponentId
-                Version     = $info.Version
-                File        = $File
-                LineNumber  = $LineNumber
-                Rule        = $rule
-            }
-        }
-
-        if ([string]::IsNullOrWhiteSpace($Root)) { throw 'User Data folder is empty.' }
-        if (-not (Test-Path $Root)) { throw "User Data folder not found: $Root" }
-
-        $warnings = New-Object System.Collections.ArrayList
-        $records = New-Object System.Collections.Generic.List[object]
-        $componentDirs = @(Get-ChildItem -Path $Root -Directory -ErrorAction Stop | Where-Object { $_.Name -match '^[a-z]{32}$' })
-        foreach ($dir in $componentDirs) {
-            try {
-                $files = @(Get-ChildItem -Path $dir.FullName -Recurse -Filter 'list.txt' -File -ErrorAction Stop)
-                foreach ($file in $files) {
-                    try {
-                        $lineNo = 0
-                        foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
-                            $lineNo++
-                            $record = ConvertTo-ScriptletRecordInJob -File $file.FullName -Root $Root -Line $line -LineNumber $lineNo -ComponentNames $ComponentNames
-                            if ($record) { [void]$records.Add($record) }
-                        }
-                    } catch {
-                        [void]$warnings.Add("Scriptlet scan failed $($file.FullName): $_")
-                    }
-                }
-            } catch {
-                [void]$warnings.Add("Scriptlet scan skipped $($dir.FullName): $_")
-            }
-        }
-
-        [pscustomobject]@{
-            Root     = $Root
-            Rules    = @($records.ToArray())
-            Warnings = @($warnings)
-        }
-    }
-
     try {
-        $script:ScriptletScanWorker = Start-Job -ScriptBlock $scanner -ArgumentList $root, $script:ScriptletComponentNames
+        Set-ScriptletUiBusy $true 'Finding Brave scriptlet list files...'
+        $warnings = New-Object System.Collections.ArrayList
+        $files = @(Get-ScriptletListFiles -Root $root -Warnings $warnings)
+        if ($files.Count -eq 0) {
+            Set-ScriptletUiBusy $false
+            if ($script:ScriptletProgress) { $script:ScriptletProgress.Value = 0 }
+            [System.Windows.Forms.MessageBox]::Show(
+                "No Brave filter-list files were found in:`r`n$root`r`n`r`nUse Browse if your Brave User Data folder lives somewhere else.",
+                'Scriptlet manager',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            return
+        }
+
+        $totalBytes = [int64](@($files | Measure-Object Length -Sum).Sum)
+        if ($totalBytes -lt 1) { $totalBytes = 1 }
+        $script:ScriptletRules = @()
+        $script:ScriptletVisibleRules = @()
+        if ($script:ScriptletList) { $script:ScriptletList.Items.Clear() }
+
+        $script:ScriptletScanState = [pscustomobject]@{
+            Root           = $root
+            Files          = $files
+            FileIndex      = 0
+            CurrentFile    = $null
+            CurrentLine    = 0
+            Reader         = $null
+            ProcessedBytes = 0L
+            TotalBytes     = $totalBytes
+            Records        = (New-Object System.Collections.Generic.List[object])
+            Warnings       = $warnings
+            Stopwatch      = [System.Diagnostics.Stopwatch]::StartNew()
+        }
+
+        if ($script:ScriptletProgress) {
+            $script:ScriptletProgress.Visible = $true
+            $script:ScriptletProgress.Style = 'Continuous'
+            $script:ScriptletProgress.Value = 0
+        }
+        Update-ScriptletScanProgress "Found $($files.Count) list file(s). Scanning in chunks..."
+        Write-Log "Scriptlet scan started: $root ($($files.Count) list file(s), $([Math]::Round($totalBytes / 1MB, 2)) MB)" 'INFO'
+
+        if (-not $script:ScriptletScanTimer) {
+            $script:ScriptletScanTimer = New-Object System.Windows.Forms.Timer
+            $script:ScriptletScanTimer.Interval = 15
+            $script:ScriptletScanTimer.Add_Tick({ Step-ScriptletScan })
+        }
+        $script:ScriptletScanTimer.Start()
     } catch {
-        $script:ScriptletScanWorker = $null
-        Set-ScriptletUiBusy $false "Scriptlet scan failed before it could start."
-        Write-Log "Scriptlet scan failed to start: $_" 'ERR'
+        Stop-ScriptletScan
+        $script:ScriptletRules = @()
+        Update-ScriptletListView
+        Write-Log "Scriptlet scan failed: $_" 'ERR'
         [System.Windows.Forms.MessageBox]::Show(
-            "Could not start the background scan:`r`n$_",
+            "Could not scan scriptlets:`r`n$_`r`n`r`nUse Browse to point Brave-Free-Origin at the correct Brave User Data folder.",
             'Scriptlet manager',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-        return
     }
-
-    if (-not $script:ScriptletScanTimer) {
-        $script:ScriptletScanTimer = New-Object System.Windows.Forms.Timer
-        $script:ScriptletScanTimer.Interval = 250
-        $script:ScriptletScanTimer.Add_Tick({
-            if (-not $script:ScriptletScanWorker) {
-                $script:ScriptletScanTimer.Stop()
-                return
-            }
-            if ($script:ScriptletScanWorker.State -in @('NotStarted', 'Running')) { return }
-
-            $job = $script:ScriptletScanWorker
-            $script:ScriptletScanWorker = $null
-            $script:ScriptletScanTimer.Stop()
-
-            Set-ScriptletUiBusy $true "Loading scriptlet scan results..."
-            try {
-                if ($job.State -ne 'Completed') {
-                    $reason = if ($job.ChildJobs.Count -gt 0 -and $job.ChildJobs[0].JobStateInfo.Reason) { $job.ChildJobs[0].JobStateInfo.Reason.Message } else { $job.State }
-                    throw "Background scan did not complete: $reason"
-                }
-
-                $result = Receive-Job -Job $job -ErrorAction Stop
-                if ($result -is [array]) { $result = $result[0] }
-
-                $script:ScriptletRules = @($result.Rules)
-                foreach ($warning in @($result.Warnings)) { Write-Log $warning 'WARN' }
-                Update-ScriptletListView
-                Write-Log "Scriptlet scan complete: $($script:ScriptletRules.Count) rule(s) from $($result.Root)" 'OK'
-                if ($script:ScriptletRules.Count -eq 0) {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "No Brave scriptlet rules were found in:`r`n$($result.Root)`r`n`r`nUse Browse if your Brave User Data folder lives somewhere else.",
-                        'Scriptlet manager',
-                        [System.Windows.Forms.MessageBoxButtons]::OK,
-                        [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-                }
-            } catch {
-                $script:ScriptletRules = @()
-                Update-ScriptletListView
-                Write-Log "Scriptlet scan failed: $_" 'ERR'
-                [System.Windows.Forms.MessageBox]::Show(
-                    "Could not scan scriptlets:`r`n$_`r`n`r`nUse Browse to point Brave-Free-Origin at the correct Brave User Data folder.",
-                    'Scriptlet manager',
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-            } finally {
-                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-                Set-ScriptletUiBusy $false
-            }
-        })
-    }
-
-    $script:ScriptletScanTimer.Start()
 }
 #endregion
 
 #region GUI Build -------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Brave Free Origin v1.10  -  the free answer to Brave Origin's paywalled minimal mode"
+$form.Text = "Brave Free Origin v1.11  -  the free answer to Brave Origin's paywalled minimal mode"
 $form.Size = New-Object System.Drawing.Size(1180, 900)
 $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(1080, 820)
@@ -2166,7 +2183,7 @@ $hostsTab.Controls.Add($btnOpenHosts)
 
 $tabs.TabPages.Add($hostsTab)
 
-# ---- Default scriptlets tab (v1.10) ----------------------------------------
+# ---- Default scriptlets tab (v1.11) ----------------------------------------
 # Advanced, optional, and deliberately separate from presets/main Apply.
 # Scans Brave component filter lists, displays ##+js(...) rules, and can
 # comment/uncomment rules with a BFO marker after explicit user opt-in.
@@ -2327,6 +2344,16 @@ $script:LblScriptletStatus.Location = New-Object System.Drawing.Point(10, 336)
 $script:LblScriptletStatus.Size = New-Object System.Drawing.Size(910, 18)
 $script:LblScriptletStatus.ForeColor = [System.Drawing.Color]::DimGray
 $scriptletsTab.Controls.Add($script:LblScriptletStatus)
+
+$script:ScriptletProgress = New-Object System.Windows.Forms.ProgressBar
+$script:ScriptletProgress.Location = New-Object System.Drawing.Point(925, 336)
+$script:ScriptletProgress.Size = New-Object System.Drawing.Size(195, 16)
+$script:ScriptletProgress.Minimum = 0
+$script:ScriptletProgress.Maximum = 1000
+$script:ScriptletProgress.Value = 0
+$script:ScriptletProgress.Style = 'Continuous'
+$script:ScriptletProgress.Anchor = 'Top, Right'
+$scriptletsTab.Controls.Add($script:ScriptletProgress)
 
 $script:ChkScriptletAffectDuplicates = New-Object System.Windows.Forms.CheckBox
 $script:ChkScriptletAffectDuplicates.Text = 'Affect duplicate raw rules in the same file'
@@ -2917,7 +2944,7 @@ $btnExport.Add_Click({
     if ($sfd.ShowDialog() -ne 'OK') { return }
 
     $cfg = [ordered]@{
-        version  = '1.10'
+        version  = '1.11'
         exported = (Get-Date -Format 's')
         channel  = $script:TargetChannels
         profile  = $script:ActiveProfile
