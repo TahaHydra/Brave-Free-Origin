@@ -1,4 +1,4 @@
-# Brave Free Origin (v1.8)
+# Brave Free Origin (v1.9)
 
 `Brave Free Origin` is a Windows GUI tool that turns normal Brave into a leaner, stripped-down build without paying for Brave Origin.
 
@@ -38,6 +38,8 @@ That is the launcher. It opens PowerShell with the right execution-policy flag a
 
 **6. (Optional) Tweak the tabs** below the buttons if you want to add/remove individual policies.
 
+There is also a `Default Scriptlets (Advanced)` tab in v1.9. That is a separate optional tool for viewing Brave's built-in adblock scriptlet rules and manually disabling selected ones. Presets and the big `Apply to Brave` button never touch it.
+
 **7. Click `Preview changes`** before applying. It shows exactly what will be added, changed, cleared, disabled, or reset. Nothing is written from Preview.
 
 **8. Click `Apply to Brave`** (the big green button). Then **fully close and reopen Brave** — running tabs need a restart to pick up the new policies.
@@ -64,6 +66,20 @@ The launcher (`.bat`) is essentially one line: it runs the PowerShell script wit
 
 <details>
 <summary><strong>📜 Changelog (click to expand)</strong></summary>
+
+### What's new in v1.9
+
+This is the advanced scriptlet transparency release. It adds a separate manager for Brave's built-in adblock scriptlets without mixing that risky workflow into the normal presets.
+
+- **Default Scriptlets (Advanced) tab.** Scans Brave `User Data` component folders for filter-list `list.txt` files and lists internal `##+js(...)` scriptlet rules.
+- **Viewer columns for auditability.** Shows enabled state, domain, scriptlet name, arguments, source/version, line number, and raw rule.
+- **Portable path handling.** Auto-detects Brave Stable/Beta/Nightly/Dev User Data locations from `%LOCALAPPDATA%`, with manual `Browse...` support when Brave lives somewhere unusual.
+- **Manual-only advanced editing.** Scriptlet edits are not part of Quick Debloat, Recommended, Origin Mode, Max Performance, Max Privacy, presets, config apply, or the main `Apply to Brave` button. You must open the advanced tab, scan, tick `Advanced edit mode`, select rules, and confirm the action.
+- **Per-scriptlet disable/enable.** Disabling comments rules with `! BFO disabled:`. Enabling restores the original rule text.
+- **Duplicate handling.** Brave lists can contain the same raw scriptlet rule more than once; the manager can affect duplicate raw rules in the same file so one selection does not leave a twin active by accident.
+- **Backup and restore.** Creates `list.txt.bfo-backup` before edits, with buttons to back up all loaded lists, restore the selected file, or restore all scriptlet backups under the selected User Data folder.
+- **Export and reapply preferences.** Exports currently disabled raw rules to JSON and can reapply those disabled preferences after Brave updates replace component versions.
+- **CSV export.** Saves the visible filtered scriptlet table for inspection, bug reports, or GitHub issue evidence.
 
 ### What's new in v1.8
 
@@ -170,6 +186,8 @@ It can also tune Brave for a lighter footprint:
 - disk cache cap
 - less background browser noise
 
+v1.9 also adds an optional advanced scriptlet manager. It can view and manually disable Brave's built-in adblock scriptlet rules in component filter lists. This is intentionally separate from the normal policy system and is only for users who choose to open the advanced tab and accept the warnings.
+
 ## Before / After
 
 These screenshots are included in the project folder and show the exact comparison you added.
@@ -264,7 +282,7 @@ The in-app `Verify` report can be copied or saved to a text file. That is useful
 
 ## Restore / Undo
 
-The app can export backups before applying changes, and v1.8 adds a stronger stock restore path.
+The app can export backups before applying changes, and v1.8 added a stronger stock restore path. v1.9 adds a separate backup/restore path for advanced scriptlet edits.
 
 Backups go to:
 
@@ -299,12 +317,23 @@ Or:
 
 1. Use the Hosts tab's `Remove hosts block` button to clear only the DNS-level blocklist
 
+Or, for advanced scriptlet edits only:
+
+1. Open `Default Scriptlets (Advanced)`
+2. Scan your Brave `User Data` folder
+3. Tick `Advanced edit mode`
+4. Use `Restore selected file` or `Restore all backups`
+
+Scriptlet restores use the local `list.txt.bfo-backup` files created beside Brave's component filter lists.
+
 ## Caveats
 
 - `Origin Mode` is meant to mimic the stripped-down Brave Origin idea, but it is still doing it through Windows policies, not through a custom Brave build.
 - `Max Performance` is aggressive on purpose. It disables more convenience features and Brave updater services/tasks to cut overhead further.
 - `Max Privacy` is even harsher in some areas and can affect sign-in, sync, imports, component updates, and update flow.
 - Turning off component updates can break Widevine/DRM playback such as Netflix or some Spotify web playback scenarios.
+- Disabling built-in Brave scriptlets can break adblocking, anti-annoyance fixes, cookie banners, video playback, or site compatibility. Use the scriptlet manager only when you know which rule you are changing.
+- Brave can replace component filter-list versions during updates. Export disabled scriptlet preferences if you want to reapply the same raw-rule disables after an update.
 - Some Brave-side UI bugs can leave elements visible even when the policy is correctly applied. In that case, trust `brave://policy` first.
 
 ## File Layout
@@ -329,6 +358,14 @@ Backups land here:
 ├── hosts-backup-YYYYMMDD-HHMMSS.bak            # hosts snapshot before each hosts apply
 └── brave-free-origin-config-YYYYMMDD-HHMMSS.json   # exported configs
 ```
+
+Advanced scriptlet backups are stored beside the Brave component list they protect:
+
+```text
+%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\<component>\<version>\list.txt.bfo-backup
+```
+
+Disabled scriptlet preference exports are JSON files saved wherever you choose in the save dialog.
 
 ## Sources
 

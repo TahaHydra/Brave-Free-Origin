@@ -58,6 +58,22 @@ $script:Channels = [ordered]@{
     }
 }
 $script:TargetChannels = @('Stable')
+$script:ScriptletUserDataRoots = [ordered]@{
+    'Stable'  = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
+    'Beta'    = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Beta\User Data"
+    'Nightly' = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Nightly\User Data"
+    'Dev'     = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Dev\User Data"
+}
+$script:ScriptletDisablePrefix = '! BFO disabled: '
+$script:ScriptletRules = @()
+$script:ScriptletVisibleRules = @()
+$script:ScriptletComponentNames = @{
+    'iodkpdagapdfkphljnddpjlldadblomo' = 'uBlock filters'
+    'adcocjohghhfpidemphmcmlmhnfgikei' = 'Brave Firstparty specific filters'
+    'cdbbhgbmjhfnhnmgeddbliobbofkgdhe' = 'EasyList Cookie'
+    'kihnoaefogbkmblfimmibknnmkllbhlf' = 'EasyPrivacy'
+    'flnkmpokemfpaajmiimmjeiandgoodgg' = 'AdGuard French'
+}
 
 function Get-DetectedChannels {
     $found = @()
@@ -809,11 +825,392 @@ function Invoke-FullRestore {
     Update-SelectionSummary
     Write-Log 'Full restore completed. Restart Brave to see stock behavior.' 'DONE'
 }
+
+function Get-ScriptletDefaultRoot {
+    $channel = if ($script:TargetChannels -and $script:TargetChannels.Count -gt 0) { $script:TargetChannels[0] } else { 'Stable' }
+    if ($script:ScriptletUserDataRoots.Contains($channel)) { return $script:ScriptletUserDataRoots[$channel] }
+    return $script:ScriptletUserDataRoots['Stable']
+}
+
+function Get-ScriptletComponentInfo {
+    param([string]$File, [string]$Root)
+
+    $componentId = 'unknown'
+    $version = 'unknown'
+    $source = 'Unknown filter list'
+    try {
+        $full = [System.IO.Path]::GetFullPath($File)
+        $base = [System.IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+        if ($full.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $full.Substring($base.Length)
+            $parts = $relative -split '[\\/]'
+            if ($parts.Count -ge 1) { $componentId = $parts[0] }
+            if ($parts.Count -ge 2) { $version = $parts[1] }
+        }
+        if ($script:ScriptletComponentNames.ContainsKey($componentId)) {
+            $source = $script:ScriptletComponentNames[$componentId]
+        } elseif ($componentId -ne 'unknown') {
+            $source = $componentId
+        }
+    } catch {}
+
+    return [pscustomobject]@{
+        ComponentId = $componentId
+        Version     = $version
+        Source      = $source
+    }
+}
+
+function Get-BfoDisabledScriptletRule {
+    param([string]$Line)
+    if ($Line -match '^\s*!\s*BFO disabled:\s*(?<rule>.+)$') {
+        return $Matches.rule.Trim()
+    }
+    return $null
+}
+
+function Get-ScriptletRuleFromLine {
+    param([string]$Line)
+    $disabled = Get-BfoDisabledScriptletRule -Line $Line
+    if ($disabled) { return $disabled }
+
+    $trimmed = $Line.Trim()
+    if ($trimmed.StartsWith('!')) { return $null }
+    return $trimmed
+}
+
+function ConvertTo-ScriptletRecord {
+    param(
+        [string]$File,
+        [string]$Root,
+        [string]$Line,
+        [int]$LineNumber
+    )
+
+    $disabledRule = Get-BfoDisabledScriptletRule -Line $Line
+    $enabled = -not [bool]$disabledRule
+    $rule = if ($disabledRule) { $disabledRule } else { $Line.Trim() }
+    if ([string]::IsNullOrWhiteSpace($rule)) { return $null }
+    if ($rule.StartsWith('!')) { return $null }
+    if ($rule -notmatch '##\+js\((?<body>.*)\)') { return $null }
+
+    $marker = $rule.IndexOf('##+js(', [System.StringComparison]::Ordinal)
+    if ($marker -lt 0) { return $null }
+    $domain = $rule.Substring(0, $marker)
+    $body = $Matches.body
+    $scriptlet = $body
+    $arguments = ''
+    $comma = $body.IndexOf(',')
+    if ($comma -ge 0) {
+        $scriptlet = $body.Substring(0, $comma).Trim()
+        $arguments = $body.Substring($comma + 1).Trim()
+    } else {
+        $scriptlet = $body.Trim()
+    }
+
+    $info = Get-ScriptletComponentInfo -File $File -Root $Root
+    return [pscustomobject]@{
+        Enabled     = $enabled
+        Domain      = $domain
+        Scriptlet   = $scriptlet
+        Arguments   = $arguments
+        Source      = $info.Source
+        ComponentId = $info.ComponentId
+        Version     = $info.Version
+        File        = $File
+        LineNumber  = $LineNumber
+        Rule        = $rule
+    }
+}
+
+function Get-ScriptletListFiles {
+    param([string]$Root)
+
+    if ([string]::IsNullOrWhiteSpace($Root)) { throw 'User Data folder is empty.' }
+    if (-not (Test-Path $Root)) { throw "User Data folder not found: $Root" }
+
+    $files = @()
+    $componentDirs = @(Get-ChildItem -Path $Root -Directory -ErrorAction Stop | Where-Object { $_.Name -match '^[a-z]{32}$' })
+    foreach ($dir in $componentDirs) {
+        try {
+            $files += Get-ChildItem -Path $dir.FullName -Recurse -Filter 'list.txt' -File -ErrorAction Stop
+        } catch {
+            Write-Log "Scriptlet scan skipped $($dir.FullName): $_" 'WARN'
+        }
+    }
+    return @($files | Sort-Object FullName)
+}
+
+function Get-ScriptletRules {
+    param([string]$Root)
+
+    $records = New-Object System.Collections.Generic.List[object]
+    $files = Get-ScriptletListFiles -Root $Root
+    foreach ($file in $files) {
+        try {
+            $lineNo = 0
+            foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
+                $lineNo++
+                $record = ConvertTo-ScriptletRecord -File $file.FullName -Root $Root -Line $line -LineNumber $lineNo
+                if ($record) { [void]$records.Add($record) }
+            }
+        } catch {
+            Write-Log "Scriptlet scan failed $($file.FullName): $_" 'WARN'
+        }
+    }
+    return @($records.ToArray())
+}
+
+function Backup-ScriptletFile {
+    param([string]$File)
+
+    if (-not (Test-Path $File)) { throw "Scriptlet list file not found: $File" }
+    $backup = "$File.bfo-backup"
+    if (-not (Test-Path $backup)) {
+        Copy-Item -LiteralPath $File -Destination $backup -Force
+        Write-Log "Scriptlet backup created: $backup" 'OK'
+    }
+    return $backup
+}
+
+function Test-ScriptletAdvancedWriteAllowed {
+    if (-not $script:ChkScriptletAdvanced -or -not $script:ChkScriptletAdvanced.Checked) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Editing Brave's internal filter-list files is disabled.`r`n`r`nTick 'Advanced edit mode' in the Scriptlets tab first.",
+            'Scriptlet manager',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return $false
+    }
+
+    $braveProcesses = @(Get-Process -Name brave -ErrorAction SilentlyContinue)
+    if ($braveProcesses.Count -gt 0) {
+        $ans = [System.Windows.Forms.MessageBox]::Show(
+            "Brave is currently running ($($braveProcesses.Count) process(es)).`r`n`r`nClose Brave first if you want the safest patch. Continue anyway?",
+            'Scriptlet manager',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($ans -ne 'Yes') { return $false }
+    }
+
+    return $true
+}
+
+function Set-ScriptletRuleState {
+    param(
+        [object[]]$Records,
+        [bool]$Enable,
+        [bool]$AffectDuplicates
+    )
+
+    if (-not $Records -or $Records.Count -eq 0) { return 0 }
+    $changed = 0
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $byFile = $Records | Group-Object File
+
+    foreach ($group in $byFile) {
+        $file = $group.Name
+        [void](Backup-ScriptletFile -File $file)
+        $lines = [System.IO.File]::ReadAllLines($file)
+
+        if ($AffectDuplicates) {
+            $wanted = @{}
+            foreach ($record in $group.Group) { $wanted[$record.Rule] = $true }
+            for ($i = 0; $i -lt $lines.Length; $i++) {
+                $original = Get-ScriptletRuleFromLine -Line $lines[$i]
+                if (-not $original -or -not $wanted.ContainsKey($original)) { continue }
+
+                $disabledRule = Get-BfoDisabledScriptletRule -Line $lines[$i]
+                if ($Enable -and $disabledRule) {
+                    $lines[$i] = $disabledRule
+                    $changed++
+                } elseif (-not $Enable -and -not $disabledRule) {
+                    $lines[$i] = "$($script:ScriptletDisablePrefix)$original"
+                    $changed++
+                }
+            }
+        } else {
+            foreach ($record in $group.Group) {
+                $idx = [int]$record.LineNumber - 1
+                if ($idx -lt 0 -or $idx -ge $lines.Length) { continue }
+                $original = Get-ScriptletRuleFromLine -Line $lines[$idx]
+                if ($original -ne $record.Rule) { continue }
+
+                $disabledRule = Get-BfoDisabledScriptletRule -Line $lines[$idx]
+                if ($Enable -and $disabledRule) {
+                    $lines[$idx] = $disabledRule
+                    $changed++
+                } elseif (-not $Enable -and -not $disabledRule) {
+                    $lines[$idx] = "$($script:ScriptletDisablePrefix)$original"
+                    $changed++
+                }
+            }
+        }
+
+        [System.IO.File]::WriteAllLines($file, [string[]]$lines, $utf8NoBom)
+    }
+
+    return $changed
+}
+
+function Restore-ScriptletBackup {
+    param([string]$File)
+
+    $backup = "$File.bfo-backup"
+    if (-not (Test-Path $backup)) { throw "No backup exists for: $File" }
+    Copy-Item -LiteralPath $backup -Destination $File -Force
+}
+
+function Restore-AllScriptletBackups {
+    param([string]$Root)
+
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not (Test-Path $Root)) { throw "User Data folder not found: $Root" }
+    $backups = @(Get-ChildItem -Path $Root -Recurse -Filter 'list.txt.bfo-backup' -File -ErrorAction SilentlyContinue)
+    $count = 0
+    foreach ($backup in $backups) {
+        $target = $backup.FullName.Substring(0, $backup.FullName.Length - '.bfo-backup'.Length)
+        Copy-Item -LiteralPath $backup.FullName -Destination $target -Force
+        $count++
+    }
+    return $count
+}
+
+function Export-ScriptletDisabledPreferences {
+    param([string]$File)
+
+    $disabled = @($script:ScriptletRules | Where-Object { -not $_.Enabled } | Sort-Object Rule -Unique)
+    $payload = [ordered]@{
+        version       = '1.9'
+        exported      = (Get-Date -Format 's')
+        disabledRules = @(
+            foreach ($r in $disabled) {
+                [ordered]@{
+                    rule      = $r.Rule
+                    domain    = $r.Domain
+                    scriptlet = $r.Scriptlet
+                    source    = $r.Source
+                }
+            }
+        )
+    }
+    $payload | ConvertTo-Json -Depth 5 | Set-Content -Path $File -Encoding UTF8
+    return $disabled.Count
+}
+
+function Import-ScriptletPreferencesAndReapply {
+    param([string]$PrefsFile, [string]$Root)
+
+    if (-not (Test-Path $PrefsFile)) { throw "Preference file not found: $PrefsFile" }
+    $prefs = Get-Content $PrefsFile -Raw | ConvertFrom-Json
+    if (-not $prefs.disabledRules) { throw 'Preference file has no disabledRules array.' }
+
+    $wanted = @{}
+    foreach ($entry in $prefs.disabledRules) {
+        if ($entry.rule) { $wanted["$($entry.rule)"] = $true }
+    }
+    if ($wanted.Count -eq 0) { return 0 }
+
+    $changed = 0
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    foreach ($file in (Get-ScriptletListFiles -Root $Root)) {
+        $lines = [System.IO.File]::ReadAllLines($file.FullName)
+        $fileChanged = $false
+        for ($i = 0; $i -lt $lines.Length; $i++) {
+            $original = Get-ScriptletRuleFromLine -Line $lines[$i]
+            if (-not $original -or -not $wanted.ContainsKey($original)) { continue }
+            if (Get-BfoDisabledScriptletRule -Line $lines[$i]) { continue }
+            if (-not $fileChanged) {
+                [void](Backup-ScriptletFile -File $file.FullName)
+                $fileChanged = $true
+            }
+            $lines[$i] = "$($script:ScriptletDisablePrefix)$original"
+            $changed++
+        }
+        if ($fileChanged) {
+            [System.IO.File]::WriteAllLines($file.FullName, [string[]]$lines, $utf8NoBom)
+        }
+    }
+    return $changed
+}
+
+function Update-ScriptletListView {
+    if (-not $script:ScriptletList) { return }
+
+    $query = if ($script:TxtScriptletSearch) { $script:TxtScriptletSearch.Text.Trim() } else { '' }
+    $disabledOnly = ($script:ChkScriptletDisabledOnly -and $script:ChkScriptletDisabledOnly.Checked)
+    $rows = @($script:ScriptletRules)
+    if ($disabledOnly) { $rows = @($rows | Where-Object { -not $_.Enabled }) }
+    if (-not [string]::IsNullOrWhiteSpace($query)) {
+        $needle = $query.ToLowerInvariant()
+        $rows = @($rows | Where-Object {
+            ("$($_.Domain) $($_.Scriptlet) $($_.Arguments) $($_.Source) $($_.Rule) $($_.File)").ToLowerInvariant().Contains($needle)
+        })
+    }
+
+    $script:ScriptletVisibleRules = $rows
+    $script:ScriptletList.BeginUpdate()
+    $script:ScriptletList.Items.Clear()
+    foreach ($r in $rows) {
+        $item = New-Object System.Windows.Forms.ListViewItem($(if ($r.Enabled) { 'Yes' } else { 'No' }))
+        [void]$item.SubItems.Add($r.Domain)
+        [void]$item.SubItems.Add($r.Scriptlet)
+        [void]$item.SubItems.Add($r.Arguments)
+        [void]$item.SubItems.Add("$($r.Source) $($r.Version)")
+        [void]$item.SubItems.Add([string]$r.LineNumber)
+        [void]$item.SubItems.Add($r.Rule)
+        $item.Tag = $r
+        if (-not $r.Enabled) {
+            $item.ForeColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
+        }
+        [void]$script:ScriptletList.Items.Add($item)
+    }
+    $script:ScriptletList.EndUpdate()
+
+    if ($script:LblScriptletStatus) {
+        $enabled = @($script:ScriptletRules | Where-Object { $_.Enabled }).Count
+        $disabled = @($script:ScriptletRules | Where-Object { -not $_.Enabled }).Count
+        $script:LblScriptletStatus.Text = "Showing $($rows.Count) / $($script:ScriptletRules.Count) scriptlet rule(s). Enabled: $enabled. BFO-disabled: $disabled."
+    }
+}
+
+function Get-SelectedScriptletRecords {
+    if (-not $script:ScriptletList) { return @() }
+    $records = @()
+    foreach ($item in $script:ScriptletList.SelectedItems) {
+        if ($item.Tag) { $records += $item.Tag }
+    }
+    return $records
+}
+
+function Invoke-ScriptletScan {
+    $root = $script:TxtScriptletRoot.Text.Trim()
+    try {
+        $script:ScriptletRules = @(Get-ScriptletRules -Root $root)
+        Update-ScriptletListView
+        Write-Log "Scriptlet scan complete: $($script:ScriptletRules.Count) rule(s) from $root" 'OK'
+        if ($script:ScriptletRules.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "No Brave scriptlet rules were found in:`r`n$root`r`n`r`nUse Browse if your Brave User Data folder lives somewhere else.",
+                'Scriptlet manager',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        }
+    } catch {
+        $script:ScriptletRules = @()
+        Update-ScriptletListView
+        Write-Log "Scriptlet scan failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show(
+            "Could not scan scriptlets:`r`n$_`r`n`r`nUse Browse to point Brave-Free-Origin at the correct Brave User Data folder.",
+            'Scriptlet manager',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
 #endregion
 
 #region GUI Build -------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Brave Free Origin v1.8  -  the free answer to Brave Origin's paywalled minimal mode"
+$form.Text = "Brave Free Origin v1.9  -  the free answer to Brave Origin's paywalled minimal mode"
 $form.Size = New-Object System.Drawing.Size(1180, 900)
 $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = New-Object System.Drawing.Size(1080, 820)
@@ -1508,6 +1905,365 @@ $hostsTab.Controls.Add($btnOpenHosts)
 
 $tabs.TabPages.Add($hostsTab)
 
+# ---- Default scriptlets tab (v1.9) -----------------------------------------
+# Advanced, optional, and deliberately separate from presets/main Apply.
+# Scans Brave component filter lists, displays ##+js(...) rules, and can
+# comment/uncomment rules with a BFO marker after explicit user opt-in.
+$scriptletsTab = New-Object System.Windows.Forms.TabPage
+$scriptletsTab.Text = 'Default Scriptlets (Advanced)'
+$scriptletsTab.AutoScroll = $true
+$scriptletsTab.BackColor = [System.Drawing.Color]::White
+
+$scriptletIntro = New-Object System.Windows.Forms.Label
+$scriptletIntro.Text = "Optional advanced tool: view Brave's built-in adblock scriptlet rules from component filter lists. Editing is manual-only, never part of presets, and never triggered by Apply to Brave."
+$scriptletIntro.Location = New-Object System.Drawing.Point(10, 8)
+$scriptletIntro.Size = New-Object System.Drawing.Size(1100, 34)
+$scriptletIntro.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 90)
+$scriptletsTab.Controls.Add($scriptletIntro)
+
+$scriptletRisk = New-Object System.Windows.Forms.Label
+$scriptletRisk.Text = "Risk: disabling scriptlets can break adblocking, anti-annoyance fixes, cookie banners, video sites, or site compatibility. Brave updates may replace component versions; export disabled preferences and reapply after updates if needed."
+$scriptletRisk.Location = New-Object System.Drawing.Point(10, 38)
+$scriptletRisk.Size = New-Object System.Drawing.Size(1100, 34)
+$scriptletRisk.ForeColor = [System.Drawing.Color]::FromArgb(160, 70, 30)
+$scriptletRisk.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$scriptletsTab.Controls.Add($scriptletRisk)
+
+$lblScriptletRoot = New-Object System.Windows.Forms.Label
+$lblScriptletRoot.Text = 'Brave User Data folder:'
+$lblScriptletRoot.Location = New-Object System.Drawing.Point(10, 80)
+$lblScriptletRoot.Size = New-Object System.Drawing.Size(145, 18)
+$scriptletsTab.Controls.Add($lblScriptletRoot)
+
+$script:TxtScriptletRoot = New-Object System.Windows.Forms.TextBox
+$script:TxtScriptletRoot.Location = New-Object System.Drawing.Point(155, 76)
+$script:TxtScriptletRoot.Size = New-Object System.Drawing.Size(560, 22)
+$script:TxtScriptletRoot.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$script:TxtScriptletRoot.Text = Get-ScriptletDefaultRoot
+$scriptletsTab.Controls.Add($script:TxtScriptletRoot)
+
+$btnScriptletAutoRoot = New-Object System.Windows.Forms.Button
+$btnScriptletAutoRoot.Text = 'Auto path'
+$btnScriptletAutoRoot.Size = New-Object System.Drawing.Size(85, 26)
+$btnScriptletAutoRoot.Location = New-Object System.Drawing.Point(725, 74)
+$btnScriptletAutoRoot.Add_Click({
+    $script:TxtScriptletRoot.Text = Get-ScriptletDefaultRoot
+    Write-Log "Scriptlet User Data path set to: $($script:TxtScriptletRoot.Text)"
+})
+$scriptletsTab.Controls.Add($btnScriptletAutoRoot)
+
+$btnScriptletBrowse = New-Object System.Windows.Forms.Button
+$btnScriptletBrowse.Text = 'Browse...'
+$btnScriptletBrowse.Size = New-Object System.Drawing.Size(85, 26)
+$btnScriptletBrowse.Location = New-Object System.Drawing.Point(815, 74)
+$btnScriptletBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Select Brave User Data folder'
+    if (Test-Path $script:TxtScriptletRoot.Text) { $dlg.SelectedPath = $script:TxtScriptletRoot.Text }
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $script:TxtScriptletRoot.Text = $dlg.SelectedPath
+        Write-Log "Scriptlet User Data path set manually: $($dlg.SelectedPath)"
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletBrowse)
+
+$btnScriptletScan = New-Object System.Windows.Forms.Button
+$btnScriptletScan.Text = 'Scan'
+$btnScriptletScan.Size = New-Object System.Drawing.Size(80, 26)
+$btnScriptletScan.Location = New-Object System.Drawing.Point(905, 74)
+$btnScriptletScan.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 63)
+$btnScriptletScan.ForeColor = [System.Drawing.Color]::White
+$btnScriptletScan.Add_Click({ Invoke-ScriptletScan })
+$scriptletsTab.Controls.Add($btnScriptletScan)
+
+$btnScriptletOpenFolder = New-Object System.Windows.Forms.Button
+$btnScriptletOpenFolder.Text = 'Open folder'
+$btnScriptletOpenFolder.Size = New-Object System.Drawing.Size(95, 26)
+$btnScriptletOpenFolder.Location = New-Object System.Drawing.Point(990, 74)
+$btnScriptletOpenFolder.Add_Click({
+    if (Test-Path $script:TxtScriptletRoot.Text) { Start-Process explorer.exe $script:TxtScriptletRoot.Text }
+    else { [System.Windows.Forms.MessageBox]::Show('Folder not found. Use Browse to choose the correct Brave User Data folder.', 'Scriptlet manager', 'OK', 'Warning') | Out-Null }
+})
+$scriptletsTab.Controls.Add($btnScriptletOpenFolder)
+
+$lblScriptletSearch = New-Object System.Windows.Forms.Label
+$lblScriptletSearch.Text = 'Search/filter:'
+$lblScriptletSearch.Location = New-Object System.Drawing.Point(10, 112)
+$lblScriptletSearch.Size = New-Object System.Drawing.Size(85, 18)
+$scriptletsTab.Controls.Add($lblScriptletSearch)
+
+$script:TxtScriptletSearch = New-Object System.Windows.Forms.TextBox
+$script:TxtScriptletSearch.Location = New-Object System.Drawing.Point(95, 108)
+$script:TxtScriptletSearch.Size = New-Object System.Drawing.Size(360, 22)
+$script:TxtScriptletSearch.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$script:TxtScriptletSearch.Add_KeyDown({
+    if ($_.KeyCode -eq 'Enter') {
+        Update-ScriptletListView
+        $_.SuppressKeyPress = $true
+    }
+})
+$scriptletsTab.Controls.Add($script:TxtScriptletSearch)
+
+$btnScriptletFilter = New-Object System.Windows.Forms.Button
+$btnScriptletFilter.Text = 'Filter'
+$btnScriptletFilter.Size = New-Object System.Drawing.Size(75, 26)
+$btnScriptletFilter.Location = New-Object System.Drawing.Point(465, 106)
+$btnScriptletFilter.Add_Click({ Update-ScriptletListView })
+$scriptletsTab.Controls.Add($btnScriptletFilter)
+
+$script:ChkScriptletDisabledOnly = New-Object System.Windows.Forms.CheckBox
+$script:ChkScriptletDisabledOnly.Text = 'Show BFO-disabled only'
+$script:ChkScriptletDisabledOnly.Location = New-Object System.Drawing.Point(550, 110)
+$script:ChkScriptletDisabledOnly.Size = New-Object System.Drawing.Size(160, 20)
+$script:ChkScriptletDisabledOnly.Add_CheckedChanged({ Update-ScriptletListView })
+$scriptletsTab.Controls.Add($script:ChkScriptletDisabledOnly)
+
+$script:ChkScriptletAdvanced = New-Object System.Windows.Forms.CheckBox
+$script:ChkScriptletAdvanced.Text = 'Advanced edit mode (allow list.txt modifications)'
+$script:ChkScriptletAdvanced.Location = New-Object System.Drawing.Point(725, 110)
+$script:ChkScriptletAdvanced.Size = New-Object System.Drawing.Size(330, 20)
+$script:ChkScriptletAdvanced.ForeColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
+$scriptletsTab.Controls.Add($script:ChkScriptletAdvanced)
+
+$script:ScriptletList = New-Object System.Windows.Forms.ListView
+$script:ScriptletList.Location = New-Object System.Drawing.Point(10, 140)
+$script:ScriptletList.Size = New-Object System.Drawing.Size(1110, 190)
+$script:ScriptletList.View = 'Details'
+$script:ScriptletList.FullRowSelect = $true
+$script:ScriptletList.GridLines = $true
+$script:ScriptletList.MultiSelect = $true
+$script:ScriptletList.HideSelection = $false
+[void]$script:ScriptletList.Columns.Add('Enabled', 64)
+[void]$script:ScriptletList.Columns.Add('Domain', 190)
+[void]$script:ScriptletList.Columns.Add('Scriptlet', 190)
+[void]$script:ScriptletList.Columns.Add('Arguments', 260)
+[void]$script:ScriptletList.Columns.Add('Source / version', 180)
+[void]$script:ScriptletList.Columns.Add('Line', 55)
+[void]$script:ScriptletList.Columns.Add('Raw rule', 520)
+$scriptletsTab.Controls.Add($script:ScriptletList)
+
+$script:LblScriptletStatus = New-Object System.Windows.Forms.Label
+$script:LblScriptletStatus.Text = 'Scan a Brave User Data folder to list internal scriptlet rules.'
+$script:LblScriptletStatus.Location = New-Object System.Drawing.Point(10, 336)
+$script:LblScriptletStatus.Size = New-Object System.Drawing.Size(910, 18)
+$script:LblScriptletStatus.ForeColor = [System.Drawing.Color]::DimGray
+$scriptletsTab.Controls.Add($script:LblScriptletStatus)
+
+$script:ChkScriptletAffectDuplicates = New-Object System.Windows.Forms.CheckBox
+$script:ChkScriptletAffectDuplicates.Text = 'Affect duplicate raw rules in the same file'
+$script:ChkScriptletAffectDuplicates.Checked = $true
+$script:ChkScriptletAffectDuplicates.Location = New-Object System.Drawing.Point(10, 360)
+$script:ChkScriptletAffectDuplicates.Size = New-Object System.Drawing.Size(270, 20)
+$tt.SetToolTip($script:ChkScriptletAffectDuplicates, 'Brave lists can contain the same scriptlet rule multiple times. Leave this on unless you only want the exact selected line.')
+$scriptletsTab.Controls.Add($script:ChkScriptletAffectDuplicates)
+
+$btnScriptletDisable = New-Object System.Windows.Forms.Button
+$btnScriptletDisable.Text = 'Disable selected'
+$btnScriptletDisable.Size = New-Object System.Drawing.Size(125, 28)
+$btnScriptletDisable.Location = New-Object System.Drawing.Point(10, 388)
+$btnScriptletDisable.BackColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
+$btnScriptletDisable.ForeColor = [System.Drawing.Color]::White
+$btnScriptletDisable.Add_Click({
+    $records = @(Get-SelectedScriptletRecords)
+    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Select one or more scriptlet rules first.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+    if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Disable $($records.Count) selected scriptlet rule(s)?`r`n`r`nThis comments rules with: $($script:ScriptletDisablePrefix)`r`nBackups are created as list.txt.bfo-backup before the first edit.",
+        'Scriptlet manager',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($ans -ne 'Yes') { return }
+    try {
+        $changed = Set-ScriptletRuleState -Records $records -Enable:$false -AffectDuplicates:$script:ChkScriptletAffectDuplicates.Checked
+        Write-Log "Scriptlets disabled: $changed line(s)." 'OK'
+        Invoke-ScriptletScan
+    } catch {
+        Write-Log "Scriptlet disable failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Disable failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletDisable)
+
+$btnScriptletEnable = New-Object System.Windows.Forms.Button
+$btnScriptletEnable.Text = 'Enable selected'
+$btnScriptletEnable.Size = New-Object System.Drawing.Size(120, 28)
+$btnScriptletEnable.Location = New-Object System.Drawing.Point(145, 388)
+$btnScriptletEnable.Add_Click({
+    $records = @(Get-SelectedScriptletRecords)
+    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Select one or more scriptlet rules first.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+    if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
+    try {
+        $changed = Set-ScriptletRuleState -Records $records -Enable:$true -AffectDuplicates:$script:ChkScriptletAffectDuplicates.Checked
+        Write-Log "Scriptlets enabled: $changed line(s)." 'OK'
+        Invoke-ScriptletScan
+    } catch {
+        Write-Log "Scriptlet enable failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Enable failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletEnable)
+
+$btnScriptletDetails = New-Object System.Windows.Forms.Button
+$btnScriptletDetails.Text = 'View selected'
+$btnScriptletDetails.Size = New-Object System.Drawing.Size(115, 28)
+$btnScriptletDetails.Location = New-Object System.Drawing.Point(275, 388)
+$btnScriptletDetails.Add_Click({
+    $records = @(Get-SelectedScriptletRecords)
+    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Select a scriptlet rule first.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+    $report = New-Object System.Text.StringBuilder
+    foreach ($r in $records) {
+        [void]$report.AppendLine("Enabled: $($r.Enabled)")
+        [void]$report.AppendLine("Domain: $($r.Domain)")
+        [void]$report.AppendLine("Scriptlet: $($r.Scriptlet)")
+        [void]$report.AppendLine("Arguments: $($r.Arguments)")
+        [void]$report.AppendLine("Source: $($r.Source) $($r.Version)")
+        [void]$report.AppendLine("File: $($r.File)")
+        [void]$report.AppendLine("Line: $($r.LineNumber)")
+        [void]$report.AppendLine("Rule: $($r.Rule)")
+        [void]$report.AppendLine('')
+    }
+    Show-TextReport -Title 'Selected scriptlet rule(s)' -Text ($report.ToString()) -DefaultFileName "brave-free-origin-scriptlet-details-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+})
+$scriptletsTab.Controls.Add($btnScriptletDetails)
+
+$btnScriptletBackupAll = New-Object System.Windows.Forms.Button
+$btnScriptletBackupAll.Text = 'Backup all lists'
+$btnScriptletBackupAll.Size = New-Object System.Drawing.Size(120, 28)
+$btnScriptletBackupAll.Location = New-Object System.Drawing.Point(400, 388)
+$btnScriptletBackupAll.Add_Click({
+    try {
+        $files = @($script:ScriptletRules | Select-Object -ExpandProperty File -Unique)
+        if ($files.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Scan first; no scriptlet list files are loaded.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+        foreach ($file in $files) { [void](Backup-ScriptletFile -File $file) }
+        [System.Windows.Forms.MessageBox]::Show("Backups checked/created for $($files.Count) list file(s).", 'Scriptlet manager', 'OK', 'Information') | Out-Null
+    } catch {
+        Write-Log "Scriptlet backup failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Backup failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletBackupAll)
+
+$btnScriptletRestoreSelected = New-Object System.Windows.Forms.Button
+$btnScriptletRestoreSelected.Text = 'Restore selected file'
+$btnScriptletRestoreSelected.Size = New-Object System.Drawing.Size(145, 28)
+$btnScriptletRestoreSelected.Location = New-Object System.Drawing.Point(530, 388)
+$btnScriptletRestoreSelected.Add_Click({
+    $records = @(Get-SelectedScriptletRecords)
+    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Select a rule from the file you want to restore.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+    if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
+    $files = @($records | Select-Object -ExpandProperty File -Unique)
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Restore $($files.Count) selected list file(s) from .bfo-backup?`r`nThis discards BFO scriptlet edits in those file(s).",
+        'Scriptlet manager',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($ans -ne 'Yes') { return }
+    try {
+        foreach ($file in $files) { Restore-ScriptletBackup -File $file }
+        Write-Log "Restored $($files.Count) scriptlet list file(s) from backup." 'OK'
+        Invoke-ScriptletScan
+    } catch {
+        Write-Log "Scriptlet restore selected failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Restore failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletRestoreSelected)
+
+$btnScriptletRestoreAll = New-Object System.Windows.Forms.Button
+$btnScriptletRestoreAll.Text = 'Restore all backups'
+$btnScriptletRestoreAll.Size = New-Object System.Drawing.Size(140, 28)
+$btnScriptletRestoreAll.Location = New-Object System.Drawing.Point(685, 388)
+$btnScriptletRestoreAll.Add_Click({
+    if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Restore every list.txt.bfo-backup under:`r`n$($script:TxtScriptletRoot.Text)`r`n`r`nThis discards all BFO scriptlet edits in backed-up lists. Continue?",
+        'Scriptlet manager',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($ans -ne 'Yes') { return }
+    try {
+        $count = Restore-AllScriptletBackups -Root $script:TxtScriptletRoot.Text.Trim()
+        Write-Log "Restored $count scriptlet backup file(s)." 'OK'
+        Invoke-ScriptletScan
+    } catch {
+        Write-Log "Scriptlet restore all failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Restore all failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletRestoreAll)
+
+$btnScriptletExportCsv = New-Object System.Windows.Forms.Button
+$btnScriptletExportCsv.Text = 'Export visible CSV'
+$btnScriptletExportCsv.Size = New-Object System.Drawing.Size(130, 28)
+$btnScriptletExportCsv.Location = New-Object System.Drawing.Point(835, 388)
+$btnScriptletExportCsv.Add_Click({
+    if (-not $script:ScriptletVisibleRules -or $script:ScriptletVisibleRules.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Nothing visible to export. Scan or change the filter first.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+    $sfd = New-Object System.Windows.Forms.SaveFileDialog
+    $sfd.Filter = 'CSV (*.csv)|*.csv'
+    $sfd.FileName = "brave-free-origin-scriptlets-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    if ($sfd.ShowDialog() -ne 'OK') { return }
+    $script:ScriptletVisibleRules |
+        Select-Object Enabled,Domain,Scriptlet,Arguments,Source,Version,ComponentId,File,LineNumber,Rule |
+        Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8
+    Write-Log "Scriptlet CSV exported: $($sfd.FileName)" 'OK'
+})
+$scriptletsTab.Controls.Add($btnScriptletExportCsv)
+
+$btnScriptletExportPrefs = New-Object System.Windows.Forms.Button
+$btnScriptletExportPrefs.Text = 'Export disabled prefs'
+$btnScriptletExportPrefs.Size = New-Object System.Drawing.Size(150, 28)
+$btnScriptletExportPrefs.Location = New-Object System.Drawing.Point(10, 424)
+$btnScriptletExportPrefs.Add_Click({
+    if (-not $script:ScriptletRules -or $script:ScriptletRules.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Scan first; there are no scriptlet rules loaded.', 'Scriptlet manager', 'OK', 'Information') | Out-Null; return }
+    $sfd = New-Object System.Windows.Forms.SaveFileDialog
+    $sfd.Filter = 'Scriptlet preferences (*.json)|*.json'
+    $sfd.FileName = "brave-free-origin-disabled-scriptlets-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+    if ($sfd.ShowDialog() -ne 'OK') { return }
+    try {
+        $count = Export-ScriptletDisabledPreferences -File $sfd.FileName
+        Write-Log "Disabled scriptlet prefs exported: $count rule(s)." 'OK'
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Export failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletExportPrefs)
+
+$btnScriptletImportPrefs = New-Object System.Windows.Forms.Button
+$btnScriptletImportPrefs.Text = 'Import + reapply prefs'
+$btnScriptletImportPrefs.Size = New-Object System.Drawing.Size(165, 28)
+$btnScriptletImportPrefs.Location = New-Object System.Drawing.Point(170, 424)
+$btnScriptletImportPrefs.Add_Click({
+    if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
+    $ofd = New-Object System.Windows.Forms.OpenFileDialog
+    $ofd.Filter = 'Scriptlet preferences (*.json)|*.json'
+    if ($ofd.ShowDialog() -ne 'OK') { return }
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Reapply disabled scriptlet preferences to the current component lists under:`r`n$($script:TxtScriptletRoot.Text)`r`n`r`nThis comments active rules whose raw text matches the preference file. Continue?",
+        'Scriptlet manager',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($ans -ne 'Yes') { return }
+    try {
+        $changed = Import-ScriptletPreferencesAndReapply -PrefsFile $ofd.FileName -Root $script:TxtScriptletRoot.Text.Trim()
+        Write-Log "Reapplied disabled scriptlet prefs: $changed line(s)." 'OK'
+        Invoke-ScriptletScan
+    } catch {
+        Write-Log "Scriptlet preference reapply failed: $_" 'ERR'
+        [System.Windows.Forms.MessageBox]::Show("Reapply failed:`r`n$_", 'Scriptlet manager', 'OK', 'Error') | Out-Null
+    }
+})
+$scriptletsTab.Controls.Add($btnScriptletImportPrefs)
+
+$scriptletFooter = New-Object System.Windows.Forms.Label
+$scriptletFooter.Text = 'Tip: if Scan finds nothing, use Browse and select the folder named "User Data" under your Brave profile. This feature edits component filter lists only when Advanced edit mode is ticked.'
+$scriptletFooter.Location = New-Object System.Drawing.Point(350, 429)
+$scriptletFooter.Size = New-Object System.Drawing.Size(760, 32)
+$scriptletFooter.ForeColor = [System.Drawing.Color]::DimGray
+$scriptletFooter.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$scriptletsTab.Controls.Add($scriptletFooter)
+
+$tabs.TabPages.Add($scriptletsTab)
+
 # ---- Search & Startup tab (v1.6) -------------------------------------------
 # Three independent, opt-in sections. Each has its own "Override" checkbox.
 # Off by default: Brave's user-chosen search engine and startup behavior stay
@@ -1867,7 +2623,7 @@ $btnExport.Add_Click({
     if ($sfd.ShowDialog() -ne 'OK') { return }
 
     $cfg = [ordered]@{
-        version  = '1.8'
+        version  = '1.9'
         exported = (Get-Date -Format 's')
         channel  = $script:TargetChannels
         profile  = $script:ActiveProfile
