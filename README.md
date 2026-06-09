@@ -1,4 +1,4 @@
-# Brave Free Origin (v1.9)
+# Brave Free Origin (v1.10)
 
 `Brave Free Origin` is a Windows GUI tool that turns normal Brave into a leaner, stripped-down build without paying for Brave Origin.
 
@@ -38,7 +38,7 @@ That is the launcher. It opens PowerShell with the right execution-policy flag a
 
 **6. (Optional) Tweak the tabs** below the buttons if you want to add/remove individual policies.
 
-There is also a `Default Scriptlets (Advanced)` tab in v1.9. That is a separate optional tool for viewing Brave's built-in adblock scriptlet rules and manually disabling selected ones. Presets and the big `Apply to Brave` button never touch it.
+There is also a `Default Scriptlets (Advanced)` tab. That is a separate optional tool for viewing Brave's built-in adblock scriptlet rules and manually disabling selected ones. Presets and the big `Apply to Brave` button never touch it.
 
 **7. Click `Preview changes`** before applying. It shows exactly what will be added, changed, cleared, disabled, or reset. Nothing is written from Preview.
 
@@ -66,6 +66,17 @@ The launcher (`.bat`) is essentially one line: it runs the PowerShell script wit
 
 <details>
 <summary><strong>📜 Changelog (click to expand)</strong></summary>
+
+### What's new in v1.10
+
+This is the scriptlet-manager usability fix.
+
+- **Background scriptlet scan.** Loading Brave's internal scriptlet lists now runs in a background PowerShell job instead of freezing the whole GUI.
+- **Faster table refresh.** Search/filter updates use debouncing and bulk row loading, so toggling filters no longer feels like the app died.
+- **Checkbox selection.** Scriptlet rows now have checkboxes. Checked rows are used first; normal highlighted selection still works as a fallback.
+- **Check all visible / clear checks.** Search for something like `youtube`, click `Check all visible`, then disable or enable the filtered set in one action.
+- **Clearer wording.** The UI says `disabled by this app` / `Disabled by Brave Free Origin` instead of assuming everyone knows what `BFO` means. The internal file marker remains `! BFO disabled:` for compatibility with existing backups and disabled rules.
+- **Adaptive columns.** The scriptlet table now resizes its columns with the window instead of staying stuck at the original widths.
 
 ### What's new in v1.9
 
