@@ -74,6 +74,9 @@ This fixes the scriptlet scan hang from v1.10.
 - **Chunked in-app scanner.** Replaces the background-job scan with a timer-based chunk scanner, avoiding the slow PowerShell job serialization step that could sit on `Loading scriptlet scan results...` for minutes.
 - **Real progress bar.** The Scriptlets tab now shows a blue progress bar and live status based on files/bytes processed, current file, elapsed seconds, and rules found.
 - **Responsive during scan.** The scan yields back to the GUI every small chunk, so Windows should not mark the app as Not Responding while large Brave lists are being read.
+- **Chunked table rendering.** Large scriptlet result sets render in batches instead of locking the whole window while thousands of rows are painted.
+- **Safer bulk checking.** `Check filtered` now checks every scanned rule matching the current search/filter, including rows that are not currently painted in the table yet.
+- **Clearer filtered workflow.** If `Show disabled by this app only` is enabled, `Check filtered` only checks the disabled subset currently being shown. Untick it and clear the search box before bulk-disabling every scriptlet rule.
 
 ### What's new in v1.10
 
@@ -82,7 +85,7 @@ This is the scriptlet-manager usability fix.
 - **Background scriptlet scan.** Loading Brave's internal scriptlet lists now runs in a background PowerShell job instead of freezing the whole GUI.
 - **Faster table refresh.** Search/filter updates use debouncing and bulk row loading, so toggling filters no longer feels like the app died.
 - **Checkbox selection.** Scriptlet rows now have checkboxes. Checked rows are used first; normal highlighted selection still works as a fallback.
-- **Check all visible / clear checks.** Search for something like `youtube`, click `Check all visible`, then disable or enable the filtered set in one action.
+- **Check filtered / clear checks.** Search for something like `youtube`, click `Check filtered`, then disable or enable the filtered set in one action.
 - **Clearer wording.** The UI says `disabled by this app` / `Disabled by Brave Free Origin` instead of assuming everyone knows what `BFO` means. The internal file marker remains `! BFO disabled:` for compatibility with existing backups and disabled rules.
 - **Adaptive columns.** The scriptlet table now resizes its columns with the window instead of staying stuck at the original widths.
 
@@ -206,6 +209,23 @@ It can also tune Brave for a lighter footprint:
 - less background browser noise
 
 v1.9 also adds an optional advanced scriptlet manager. It can view and manually disable Brave's built-in adblock scriptlet rules in component filter lists. This is intentionally separate from the normal policy system and is only for users who choose to open the advanced tab and accept the warnings.
+
+### Advanced scriptlet manager notes
+
+The `Default Scriptlets (Advanced)` tab is not part of the normal preset/apply flow. The one-click modes, policy tabs, config import, and big `Apply to Brave` button do not edit Brave's internal filter-list files.
+
+To bulk-disable matching scriptlets:
+
+1. Open `Default Scriptlets (Advanced)`.
+2. Click `Scan` and wait for rendering to finish.
+3. Use `Search/filter` if you only want a subset, such as `youtube`.
+4. Leave `Show disabled by this app only` unticked if you want active rules included.
+5. Tick `Advanced edit mode`.
+6. Click `Check filtered`.
+7. Confirm the status line shows the expected `Checked:` count.
+8. Click `Disable checked`.
+
+Disabling scriptlets is not the same as disabling Brave adblocking. Scriptlets are only the `##+js(...)` injected-rule layer used for site fixes, anti-annoyance behavior, cookie banners, video workarounds, and some anti-adblock handling. Brave can still block ads through network filters, cosmetic filters, and Shields even when scriptlets are disabled.
 
 ## Before / After
 
