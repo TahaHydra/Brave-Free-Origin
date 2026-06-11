@@ -69,7 +69,10 @@ $script:ScriptletRules = @()
 $script:ScriptletVisibleRules = @()
 $script:ScriptletScanState = $null
 $script:ScriptletScanTimer = $null
+$script:ScriptletRenderState = $null
+$script:ScriptletRenderTimer = $null
 $script:ScriptletFilterTimer = $null
+$script:ScriptletCheckedKeys = @{}
 $script:SuppressScriptletStatusEvents = $false
 $script:ScriptletComponentNames = @{
     'iodkpdagapdfkphljnddpjlldadblomo' = 'uBlock filters'
@@ -1149,14 +1152,15 @@ function Resize-ScriptletColumns {
     if (-not $script:ScriptletList) { return }
     if ($script:ScriptletList.Columns.Count -lt 7) { return }
 
-    $width = [Math]::Max(760, $script:ScriptletList.ClientSize.Width)
-    $pickWidth = 96
-    $domainWidth = [Math]::Max(150, [int]($width * 0.16))
-    $scriptletWidth = [Math]::Max(150, [int]($width * 0.16))
-    $argsWidth = [Math]::Max(170, [int]($width * 0.22))
-    $sourceWidth = [Math]::Max(150, [int]($width * 0.15))
+    $width = [Math]::Max(760, $script:ScriptletList.ClientSize.Width - 10)
+    $pickWidth = 92
     $lineWidth = 55
-    $rawWidth = [Math]::Max(260, $width - ($pickWidth + $domainWidth + $scriptletWidth + $argsWidth + $sourceWidth + $lineWidth + 26))
+    $flex = [Math]::Max(600, $width - $pickWidth - $lineWidth)
+    $domainWidth = [Math]::Max(105, [int]($flex * 0.16))
+    $scriptletWidth = [Math]::Max(115, [int]($flex * 0.17))
+    $argsWidth = [Math]::Max(145, [int]($flex * 0.22))
+    $sourceWidth = [Math]::Max(125, [int]($flex * 0.15))
+    $rawWidth = [Math]::Max(170, $width - ($pickWidth + $domainWidth + $scriptletWidth + $argsWidth + $sourceWidth + $lineWidth + 4))
 
     $script:ScriptletList.Columns[0].Width = $pickWidth
     $script:ScriptletList.Columns[1].Width = $domainWidth
@@ -1175,8 +1179,8 @@ function Update-ScriptletStatusText {
 
     $enabled = @($script:ScriptletRules | Where-Object { $_.Enabled }).Count
     $disabled = @($script:ScriptletRules | Where-Object { -not $_.Enabled }).Count
-    $checked = if ($script:ScriptletList) { $script:ScriptletList.CheckedItems.Count } else { 0 }
-    $script:LblScriptletStatus.Text = "Showing $Shown / $($script:ScriptletRules.Count) scriptlet rule(s). Enabled: $enabled. Disabled by Brave Free Origin: $disabled. Checked: $checked."
+    $checked = $script:ScriptletCheckedKeys.Count
+    $script:LblScriptletStatus.Text = "Showing $Shown / $($script:ScriptletRules.Count). Enabled: $enabled. Disabled: $disabled. Checked: $checked."
 }
 
 function Set-ScriptletUiBusy {
@@ -1208,6 +1212,158 @@ function Start-ScriptletFilterDelay {
     }
 }
 
+function Get-ScriptletRecordKey {
+    param([object]$Record)
+
+    if (-not $Record) { return $null }
+    return ('{0}`t{1}' -f [string]$Record.File, [int]$Record.LineNumber)
+}
+
+function Test-ScriptletRecordChecked {
+    param([object]$Record)
+
+    $key = Get-ScriptletRecordKey -Record $Record
+    return ($key -and $script:ScriptletCheckedKeys.ContainsKey($key))
+}
+
+function Set-ScriptletRecordChecked {
+    param(
+        [object]$Record,
+        [bool]$Checked
+    )
+
+    $key = Get-ScriptletRecordKey -Record $Record
+    if (-not $key) { return }
+
+    if ($Checked) {
+        $script:ScriptletCheckedKeys[$key] = $true
+    } else {
+        [void]$script:ScriptletCheckedKeys.Remove($key)
+    }
+}
+
+function New-ScriptletListItem {
+    param([object]$Record)
+
+    $item = New-Object System.Windows.Forms.ListViewItem($(if ($Record.Enabled) { 'Enabled' } else { 'Disabled' }))
+    [void]$item.SubItems.Add($Record.Domain)
+    [void]$item.SubItems.Add($Record.Scriptlet)
+    [void]$item.SubItems.Add($Record.Arguments)
+    [void]$item.SubItems.Add("$($Record.Source) $($Record.Version)")
+    [void]$item.SubItems.Add([string]$Record.LineNumber)
+    [void]$item.SubItems.Add($Record.Rule)
+    $item.Tag = $Record
+    $item.Checked = Test-ScriptletRecordChecked -Record $Record
+    if (-not $Record.Enabled) {
+        $item.ForeColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
+    }
+    return $item
+}
+
+function Stop-ScriptletRender {
+    if ($script:ScriptletRenderTimer) { $script:ScriptletRenderTimer.Stop() }
+    $script:ScriptletRenderState = $null
+    $script:SuppressScriptletStatusEvents = $false
+}
+
+function Start-ScriptletRender {
+    param([object[]]$Rows)
+
+    if (-not $script:ScriptletList) { return }
+    Stop-ScriptletRender
+    Set-ScriptletUiBusy $true "Rendering 0 / $($Rows.Count) visible scriptlet row(s)..."
+    Resize-ScriptletColumns
+
+    $script:SuppressScriptletStatusEvents = $true
+    $script:ScriptletList.BeginUpdate()
+    try {
+        $script:ScriptletList.Items.Clear()
+    } finally {
+        $script:ScriptletList.EndUpdate()
+    }
+
+    $script:ScriptletRenderState = [pscustomobject]@{
+        Rows      = @($Rows)
+        Index     = 0
+        Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    }
+
+    if ($script:ScriptletProgress) {
+        $script:ScriptletProgress.Visible = $true
+        $script:ScriptletProgress.Style = 'Continuous'
+        $script:ScriptletProgress.Value = 0
+    }
+    if ($script:LblScriptletStatus) {
+        $script:LblScriptletStatus.Text = "Rendering 0 / $($Rows.Count) visible scriptlet row(s)..."
+    }
+
+    if ($Rows.Count -eq 0) {
+        Stop-ScriptletRender
+        if ($script:ScriptletProgress) { $script:ScriptletProgress.Value = 0 }
+        Update-ScriptletStatusText -Shown 0
+        Set-ScriptletUiBusy $false
+        return
+    }
+
+    if (-not $script:ScriptletRenderTimer) {
+        $script:ScriptletRenderTimer = New-Object System.Windows.Forms.Timer
+        $script:ScriptletRenderTimer.Interval = 10
+        $script:ScriptletRenderTimer.Add_Tick({ Step-ScriptletRender })
+    }
+    $script:ScriptletRenderTimer.Start()
+}
+
+function Step-ScriptletRender {
+    $state = $script:ScriptletRenderState
+    if (-not $state) {
+        Stop-ScriptletRender
+        return
+    }
+
+    $total = $state.Rows.Count
+    if ($total -eq 0) {
+        Stop-ScriptletRender
+        Update-ScriptletStatusText -Shown 0
+        return
+    }
+
+    $startTick = [Environment]::TickCount64
+    $batch = New-Object System.Collections.Generic.List[System.Windows.Forms.ListViewItem]
+    while ($state.Index -lt $total -and (([Environment]::TickCount64 - $startTick) -lt 25) -and $batch.Count -lt 400) {
+        [void]$batch.Add((New-ScriptletListItem -Record $state.Rows[$state.Index]))
+        $state.Index++
+    }
+
+    if ($batch.Count -gt 0) {
+        $items = $batch.ToArray()
+        $script:ScriptletList.BeginUpdate()
+        try {
+            $script:ScriptletList.Items.AddRange($items)
+        } finally {
+            $script:ScriptletList.EndUpdate()
+        }
+    }
+
+    $percent = [int](($state.Index * 1000L) / [Math]::Max(1, $total))
+    $percent = [Math]::Max(0, [Math]::Min(1000, $percent))
+    if ($script:ScriptletProgress) { $script:ScriptletProgress.Value = $percent }
+    if ($script:LblScriptletStatus) {
+        $seconds = [Math]::Round($state.Stopwatch.Elapsed.TotalSeconds, 1)
+        $script:LblScriptletStatus.Text = "Rendering $($state.Index) / $total visible scriptlet row(s)... ${seconds}s"
+    }
+
+    if ($state.Index -ge $total) {
+        $elapsed = [Math]::Round($state.Stopwatch.Elapsed.TotalSeconds, 1)
+        Stop-ScriptletRender
+        if ($script:ScriptletProgress) { $script:ScriptletProgress.Value = 1000 }
+        Update-ScriptletStatusText -Shown $total
+        if ($script:LblScriptletStatus) {
+            $script:LblScriptletStatus.Text += " Render completed in ${elapsed}s."
+        }
+        Set-ScriptletUiBusy $false
+    }
+}
+
 function Update-ScriptletListView {
     if (-not $script:ScriptletList) { return }
 
@@ -1223,39 +1379,21 @@ function Update-ScriptletListView {
     }
 
     $script:ScriptletVisibleRules = $rows
-    Resize-ScriptletColumns
-    $script:ScriptletList.BeginUpdate()
-    $script:ScriptletList.Items.Clear()
-
-    if ($rows.Count -gt 0) {
-        $items = New-Object 'System.Windows.Forms.ListViewItem[]' $rows.Count
-        for ($i = 0; $i -lt $rows.Count; $i++) {
-            $r = $rows[$i]
-            $item = New-Object System.Windows.Forms.ListViewItem($(if ($r.Enabled) { 'Enabled' } else { 'Disabled' }))
-            [void]$item.SubItems.Add($r.Domain)
-            [void]$item.SubItems.Add($r.Scriptlet)
-            [void]$item.SubItems.Add($r.Arguments)
-            [void]$item.SubItems.Add("$($r.Source) $($r.Version)")
-            [void]$item.SubItems.Add([string]$r.LineNumber)
-            [void]$item.SubItems.Add($r.Rule)
-            $item.Tag = $r
-            if (-not $r.Enabled) {
-                $item.ForeColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
-            }
-            $items[$i] = $item
-        }
-        $script:ScriptletList.Items.AddRange($items)
-    }
-
-    $script:ScriptletList.EndUpdate()
-    Update-ScriptletStatusText -Shown $rows.Count
+    Start-ScriptletRender -Rows $rows
 }
 
 function Get-SelectedScriptletRecords {
     if (-not $script:ScriptletList) { return @() }
     $records = @()
-    $items = if ($script:ScriptletList.CheckedItems.Count -gt 0) { $script:ScriptletList.CheckedItems } else { $script:ScriptletList.SelectedItems }
-    foreach ($item in $items) {
+
+    if ($script:ScriptletCheckedKeys.Count -gt 0) {
+        foreach ($record in $script:ScriptletRules) {
+            if (Test-ScriptletRecordChecked -Record $record) { $records += $record }
+        }
+        return $records
+    }
+
+    foreach ($item in $script:ScriptletList.SelectedItems) {
         if ($item.Tag) { $records += $item.Tag }
     }
     return $records
@@ -1265,11 +1403,19 @@ function Set-ScriptletVisibleChecks {
     param([bool]$Checked)
 
     if (-not $script:ScriptletList) { return }
+    if ($Checked) {
+        foreach ($record in $script:ScriptletVisibleRules) {
+            Set-ScriptletRecordChecked -Record $record -Checked $true
+        }
+    } else {
+        $script:ScriptletCheckedKeys.Clear()
+    }
+
     $script:SuppressScriptletStatusEvents = $true
     $script:ScriptletList.BeginUpdate()
     try {
         foreach ($item in $script:ScriptletList.Items) {
-            $item.Checked = $Checked
+            $item.Checked = Test-ScriptletRecordChecked -Record $item.Tag
         }
     } finally {
         $script:ScriptletList.EndUpdate()
@@ -1345,7 +1491,6 @@ function Complete-ScriptletScan {
     }
     [System.Windows.Forms.Application]::DoEvents()
     Update-ScriptletListView
-    Set-ScriptletUiBusy $false
     Write-Log "Scriptlet scan complete: $($script:ScriptletRules.Count) rule(s) from $root in ${elapsed}s" 'OK'
 
     if ($script:LblScriptletStatus) {
@@ -1442,6 +1587,7 @@ function Invoke-ScriptletScan {
         if ($totalBytes -lt 1) { $totalBytes = 1 }
         $script:ScriptletRules = @()
         $script:ScriptletVisibleRules = @()
+        $script:ScriptletCheckedKeys.Clear()
         if ($script:ScriptletList) { $script:ScriptletList.Items.Clear() }
 
         $script:ScriptletScanState = [pscustomobject]@{
@@ -2327,7 +2473,12 @@ $script:ScriptletList.CheckBoxes = $true
 $script:ScriptletList.Anchor = 'Top, Left, Right'
 $script:ScriptletList.Add_SizeChanged({ Resize-ScriptletColumns })
 $script:ScriptletList.Add_ItemChecked({
-    if (-not $script:SuppressScriptletStatusEvents) { Update-ScriptletStatusText }
+    param($sender, $eventArgs)
+
+    if (-not $script:SuppressScriptletStatusEvents) {
+        Set-ScriptletRecordChecked -Record $eventArgs.Item.Tag -Checked $eventArgs.Item.Checked
+        Update-ScriptletStatusText
+    }
 })
 [void]$script:ScriptletList.Columns.Add('Pick / status', 96)
 [void]$script:ScriptletList.Columns.Add('Domain', 190)
@@ -2341,18 +2492,18 @@ $scriptletsTab.Controls.Add($script:ScriptletList)
 $script:LblScriptletStatus = New-Object System.Windows.Forms.Label
 $script:LblScriptletStatus.Text = 'Scan a Brave User Data folder to list internal scriptlet rules.'
 $script:LblScriptletStatus.Location = New-Object System.Drawing.Point(10, 336)
-$script:LblScriptletStatus.Size = New-Object System.Drawing.Size(910, 18)
+$script:LblScriptletStatus.Size = New-Object System.Drawing.Size(520, 18)
 $script:LblScriptletStatus.ForeColor = [System.Drawing.Color]::DimGray
 $scriptletsTab.Controls.Add($script:LblScriptletStatus)
 
 $script:ScriptletProgress = New-Object System.Windows.Forms.ProgressBar
-$script:ScriptletProgress.Location = New-Object System.Drawing.Point(925, 336)
-$script:ScriptletProgress.Size = New-Object System.Drawing.Size(195, 16)
+$script:ScriptletProgress.Location = New-Object System.Drawing.Point(545, 336)
+$script:ScriptletProgress.Size = New-Object System.Drawing.Size(575, 16)
 $script:ScriptletProgress.Minimum = 0
 $script:ScriptletProgress.Maximum = 1000
 $script:ScriptletProgress.Value = 0
 $script:ScriptletProgress.Style = 'Continuous'
-$script:ScriptletProgress.Anchor = 'Top, Right'
+$script:ScriptletProgress.Anchor = 'Top, Left, Right'
 $scriptletsTab.Controls.Add($script:ScriptletProgress)
 
 $script:ChkScriptletAffectDuplicates = New-Object System.Windows.Forms.CheckBox
@@ -2364,11 +2515,11 @@ $tt.SetToolTip($script:ChkScriptletAffectDuplicates, 'Brave lists can contain th
 $scriptletsTab.Controls.Add($script:ChkScriptletAffectDuplicates)
 
 $script:BtnScriptletCheckVisible = New-Object System.Windows.Forms.Button
-$script:BtnScriptletCheckVisible.Text = 'Check all visible'
+$script:BtnScriptletCheckVisible.Text = 'Check filtered'
 $script:BtnScriptletCheckVisible.Size = New-Object System.Drawing.Size(125, 26)
 $script:BtnScriptletCheckVisible.Location = New-Object System.Drawing.Point(290, 356)
 $script:BtnScriptletCheckVisible.Add_Click({ Set-ScriptletVisibleChecks $true })
-$tt.SetToolTip($script:BtnScriptletCheckVisible, 'Checks every row currently shown by the active search/filter.')
+$tt.SetToolTip($script:BtnScriptletCheckVisible, 'Checks every row matching the active search/show filters, including rows not currently painted in the table.')
 $scriptletsTab.Controls.Add($script:BtnScriptletCheckVisible)
 
 $script:BtnScriptletClearChecks = New-Object System.Windows.Forms.Button
