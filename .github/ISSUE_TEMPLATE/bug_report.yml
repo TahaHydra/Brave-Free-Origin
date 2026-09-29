@@ -1,0 +1,98 @@
+name: Bug report
+description: Something does not work, a setting does nothing, or the app shows an error
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The more of the boxes below you fill in, the faster this can be fixed.
+        **Security problem?** Please do not post details here; see [SECURITY.md](https://github.com/TahaHydra/Brave-Free-Origin/blob/main/SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Say what you did and what you saw. A screenshot helps.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: false
+  - type: input
+    id: app-version
+    attributes:
+      label: Brave Free Origin version
+      description: Shown in the window title, for example "Brave Free Origin v1.13".
+      placeholder: "1.13"
+    validations:
+      required: true
+  - type: input
+    id: brave-version
+    attributes:
+      label: Brave version
+      description: Open `brave://version` in Brave and copy the first line.
+      placeholder: "Brave 154.1.96.59 (Chromium 154.0.8037.58)"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: "Windows key, type `winver`."
+      placeholder: "Windows 11 24H2 (build 26100)"
+    validations:
+      required: false
+  - type: dropdown
+    id: start
+    attributes:
+      label: How did you start it?
+      options:
+        - One-line command (irm ... | iex)
+        - Portable ZIP (Brave-Free-Origin.bat)
+        - Running Brave-Free-Origin.ps1 directly
+        - Something else
+    validations:
+      required: true
+  - type: dropdown
+    id: language
+    attributes:
+      label: App language
+      options:
+        - English
+        - Français
+        - Español
+        - हिन्दी
+        - العربية
+        - 简体中文
+        - 繁體中文
+        - Other
+    validations:
+      required: false
+  - type: textarea
+    id: policy
+    attributes:
+      label: Does it involve a specific setting?
+      description: |
+        If a setting seems to do nothing, open `brave://policy`, find it, and paste what it shows (Source, Scope, Status, value). Also say whether you fully closed and reopened Brave after pressing Apply.
+    validations:
+      required: false
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Paste the end of the newest file in `%LOCALAPPDATA%\Brave-Free-Origin\logs\` (Tools > *Show or hide the log* shows it in the window). The **Preview changes** and **Verify** reports are written in English and are very useful too.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I am using the latest release (or say below why not).
+          required: false
