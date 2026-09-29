@@ -1,0 +1,81 @@
+name: Release
+
+# Push a tag such as v1.13 and this builds the portable zip, checks that the tag
+# matches the version inside the app, and publishes the release with the zip
+# and its SHA-256 sums. The one-line installer (install\bfo.ps1) downloads
+# Brave-Free-Origin.zip from the latest release and verifies it against the
+# checksum GitHub records for that exact file, so the asset name must not change.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)publish, for example v1.13'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Work out the tag and check it matches the app
+        id: version
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event.inputs.tag }}') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if ($tag -notmatch '^v(\d+\.\d+(\.\d+)?)$') { throw "Tag '$tag' is not like v1.13." }
+          $wanted = $Matches[1]
+          $source = Get-Content 'Brave-Free-Origin.ps1' -Raw
+          if ($source -notmatch "AppVersion\s*=\s*'([^']+)'") { throw 'AppVersion not found in Brave-Free-Origin.ps1.' }
+          if ($Matches[1] -ne $wanted) { throw "Tag says $wanted but the app says $($Matches[1]). Fix one of them and tag again." }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$wanted" >> $env:GITHUB_OUTPUT
+
+      - name: Self-test the app before publishing
+        shell: powershell
+        env:
+          BFO_TEST_OUT: ${{ runner.temp }}\bfo-selftest
+        run: |
+          $settings = Join-Path $env:RUNNER_TEMP 'bfo-settings\settings.json'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Brave-Free-Origin.ps1 `
+            -Lang en-US -BfoSettingsPath $settings -SelfTest .\tools\Test-App.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\tools\Test-Locales.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build the zip
+        shell: pwsh
+        run: ./tools/Build-Package.ps1
+
+      - name: Pull this version's notes out of CHANGELOG.md
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $text = Get-Content 'CHANGELOG.md' -Raw
+          $pattern = '(?ms)^##\s+\[?v?' + [regex]::Escape($version) + '\]?[^\r\n]*\r?\n(.*?)(?=^##\s|\z)'
+          if ($text -notmatch $pattern) { throw "CHANGELOG.md has no section for $version." }
+          $Matches[1].Trim() | Set-Content -Path release-notes.md -Encoding utf8
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag Brave-Free-Origin.zip SHA256SUMS.txt --clobber
+            gh release edit $tag --notes-file release-notes.md
+          } else {
+            gh release create $tag Brave-Free-Origin.zip SHA256SUMS.txt --title "Brave Free Origin $tag" --notes-file release-notes.md --verify-tag
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -2,6 +2,7 @@
 # .github/workflows/ci.yml) and attached to releases - it is never a tracked
 # source file.
 *.zip
+SHA256SUMS.txt
 
 # Runtime / user artifacts the app writes. None of these belong to the repo.
 /settings.json
