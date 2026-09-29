@@ -7,55 +7,178 @@
 #  BOM-less .ps1 using the system ANSI code page, so any literal non-ASCII text
 #  here would mojibake on machines with a different code page. Translations
 #  live in locales\*.json and are read with an explicit UTF-8 decoder.
+#
+#  Layout of this file (search for the region names):
+#    Bootstrap        parameters, elevation, error handling, logging, sandbox
+#    i18n runtime     locale loading, fonts, right-to-left support
+#    English catalog  every user-visible string (single source of truth)
+#    Catalog data     policies, presets, hosts groups, search engines
+#    Core             registry, backups, hosts file, tasks/services, planning
+#    Scriptlets       optional expert tool for Brave's built-in filter lists
+#    UI               window, pages, dialogs
+#    Startup          locale bootstrap, first load, message loop / self-test
 # ============================================================================
 
 [CmdletBinding()]
 param(
-    # Force a UI language, e.g. -Lang zh-CN. Falls back to the saved setting,
+    # Force a UI language, e.g. -Lang fr-FR. Falls back to the saved setting,
     # then the Windows UI culture, then English.
     [string]$Lang,
 
     # Resolved before elevation and forwarded across the UAC boundary, so an
     # elevated administrator account still reads and writes the original
     # user's preference file instead of its own.
-    [string]$BfoSettingsPath
+    [string]$BfoSettingsPath,
+
+    # Maintainer hook (see tools\Test-App.ps1). Path to a script that is run
+    # inside the finished app instead of showing the window. It also switches
+    # the app into a sandbox: no HKLM, no hosts file, no scheduled tasks and no
+    # services are touched, and no UAC prompt is shown.
+    [string]$SelfTest
 )
 
-#region Elevation -------------------------------------------------------------
+#region Bootstrap -------------------------------------------------------------
+$ErrorActionPreference = 'Stop'
+
+$script:AppVersion       = '1.13'
+$script:CatalogBrave     = '154.1.96.59'   # Brave build the policy catalog was verified against
+$script:CatalogBraveMajor = 154
+$script:CatalogDate      = '2026-09-29'
+$script:SelfTestMode     = -not [string]::IsNullOrWhiteSpace($SelfTest)
+$script:ProjectUrl       = 'https://github.com/TahaHydra/Brave-Free-Origin'
+
 if (-not $BfoSettingsPath) {
     $BfoSettingsPath = Join-Path $env:LOCALAPPDATA 'Brave-Free-Origin\settings.json'
 }
+$script:SettingsPath = $BfoSettingsPath
+$script:AppDataDir   = Split-Path -Parent $BfoSettingsPath
+$script:LogDir       = Join-Path $script:AppDataDir 'logs'
+$script:LogFile      = Join-Path $script:LogDir ('bfo-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
 
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal(
-    [Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    # Forward our own parameters. The old code rebuilt a fixed command line, so
-    # anything passed on the command line vanished at the UAC boundary.
+function Test-IsAdministrator {
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Elevation. Policies live under HKLM, so the app needs administrator rights.
+# The relaunch is hidden (the GUI is the only window the user should see) and
+# a refused UAC prompt is explained instead of surfacing as a red PowerShell
+# error and a misleading launcher message.
+if (-not $script:SelfTestMode -and -not (Test-IsAdministrator)) {
     $relaunchArgs = @(
-        '-NoProfile'
+        '-NoLogo', '-NoProfile'
         '-ExecutionPolicy', 'Bypass'
+        '-WindowStyle', 'Hidden'
         '-File', ('"{0}"' -f $PSCommandPath)
         '-BfoSettingsPath', ('"{0}"' -f $BfoSettingsPath)
     )
     if ($Lang) { $relaunchArgs += @('-Lang', ('"{0}"' -f $Lang)) }
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $relaunchArgs
-    exit
+    try {
+        Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList $relaunchArgs -ErrorAction Stop | Out-Null
+        exit 0
+    } catch {
+        Add-Type -AssemblyName System.Windows.Forms
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Brave Free Origin needs administrator permission to change Brave's machine-wide policies.`r`n`r`nStart it again and choose Yes on the Windows prompt.",
+            'Brave Free Origin',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information)
+        exit 2
+    }
 }
-#endregion
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+try { [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false) } catch { }
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
 
-$script:AppVersion = '1.12'
+# ---- Sandbox ---------------------------------------------------------------
+# In self-test mode every machine-level side effect is redirected, so the whole
+# apply / verify / restore pipeline can be exercised without administrator
+# rights and without touching a real Brave install.
+$script:SandboxRegistryRoot = 'HKCU:\Software\Brave-Free-Origin-SelfTest\Policies\BraveSoftware'
+$script:SandboxHostsFile    = Join-Path ([System.IO.Path]::GetTempPath()) 'bfo-selftest-hosts.txt'
+
+function Get-PolicyHivePath {
+    param([string]$ChannelKey)   # 'Brave', 'Brave-Beta', 'Brave-Nightly', 'Brave-Dev'
+    if ($script:SelfTestMode) { return "$($script:SandboxRegistryRoot)\$ChannelKey" }
+    return "HKLM:\Software\Policies\BraveSoftware\$ChannelKey"
+}
+
+# ---- Logging and error reporting -------------------------------------------
+$script:LogBox      = $null
+$script:StatusLabel = $null
+$script:Form        = $null
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
+    if ($script:LogBox) {
+        try {
+            $script:LogBox.AppendText("$line`r`n")
+            $script:LogBox.SelectionStart = $script:LogBox.Text.Length
+            $script:LogBox.ScrollToCaret()
+        } catch { }
+    }
+    if ($script:StatusLabel) {
+        try { $script:StatusLabel.Text = '{0}  {1}' -f (Get-Date -Format 'HH:mm:ss'), $Message } catch { }
+    }
+    # A log file is what makes a hidden-console GUI supportable: a user can
+    # attach it to an issue. Failing to write it must never break the app.
+    try {
+        if (-not (Test-Path -LiteralPath $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+        [System.IO.File]::AppendAllText($script:LogFile, "$line`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Remove-OldLogs {
+    try {
+        Get-ChildItem -LiteralPath $script:LogDir -Filter 'bfo-*.log' -File -ErrorAction Stop |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 7 | Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Format-ErrorRecord {
+    param($ErrorRecord)
+    $text = "$($ErrorRecord.Exception.Message)"
+    if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.PositionMessage) {
+        $text += "`r`n" + $ErrorRecord.InvocationInfo.PositionMessage.Trim()
+    }
+    if ($ErrorRecord.ScriptStackTrace) { $text += "`r`n" + $ErrorRecord.ScriptStackTrace }
+    return $text
+}
+
+function Show-FatalError {
+    param($ErrorRecord)
+    $detail = Format-ErrorRecord $ErrorRecord
+    try { Write-Log "FATAL: $detail" 'ERR' } catch { }
+    if ($script:SelfTestMode) { [Console]::Error.WriteLine("FATAL: $detail"); return }
+    try {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            "Brave Free Origin could not start.`r`n`r`n$($ErrorRecord.Exception.Message)`r`n`r`nDetails were saved to:`r`n$($script:LogFile)",
+            'Brave Free Origin',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error)
+    } catch { }
+}
+
+# Anything that escapes to script scope is a startup failure. The elevated
+# console is hidden, so without this the user would see nothing at all.
+trap { Show-FatalError $_; exit 1 }
+
+Remove-OldLogs
+Write-Log ("Starting Brave Free Origin v{0} (PowerShell {1}, self-test: {2})" -f $script:AppVersion, $PSVersionTable.PSVersion, $script:SelfTestMode)
+#endregion
+
 
 #region i18n runtime ----------------------------------------------------------
 # Localization engine.
 #
 # Design rules (see TRANSLATING.md):
 #   * This .ps1 stays pure ASCII. Windows PowerShell 5.1 decodes a BOM-less
-#     script with the system ANSI code page, so literal CJK here would
-#     mojibake on any machine whose code page is not the translator's.
+#     script with the system ANSI code page, so literal non-Latin text here
+#     would mojibake on any machine whose code page is not the translator's.
 #   * The English catalog below is the single runtime source of truth. The app
 #     is fully usable with no locales\ folder at all.
 #   * Translations are inert JSON data. They are never executed, they can only
@@ -63,12 +186,13 @@ $script:AppVersion = '1.12'
 #     registry path, policy name, domain, URL or numeric value.
 $script:EnglishStrings  = @{}
 $script:LocaleStrings   = @{}
-$script:LocaleMeta      = $null
 $script:CurrentLocale   = 'en-US'
+$script:IsRtl           = $false
 $script:I18nBindings    = New-Object System.Collections.ArrayList
 $script:LocFontBindings = New-Object System.Collections.ArrayList
 $script:LocaleDir       = Join-Path $PSScriptRoot 'locales'
 $script:MaxLocaleValue  = 2000
+$script:RtlLanguages    = @('ar', 'he', 'fa', 'ur')
 
 # Re-entrant guard for "the code is changing controls, not the user".
 # WinForms raises SelectedIndexChanged / CheckedChanged for programmatic
@@ -119,11 +243,33 @@ function T {
     return $text
 }
 
+# English text regardless of the active language. Reports and the log stay
+# English so a translated install still produces bug reports the maintainer
+# can read.
+function TEn {
+    param([Parameter(Mandatory)][string]$Key, [object[]]$FormatArgs)
+    if (-not $script:EnglishStrings.ContainsKey($Key)) { return "!!$Key!!" }
+    $text = $script:EnglishStrings[$Key]
+    if ($FormatArgs -and $FormatArgs.Count -gt 0) {
+        try { return ($text -f $FormatArgs) } catch { return $text }
+    }
+    return $text
+}
+
 # ---- Locale files -----------------------------------------------------------
+function Test-IsRtlCode {
+    param([string]$Code)
+    if ([string]::IsNullOrWhiteSpace($Code)) { return $false }
+    return ($script:RtlLanguages -contains (($Code -split '-')[0]).ToLowerInvariant())
+}
+
 function Get-AvailableLocales {
-    $list = @([pscustomobject]@{ Code = 'en-US'; Name = 'English'; Path = $null; Reviewed = $true })
+    $list = @([pscustomobject]@{
+        Code = 'en-US'; Name = 'English'; EnglishName = 'English'; Path = $null; Reviewed = $true; Rtl = $false
+    })
     if (-not (Test-Path -LiteralPath $script:LocaleDir)) { return $list }
-    foreach ($file in (Get-ChildItem -LiteralPath $script:LocaleDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    $found = @()
+    foreach ($file in (Get-ChildItem -LiteralPath $script:LocaleDir -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
         $code = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
         if ($code -eq 'en-US') { continue }
         $meta = $null
@@ -134,14 +280,22 @@ function Get-AvailableLocales {
         if (-not $meta) { continue }
         $display = $code
         if ($meta.name) { $display = "$($meta.name)" }
-        $list += [pscustomobject]@{
-            Code     = $code
-            Name     = $display
-            Path     = $file.FullName
-            Reviewed = [bool]$meta.reviewed
+        $english = $display
+        if ($meta.englishName) { $english = "$($meta.englishName)" }
+        $rtl = (Test-IsRtlCode $code)
+        if ($meta.direction) { $rtl = ("$($meta.direction)".ToLowerInvariant() -eq 'rtl') }
+        $found += [pscustomobject]@{
+            Code        = $code
+            Name        = $display
+            EnglishName = $english
+            Path        = $file.FullName
+            Reviewed    = [bool]$meta.reviewed
+            Rtl         = $rtl
         }
     }
-    return $list
+    # English first (it is the default), then the rest alphabetically by their
+    # English name so the order does not depend on the script they are written in.
+    return @($list) + @($found | Sort-Object EnglishName)
 }
 
 function Import-LocaleFile {
@@ -194,8 +348,9 @@ function Set-BfoLocale {
 
     if (-not $Code -or $Code -eq 'en-US') {
         $script:LocaleStrings = @{}
-        $script:LocaleMeta    = $null
         $script:CurrentLocale = 'en-US'
+        $script:IsRtl         = $false
+        Reset-FontPlan
         return $true
     }
 
@@ -212,8 +367,10 @@ function Set-BfoLocale {
     }
 
     $script:LocaleStrings = $loaded.Strings
-    $script:LocaleMeta    = $loaded.Meta
     $script:CurrentLocale = $Code
+    $script:IsRtl         = (Test-IsRtlCode $Code)
+    if ($loaded.Meta -and $loaded.Meta.direction) { $script:IsRtl = ("$($loaded.Meta.direction)".ToLowerInvariant() -eq 'rtl') }
+    Reset-FontPlan
     $coverage = if ($script:EnglishStrings.Count -gt 0) {
         [math]::Round(100.0 * $loaded.Strings.Count / $script:EnglishStrings.Count)
     } else { 0 }
@@ -224,8 +381,8 @@ function Set-BfoLocale {
 # Coarse script tag for a culture name. Only Chinese actually needs this:
 # Simplified and Traditional are different writing systems, so silently
 # handing a zh-TW / zh-HK / zh-MO / zh-Hant user the Simplified catalog is
-# worse than leaving them in English. Every other language we are likely to
-# ship has a single script, so $null (= "no script constraint") is correct.
+# worse than leaving them in English. Every other language we ship has a
+# single script, so $null (= "no script constraint") is correct.
 function Get-LocaleScriptTag {
     param([string]$Code)
     if ([string]::IsNullOrWhiteSpace($Code)) { return $null }
@@ -245,16 +402,18 @@ function Get-LocaleScriptTag {
         }
     }
     # Bare 'zh' carries no script information at all. Simplified is both the
-    # larger population and the only Chinese catalog we ship, so prefer it.
+    # larger population and the first Chinese catalog we shipped, so prefer it.
     return 'Hans'
 }
 
 # Startup precedence: -Lang, then the persisted BFO setting, then the Windows
-# UI culture, then a same-language / same-script file, then English.
+# UI culture, then a same-language / same-script file, then English. English is
+# the default, so a PC in a language we do not ship simply gets English.
 function Resolve-StartupLocale {
-    param([string]$Requested, [string]$Saved)
+    param([string]$Requested, [string]$Saved, [string]$UiCulture)
+    if ([string]::IsNullOrWhiteSpace($UiCulture)) { $UiCulture = [System.Globalization.CultureInfo]::CurrentUICulture.Name }
     $codes = @((Get-AvailableLocales).Code)
-    foreach ($candidate in @($Requested, $Saved, [System.Globalization.CultureInfo]::CurrentUICulture.Name)) {
+    foreach ($candidate in @($Requested, $Saved, $UiCulture)) {
         if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
         $exact = @($codes | Where-Object { $_ -eq $candidate })
         if ($exact.Count -gt 0) { return $exact[0] }
@@ -269,6 +428,115 @@ function Resolve-StartupLocale {
     return 'en-US'
 }
 
+# ---- Fonts ------------------------------------------------------------------
+# Segoe UI covers Latin, Cyrillic, Greek and Arabic. It has no CJK or Indic
+# coverage, so those locales need a family of their own, and none of them has
+# a "Semibold" family - bold has to be requested as a style. A font plan is
+# resolved once per language switch and Font objects are cached, because every
+# `New-Object Font` allocates a GDI handle that would otherwise pile up.
+$script:InstalledFonts = $null
+$script:FontPlan       = $null
+$script:FontCache      = @{}
+
+function Test-FontInstalled {
+    param([string]$Family)
+    if (-not $script:InstalledFonts) {
+        $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($f in [System.Drawing.FontFamily]::Families) { [void]$set.Add($f.Name) }
+        $script:InstalledFonts = $set
+    }
+    return $script:InstalledFonts.Contains($Family)
+}
+
+function Reset-FontPlan { $script:FontPlan = $null }
+
+function Get-FontPlan {
+    if ($script:FontPlan) { return $script:FontPlan }
+    $candidates = @()
+    $boldStyle  = $true
+    # switch runs every matching branch unless told to stop, hence the breaks.
+    switch -Wildcard ($script:CurrentLocale) {
+        'zh-TW' { $candidates = @('Microsoft JhengHei UI', 'Microsoft JhengHei'); break }
+        'zh-*'  { $candidates = @('Microsoft YaHei UI', 'Microsoft YaHei'); break }
+        'hi*'   { $candidates = @('Nirmala UI'); break }
+        default { $boldStyle = $false }
+    }
+    $body = 'Segoe UI'
+    foreach ($c in $candidates) { if (Test-FontInstalled $c) { $body = $c; break } }
+    $semi = 'Segoe UI Semibold'
+    if ($boldStyle -or -not (Test-FontInstalled 'Segoe UI Semibold')) { $semi = $body; $boldStyle = $true }
+    $script:FontPlan = [pscustomobject]@{ Body = $body; Semibold = $semi; SemiIsBold = $boldStyle }
+    return $script:FontPlan
+}
+
+function Get-BfoUiFont {
+    param([single]$Size = 9, [switch]$Semibold, [switch]$Mono)
+    if ($Mono) { $family = 'Consolas'; $style = [System.Drawing.FontStyle]::Regular }
+    else {
+        $plan   = Get-FontPlan
+        $family = if ($Semibold) { $plan.Semibold } else { $plan.Body }
+        $style  = if ($Semibold -and $plan.SemiIsBold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    }
+    $key = '{0}|{1}|{2}' -f $family, $Size, $style
+    if (-not $script:FontCache.ContainsKey($key)) {
+        try { $script:FontCache[$key] = New-Object System.Drawing.Font($family, $Size, $style, [System.Drawing.GraphicsUnit]::Point) }
+        catch { $script:FontCache[$key] = New-Object System.Drawing.Font('Segoe UI', $Size, $style, [System.Drawing.GraphicsUnit]::Point) }
+    }
+    return $script:FontCache[$key]
+}
+
+# ---- Message boxes ----------------------------------------------------------
+# One entry point so every dialog is owned by the main window, and so a
+# right-to-left language gets a right-to-left dialog.
+function Show-Message {
+    param(
+        [string]$Text,
+        [string]$Title,
+        [string]$Buttons = 'OK',
+        [string]$Icon = 'Information',
+        [string]$Default = 'Button1'
+    )
+    if (-not $Title) { $Title = T 'msg.title.app' }
+    # Self-test: never block on a click. Dialogs are recorded and answered from a
+    # queue, or with the affirmative default when the queue is empty.
+    if ($script:SelfTestMode) {
+        $script:SelfTestDialogs += , @($Title, $Text)
+        if ($script:SelfTestAnswers -and $script:SelfTestAnswers.Count -gt 0) { return $script:SelfTestAnswers.Dequeue() }
+        if ($Buttons -like 'YesNo*') { return 'Yes' }
+        return 'OK'
+    }
+    $options = 0
+    if ($script:IsRtl) {
+        $options = [int]([System.Windows.Forms.MessageBoxOptions]::RtlReading -bor [System.Windows.Forms.MessageBoxOptions]::RightAlign)
+    }
+    $owner = $script:Form
+    if ($owner -and $owner.IsHandleCreated) {
+        return [System.Windows.Forms.MessageBox]::Show($owner, $Text, $Title, $Buttons, $Icon, $Default, $options)
+    }
+    return [System.Windows.Forms.MessageBox]::Show($Text, $Title, $Buttons, $Icon, $Default, $options)
+}
+$script:SelfTestAnswers = New-Object System.Collections.Queue
+$script:SelfTestDialogs = @()
+
+# Wraps an event handler body: a failure becomes a logged, explained error
+# instead of a silent no-op in a window nobody can see the console of.
+function Invoke-Guarded {
+    param([string]$Context, [scriptblock]$Action)
+    try { & $Action }
+    catch {
+        $detail = Format-ErrorRecord $_
+        Write-Log "$Context failed: $detail" 'ERR'
+        try {
+            [void](Show-Message -Text ((T 'msg.error.body' @($Context, $_.Exception.Message, $script:LogFile))) -Title (T 'msg.title.error') -Icon 'Error')
+        } catch { }
+    }
+}
+
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    Write-Log ("UI thread exception: " + $e.Exception.Message) 'ERR'
+})
+
 # ---- Control bindings -------------------------------------------------------
 # Every localized control registers itself once, so switching language is a
 # single pass instead of 120 hand-maintained assignments.
@@ -280,18 +548,14 @@ function Set-Loc {
         [object[]]$FormatArgs,
         # Re-evaluated on every language switch, for arguments that are
         # themselves translated (a group name inside a counted label).
-        [scriptblock]$ArgsScript,
-        [switch]$Fit,
-        [int]$MinWidth = 0
+        [scriptblock]$ArgsScript
     )
     if ($ArgsScript) { $FormatArgs = @(& $ArgsScript) }
     $Control.$Property = T $Key $FormatArgs
     [void]$script:I18nBindings.Add([pscustomobject]@{
         Kind = 'Property'; Control = $Control; Property = $Property
         Key  = $Key;       Args    = $FormatArgs; ArgsScript = $ArgsScript
-        Fit  = [bool]$Fit; MinWidth = $MinWidth
     })
-    if ($Fit) { Resize-ToText -Control $Control -MinWidth $MinWidth }
     return $Control
 }
 
@@ -303,11 +567,9 @@ function Set-LocTooltip {
     })
 }
 
-# Fonts have to be re-resolved on every language switch, not only at build
-# time: Segoe UI has no CJK coverage, so a control pinned to it renders
-# Chinese through GDI font linking at the wrong metrics. Registering the
-# *intent* (size + weight) rather than a Font object lets one pass rebuild
-# every localized control for the active locale.
+# Fonts are re-resolved on every language switch, not only at build time:
+# registering the *intent* (size + weight) rather than a Font object lets one
+# pass rebuild every localized control for the active locale.
 function Set-LocFont {
     param($Control, [single]$Size = 9, [switch]$Semibold)
     [void]$script:LocFontBindings.Add([pscustomobject]@{
@@ -324,169 +586,6 @@ function Update-LocalizedFonts {
     }
 }
 
-function Resize-ToText {
-    param($Control, [int]$MinWidth = 0, [int]$Padding = 24)
-    try {
-        $measured = [System.Windows.Forms.TextRenderer]::MeasureText($Control.Text, $Control.Font)
-        $Control.Width = [Math]::Max($MinWidth, $measured.Width + $Padding)
-    } catch { }
-}
-
-# A language switch is a pure re-text: it must not move one checkbox, one
-# combo selection or the active preset. Relabelling a ComboBox means
-# Items.Clear() + refill, which WinForms reports as a user selection change,
-# so the whole pass runs with the handlers muted and the active profile is
-# captured and restored around it.
-function Update-UiLanguage {
-    $keepProfile = $script:ActiveProfile
-    Push-SuppressSelectionEvents
-    try {
-        foreach ($binding in $script:I18nBindings) {
-            try {
-                if ($binding.Kind -eq 'Tooltip') {
-                    $script:ToolTip.SetToolTip($binding.Control, (T $binding.Key $binding.Args))
-                    continue
-                }
-                $bindArgs = $binding.Args
-                if ($binding.ArgsScript) { $bindArgs = @(& $binding.ArgsScript) }
-                $binding.Control.($binding.Property) = T $binding.Key $bindArgs
-                if ($binding.Fit) { Resize-ToText -Control $binding.Control -MinWidth $binding.MinWidth }
-            } catch { }
-        }
-        Update-LocalizedFonts
-        Update-LocalizedCombos
-        Update-LocalizedRowText
-        Update-ScriptletLocalizedText
-        Set-ModeButtonRow
-    } finally {
-        Pop-SuppressSelectionEvents
-    }
-    # Restored explicitly: a handler that somehow slipped through must not be
-    # able to downgrade "Recommended" to "Custom" just because labels changed.
-    $script:ActiveProfile = $keepProfile
-    # Enabled-state of the custom-URL boxes is derived from combo selection,
-    # so re-derive it now that the selections are known to be the originals.
-    Update-OverrideControlStates
-    Update-SelectionSummary
-    Update-ConfigurationFilter
-}
-
-# ---- Localized widgets that are not plain .Text properties ------------------
-function Update-ChannelComboLabels {
-    if (-not $script:ChannelCombo) { return }
-    $keep = Get-ComboId -Combo $script:ChannelCombo -Ids $script:ChannelIds
-    Push-SuppressSelectionEvents
-    try {
-        $script:ChannelCombo.BeginUpdate()
-        try {
-            $script:ChannelCombo.Items.Clear()
-            for ($i = 0; $i -lt @($script:ChannelIds).Count; $i++) {
-                $id  = @($script:ChannelIds)[$i]
-                $key = @($script:ChannelLabelKeys)[$i]
-                if ($id -eq '__ALL__') { [void]$script:ChannelCombo.Items.Add((T $key)) }
-                else                   { [void]$script:ChannelCombo.Items.Add((T $key @($id))) }
-            }
-        } finally {
-            $script:ChannelCombo.EndUpdate()
-        }
-        if (-not (Set-ComboId -Combo $script:ChannelCombo -Ids $script:ChannelIds -Id $keep)) {
-            if ($script:ChannelCombo.Items.Count -gt 0) { $script:ChannelCombo.SelectedIndex = 0 }
-        }
-    } finally {
-        Pop-SuppressSelectionEvents
-    }
-}
-
-# The three custom-URL text boxes are enabled purely as a function of their
-# combo's selected id. Derived state, so it is safe to recompute at any time -
-# and it has to be recomputed after any suppressed bulk update.
-function Update-OverrideControlStates {
-    if ($script:CmbSearchEngine -and $script:TxtCustomSearchUrl) {
-        $script:TxtCustomSearchUrl.Enabled =
-            ((Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds) -eq 'custom')
-    }
-    if ($script:CmbNtpDest -and $script:TxtNtpCustomUrl) {
-        $script:TxtNtpCustomUrl.Enabled =
-            ((Get-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds) -eq 'custom')
-    }
-    if ($script:CmbStartupMode -and $script:TxtStartupUrl) {
-        $modeId = Get-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds
-        $mode   = if ($modeId) { $script:StartupModes[$modeId] } else { $null }
-        $script:TxtStartupUrl.Enabled = [bool]($mode -and $mode.UsesURL -and -not $mode.FixedURL)
-    }
-}
-
-function Update-LocalizedCombos {
-    Update-ChannelComboLabels
-    Set-ComboLabels -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds  -LabelKeys $script:SearchEngineLabelKeys
-    Set-ComboLabels -Combo $script:CmbNtpDest      -Ids $script:DestinationIds   -LabelKeys $script:DestinationLabelKeys
-    Set-ComboLabels -Combo $script:CmbStartupMode  -Ids $script:StartupModeIds   -LabelKeys $script:StartupModeLabelKeys
-    foreach ($name in @($script:PolicyCombos.Keys)) {
-        Set-ComboLabels -Combo $script:PolicyCombos[$name] `
-                        -Ids $script:PolicyChoiceIds[$name] `
-                        -LabelKeys $script:PolicyChoiceKeys[$name]
-    }
-}
-
-# The preset row is the one place where a longer translated caption could
-# overlap its neighbour, so it is measured and re-flowed instead of pinned.
-function Set-ModeButtonRow {
-    if (-not $script:ModeButtons) { return }
-    $buttons = @($script:ModeButtons)
-    if ($buttons.Count -eq 0) { return }
-
-    $gap       = 6
-    $available = 1120
-    if ($buttons[0].Parent) {
-        $available = [Math]::Max(500, $buttons[0].Parent.ClientSize.Width - 28)
-    }
-
-    # Trim the caption padding before letting the row run off the panel. Seven
-    # buttons at the 90px floor always fit, so this terminates.
-    $padding = 24
-    while ($padding -gt 8) {
-        $total = -$gap
-        foreach ($btn in $buttons) {
-            $measured = [System.Windows.Forms.TextRenderer]::MeasureText($btn.Text, $btn.Font)
-            $total += [Math]::Max(90, $measured.Width + $padding) + $gap
-        }
-        if ($total -le $available) { break }
-        $padding -= 4
-    }
-    if ($padding -lt 8) { $padding = 8 }
-
-    $x = 14
-    foreach ($btn in $buttons) {
-        $measured = [System.Windows.Forms.TextRenderer]::MeasureText($btn.Text, $btn.Font)
-        $btn.Width = [Math]::Max(90, $measured.Width + $padding)
-        $btn.Left  = $x
-        $x = $btn.Right + $gap
-    }
-}
-
-# ---- Fonts / metrics --------------------------------------------------------
-# Segoe UI has no CJK coverage and there is no "Microsoft YaHei UI Semibold"
-# family, so bold has to be requested as a style rather than a family name.
-function Get-BfoUiFont {
-    param([single]$Size = 9, [switch]$Semibold)
-    if ($script:CurrentLocale -like 'zh-*') {
-        foreach ($family in @('Microsoft YaHei UI', 'Microsoft YaHei')) {
-            try {
-                $style = if ($Semibold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
-                return New-Object System.Drawing.Font($family, $Size, $style)
-            } catch { }
-        }
-    }
-    $fallback = if ($Semibold) { 'Segoe UI Semibold' } else { 'Segoe UI' }
-    try { return New-Object System.Drawing.Font($fallback, $Size) }
-    catch { return New-Object System.Drawing.Font('Segoe UI', $Size) }
-}
-
-# CJK needs more vertical room at the same point size.
-function Get-PolicyRowHeight { if ($script:CurrentLocale -like 'zh-*') { return 36 } else { return 28 } }
-function Get-PolicyDescHeight { if ($script:CurrentLocale -like 'zh-*') { return 34 } else { return 30 } }
-function Get-PolicyDescFontSize { if ($script:CurrentLocale -like 'zh-*') { return 9 } else { return 8 } }
-
 # ---- Persisted UI settings --------------------------------------------------
 # Stored per-user under LOCALAPPDATA, not beside the script: the script folder
 # may be read-only (Program Files) or shared, and the repo should stay clean.
@@ -501,7 +600,10 @@ function Get-BfoSettings {
         $map = @{}
         foreach ($p in $obj.PSObject.Properties) { $map[$p.Name] = $p.Value }
         return $map
-    } catch { return @{} }
+    } catch {
+        Write-Log "Settings file could not be read and was ignored: $_" 'WARN'
+        return @{}
+    }
 }
 
 function Save-BfoSettings {
@@ -513,243 +615,518 @@ function Save-BfoSettings {
         $json = ([pscustomobject]$Settings | ConvertTo-Json -Depth 4)
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($Path, $json, $utf8)
-    } catch { }
+    } catch {
+        Write-Log "Settings could not be saved: $_" 'WARN'
+    }
+}
+
+function Set-BfoSetting {
+    param([string]$Name, $Value)
+    $settings = Get-BfoSettings -Path $script:SettingsPath
+    $settings[$Name] = $Value
+    Save-BfoSettings -Path $script:SettingsPath -Settings $settings
 }
 #endregion
 
+
 #region English string catalog ------------------------------------------------
 # Runtime source of truth for every user-visible string.
-# locales\en-US.json is GENERATED from this block (tools\Export-EnglishLocale.ps1)
+# locales\en-US.json is GENERATED from these blocks (tools\Export-EnglishLocale.ps1)
 # and exists only as a reference for translators - it is never loaded.
+#
+# Writing rules: sentence case; say what happens to the person, not how the
+# program works; a control keeps the same name everywhere it appears; errors say
+# what went wrong and what to do next. Pure ASCII only (double a quote to write it).
 
 # ---- Application chrome ------------------------------------------------------
 Add-Strings @{
     'app.name'                = 'Brave Free Origin'
-    'app.title'               = 'Brave Free Origin v{0}  -  the free answer to Brave Origin''s paywalled minimal mode'
-    'channel.installed'       = '{0}  (installed)'
-    'channel.notInstalled'    = '{0}  (not installed)'
-    'header.allChannels'      = 'All installed channels'
-    'header.braveDetected'    = 'Brave detected: {0}'
-    'header.hives'            = '-> {0} ({1} hives)'
+    'app.title'               = 'Brave Free Origin v{0}'
+    'header.braveDetected'    = 'Brave {0}  -  {1}'
+    'header.braveNotFound'    = 'Brave was not found on this PC'
+    'header.compat.newer'     = 'Your Brave (version {0}) is newer than the one this list was checked against ({1}). A few settings may differ. Nothing breaks, and everything is reversible.'
+    'header.compat.older'     = 'Your Brave (version {0}) is much older than the one this list was checked against ({1}). Some settings may not exist yet in your version and will simply be ignored.'
+    'header.help'             = 'How this works, what each status means, and how to undo'
     'header.language'         = 'Language:'
-    'header.originNote'       = 'Context: Brave described Origin on April 16, 2026 as a minimalist build, then put that stripped-down idea behind a paywall. This is the free local version.'
-    'header.subtitle'         = 'Strip out the AI, crypto, VPN, promo junk, and background clutter Brave stuffed in, then tune it for a lighter desktop footprint.'
-    'header.targetChannel'    = 'Target channel:'
+    'header.scope.machine'    = 'installed for all users'
+    'header.scope.user'       = 'installed for this user'
+    'header.subtitle'         = 'Turn off the extras you do not want in Brave. Every change is reversible.'
     'header.unreviewedLocale' = 'community translation, unreviewed'
-}
-
-# ---- Mode deck ---------------------------------------------------------------
-Add-Strings @{
-    'mode.intro'    = 'Pick a one-click mode, then tweak the tabs below if you want to go deeper.'
-    'mode.label'    = 'Mode: {0}'
-    'mode.policies' = 'Policies: {0} / {1}'
-    'mode.risk'     = 'Risk: {0}'
-    'mode.system'   = 'System: {0} tasks, {1} services'
 }
 
 # ---- Presets -----------------------------------------------------------------
 # Preset ids (Minimal, Origin, ...) are stable and never translated.
 Add-Strings @{
-    'preset.CurrentState.description'   = 'Read from this PC. Shows what is already disabled right now.'
-    'preset.CurrentState.name'          = 'Current State'
-    'preset.CurrentState.risk'          = 'Read only'
-    'preset.Custom.description'         = 'Hand-picked mix. Use the tabs below to build your own Brave loadout.'
+    'mode.info'                         = '{0}  -  {1}  -  {2} settings ticked.  {3}'
+    'preset.CurrentState.description'   = 'What is set on this PC right now. Pick a preset above or tick rows below; nothing changes until you press Apply.'
+    'preset.CurrentState.name'          = 'Current settings'
+    'preset.CurrentState.risk'          = 'No changes yet'
+    'preset.Custom.description'         = 'Your own mix. Tick what you want on the pages below.'
     'preset.Custom.name'                = 'Custom'
     'preset.Custom.risk'                = 'Depends on your picks'
-    'preset.MaxPerformance.description' = 'Full fusion mode: Origin Mode, Privacy + Boost, and the strong privacy set combined, plus a few extra UI trims. This is the closest thing to an all-in gamer build.'
+    'preset.MaxPerformance.description' = 'Privacy + Boost, plus a blank new tab and home page, a fresh start on every launch (no session restore) and a smaller disk cache. The plainest, fastest Brave.'
     'preset.MaxPerformance.name'        = 'Max Performance'
-    'preset.MaxPerformance.risk'        = 'High risk'
-    'preset.MaxPrivacy.description'     = 'Aggressive lockdown. Great for hard privacy, but it can disable sync, sign-in, imports, and Brave update services.'
+    'preset.MaxPerformance.risk'        = 'Medium risk'
+    'preset.MaxPrivacy.description'     = 'Recommended plus strict privacy: no sign-in, sync or imports, no autofill or password prompts, HTTPS only, and site data is forgotten when a tab closes. Expect signed-out sites and extra clicks.'
     'preset.MaxPrivacy.name'            = 'Max Privacy'
     'preset.MaxPrivacy.risk'            = 'High risk'
-    'preset.Minimal.description'        = 'Quick debloat. Removes the loudest commercial extras without changing the whole browser.'
+    'preset.Minimal.description'        = 'Switches off Brave''s six loudest extras: Rewards, Wallet, VPN, Leo AI, News and Talk. Nothing else changes.'
     'preset.Minimal.name'               = 'Quick Debloat'
     'preset.Minimal.risk'               = 'Low risk'
-    'preset.None.description'           = 'Stock behavior. Nothing selected, nothing will be enforced.'
+    'preset.None.description'           = 'Stock Brave. Nothing is ticked, so Apply removes everything this tool set and hands control back to Brave.'
     'preset.None.name'                  = 'Stock / None'
     'preset.None.risk'                  = 'No changes'
-    'preset.Origin.description'         = 'Matches Brave Origin''s stripped-down idea from April 2026: off by default for Leo, Rewards, Wallet, VPN, News, Talk, Tor, Wayback, Web Discovery, and related stats.'
+    'preset.Origin.description'         = 'The free, local version of Brave Origin''s idea: no Leo, Rewards, Wallet, VPN, News, Talk, Tor, Wayback Machine, Playlist, Speedreader, Email Aliases or usage analytics, with Shields kept strong.'
     'preset.Origin.name'                = 'Origin Mode'
     'preset.Origin.risk'                = 'Low risk'
-    'preset.Performance.description'    = 'Privacy + Boost. Origin-style debloat plus startup and latency tuning for a leaner browser during gaming, streaming, or music use.'
+    'preset.Performance.description'    = 'Origin Mode and Recommended together, plus Memory Saver, Battery Saver, no background running, no Cast and no Live Caption download. A lighter browser for gaming, streaming or low-power laptops.'
     'preset.Performance.name'           = 'Privacy + Boost'
     'preset.Performance.risk'           = 'Medium risk'
-    'preset.Recommended.description'    = 'Balanced daily-driver setup. Good privacy, lighter UI, keeps core compatibility and media-friendly defaults.'
+    'preset.Recommended.description'    = 'Quick Debloat plus telemetry off, Chromium''s AI and promo features off, and Brave''s protections locked on. Passwords, autofill, sync, updates and session restore are left alone.'
     'preset.Recommended.name'           = 'Recommended'
     'preset.Recommended.risk'           = 'Low risk'
 }
 
-# ---- Configuration filter ----------------------------------------------------
+# ---- Navigation and pages ----------------------------------------------------
 Add-Strings @{
-    'filter.clear'         = 'Clear'
-    'filter.label'         = 'Filter configuration:'
-    'filter.matches'       = '{0} of {1} settings shown'
-    'filter.noMatches'     = 'No settings match this filter.'
-    'filter.placeholder'   = 'Type to filter every setting (name, description, category)...'
-    'filter.selectedOnly'  = 'Selected only'
-    'filter.tabCount'      = '{0} ({1})'
-    'policyTab.selectAll'  = 'Select all'
-    'policyTab.selectNone' = 'Select none'
+    'nav.group.advanced'                = 'Advanced'
+    'nav.group.settings'                = 'Settings'
+    'page.aiGenAi.intro'                = 'Brave''s own AI plus the Google-based AI features that ship with Chromium. Ticking keeps them off.'
+    'page.aiGenAi.title'                = 'AI features'
+    'page.autofillPasswords.intro'      = 'Convenience features that store personal data. Turning them off is stricter, but less convenient.'
+    'page.autofillPasswords.title'      = 'Passwords and autofill'
+    'page.braveFeatures.intro'          = 'Features Brave adds on top of the browser. Tick one to switch it off for good.'
+    'page.braveFeatures.title'          = 'Brave extras'
+    'page.hosts.intro'                  = 'A second line of defence: block Brave''s telemetry domains at the Windows level. This page has its own Apply button and never runs from the main one.'
+    'page.hosts.title'                  = 'Hosts blocklist'
+    'page.overrides.intro'              = 'Choose the address-bar search engine and what opens on launch and on new tabs. Each section only applies when its box is ticked.'
+    'page.overrides.title'              = 'Search engine and startup'
+    'page.performanceStartup.intro'     = 'Memory, battery, disk and what opens when Brave starts.'
+    'page.performanceStartup.title'     = 'Performance and startup'
+    'page.privacyTelemetry.intro'       = 'Usage statistics, crash reports and remote experiments. Ticking stops the data from being sent.'
+    'page.privacyTelemetry.title'       = 'Telemetry and reports'
+    'page.safetyUpdates.intro'          = 'Safe Browsing details and the prompts Brave shows about itself.'
+    'page.safetyUpdates.title'          = 'Safety and prompts'
+    'page.scriptlets.intro'             = 'Optional expert tool: view Brave''s built-in adblock scriptlet rules from component filter lists. Editing is manual-only, never part of presets, and never triggered by Apply to Brave.'
+    'page.scriptlets.title'             = 'Scriptlets (expert)'
+    'page.searchSuggestions.intro'      = 'What the address bar and text boxes send to web services while you type.'
+    'page.searchSuggestions.title'      = 'Search and suggestions'
+    'page.shieldsProtection.intro'      = 'Brave''s built-in tracking protection. Most of it is already on; ticking locks it so nothing can weaken it later.'
+    'page.shieldsProtection.title'      = 'Shields and tracking'
+    'page.signinImport.intro'           = 'Account, sync and first-run import features. Mostly for people who want a strictly local browser.'
+    'page.signinImport.title'           = 'Sign-in, sync and import'
+    'page.uiBloatExtras.intro'          = 'Small interface features you can remove.'
+    'page.uiBloatExtras.title'          = 'Interface clutter'
+    'page.updater.intro'                = 'Advanced. Only for people who update Brave by hand. Presets never change this page.'
+    'page.updater.title'                = 'Updater tasks and services'
+    'page.webServicesBackground.intro'  = 'What Brave does in the background and on the network.'
+    'page.webServicesBackground.title'  = 'Network and background'
 }
 
-# ---- Tabs --------------------------------------------------------------------
+# ---- Lists: columns, risk, status, tooltips -----------------------------------
 Add-Strings @{
-    'tab.hosts'         = 'Hosts Blocklist (DNS-level)'
-    'tab.scriptlets'    = 'Default Scriptlets (Advanced)'
-    'tab.searchStartup' = 'Search & Startup'
-    'tab.system'        = 'System (Tasks / Services)'
+    'grid.col.policy'  = 'Policy'
+    'grid.col.name'   = 'Name'
+    'grid.col.domains' = 'Domains'
+    'grid.col.risk'    = 'Risk'
+    'grid.col.setting' = 'Setting'
+    'grid.col.status'  = 'Status'
+    'grid.col.value'   = 'Value'
+    'grid.col.what'    = 'What changes'
+    'risk.high'        = 'High'
+    'risk.low'         = 'Low'
+    'risk.medium'      = 'Medium'
+    'risk.safe'        = 'Safe'
+    'state.active'     = 'Active'
+    'state.blocked'    = 'Blocked'
+    'state.disabled'   = 'Disabled'
+    'state.enabled'    = 'Enabled'
+    'state.missing'    = 'Not installed'
+    'state.notBlocked' = 'Not blocked'
+    'state.notSet'     = 'Not set'
+    'state.unknown'    = 'Not read yet'
+    'state.willApply'  = 'Will apply'
+    'state.willBlock'  = 'Will block'
+    'state.willChange' = 'Will change'
+    'state.willDisable' = 'Will disable'
+    'state.willEnable' = 'Will enable'
+    'state.willRemove' = 'Will remove'
+    'state.willUnblock' = 'Will unblock'
+    'tip.domains'      = 'Domains: {0}'
+    'tip.hosts'        = 'Ticked groups are added to the Windows hosts file when you press Apply hosts blocks on this page. Unticked groups are removed.'
+    'tip.lock'         = 'Brave already behaves this way by default. Ticking only makes it mandatory, so nothing can change it later.'
+    'tip.pattern'      = 'Task name pattern: {0}'
+    'tip.policy'       = 'Policy: {0} = {1}  ({2})'
+    'tip.risk'         = 'Risk: {0}'
+    'tip.service'      = 'Windows service: {0}'
+    'tip.status'       = 'Active: already applied. Will apply / change / remove: waiting for you to press Apply. Not set: Brave decides.'
+    'tip.ticked.Off'   = 'When ticked: this feature is switched off.'
+    'tip.ticked.On'    = 'When ticked: this protection is kept on and locked.'
+    'tip.ticked.Set'   = 'When ticked: this value is enforced and locked.'
+    'tip.unticked'     = 'When unticked: Brave decides again (this tool removes its policy when you press Apply).'
+    'tip.updater'      = 'Turning this off stops Brave from updating itself. Only do it if you update Brave by hand.'
 }
 
-# ---- Policy categories -------------------------------------------------------
+# ---- Filter --------------------------------------------------------------------
 Add-Strings @{
-    'category.aiGenAi'               = 'AI / GenAI'
-    'category.autofillPasswords'     = 'Autofill / Passwords'
-    'category.braveFeatures'         = 'Brave Features'
-    'category.performanceStartup'    = 'Performance / Startup'
-    'category.privacyTelemetry'      = 'Privacy / Telemetry'
-    'category.safetyUpdates'         = 'Safety / Updates'
-    'category.searchSuggestions'     = 'Search / Suggestions'
-    'category.uiBloatExtras'         = 'UI Bloat / Extras'
-    'category.webServicesBackground' = 'Web Services / Background'
+    'filter.clear'        = 'Clear the search'
+    'filter.matches'      = '{0} of {1} settings shown'
+    'filter.noMatches'    = 'No settings match this search.'
+    'filter.placeholder'  = 'Search settings...'
+    'filter.help'        = 'Search every setting: a name, a word from its description, a policy name...'
+    'filter.selectedOnly' = 'Ticked only'
+    'filter.technical'    = 'Show technical details'
+    'policyTab.selectAll' = 'Tick all'
+    'policyTab.selectNone' = 'Untick all'
 }
 
-# ---- Policy descriptions -----------------------------------------------------
-# Keyed on the registry value name, which is never translated.
+# ---- Action bar, tools, status -----------------------------------------------------
 Add-Strings @{
-    'policy.AccessibilityImageLabelsEnabled.description'              = 'Disable cloud image-description service (sends images to Google).'
-    'policy.AlternateErrorPagesEnabled.description'                   = 'Disable Google-hosted suggestion page on DNS errors.'
-    'policy.AutofillAddressEnabled.description'                       = 'Disable autofill of addresses / contact info.'
-    'policy.AutofillCreditCardEnabled.description'                    = 'Disable autofill of credit cards.'
-    'policy.AutoplayAllowed.description'                              = 'Block autoplaying media site-wide.'
-    'policy.BackgroundModeEnabled.description'                        = 'Stop Brave from running in the background after window close.'
-    'policy.BatterySaverModeAvailability.description'                 = 'Allow Battery Saver on low battery (2). 1=always on unplugged, 0=disabled.'
-    'policy.BookmarkBarEnabled.description'                           = 'Hide bookmark bar globally (small render win). Unticking lets user toggle.'
-    'policy.BraveAIChatEnabled.description'                           = 'Disable Leo AI Chat assistant.'
-    'policy.BraveDeAmpEnabled.description'                            = 'Bypass Google AMP pages to reach publisher directly. (Leave ON for privacy.)'
-    'policy.BraveDebouncingEnabled.description'                       = 'Protect against bounce-tracking redirect chains. (Leave ON for privacy.)'
-    'policy.BraveGlobalPrivacyControlEnabled.description'             = 'Enable Sec-GPC "do not sell/share" signal. (Leave ON for privacy.)'
-    'policy.BraveNewsDisabled.description'                            = 'Disable Brave News feed on the new tab page.'
-    'policy.BraveP3AEnabled.description'                              = 'Disable P3A privacy-preserving product analytics.'
-    'policy.BravePlaylistEnabled.description'                         = 'Disable Playlist feature (save videos/audio).'
-    'policy.BraveReduceLanguageEnabled.description'                   = 'Reduce language-preference fingerprinting. (Leave ON for privacy.)'
-    'policy.BraveRewardsDisabled.description'                         = 'Disable Brave Rewards (BAT ads/tips) and hide all Rewards UI.'
-    'policy.BraveSpeedreaderEnabled.description'                      = 'Disable Speedreader reading-mode feature.'
-    'policy.BraveStatsPingEnabled.description'                        = 'Disable anonymous daily/weekly/monthly usage ping.'
-    'policy.BraveTalkDisabled.description'                            = 'Disable Brave Talk (Jitsi-based video calls).'
-    'policy.BraveTrackingQueryParametersFilteringEnabled.description' = 'Strip tracking params (utm_, fbclid, etc.) from URLs. (Leave ON for privacy.)'
-    'policy.BraveVPNDisabled.description'                             = 'Disable Brave VPN integration and all VPN UI.'
-    'policy.BraveWalletDisabled.description'                          = 'Disable the built-in crypto wallet (ETH/BTC/SOL/FIL/ZEC).'
-    'policy.BraveWaybackMachineEnabled.description'                   = 'Disable the "Check Wayback Machine" prompt on 404 pages.'
-    'policy.BraveWebDiscoveryEnabled.description'                     = 'Disable Web Discovery Project search index contribution.'
-    'policy.BrowserLabsEnabled.description'                           = 'Hide the Labs / experimental features icon in the toolbar.'
-    'policy.BrowserSignin.description'                                = 'Fully disable sign-in UI (0). 1=allow, 2=force.'
-    'policy.BuiltInDnsClientEnabled.description'                      = 'Use OS resolver instead of async DoH client. Only tick if you want OS DNS.'
-    'policy.ChromeCleanupEnabled.description'                         = 'Disable the software-cleanup scanner (harmless on Brave).'
-    'policy.ChromeCleanupReportingEnabled.description'                = 'Disable reporting from the cleanup scanner.'
-    'policy.ChromeVariations.description'                             = 'Opt out of all Chromium field trials/experiments (2). 1=critical only, 0=all.'
-    'policy.CloudPrintSubmitEnabled.description'                      = 'Disable legacy cloud-print submissions.'
-    'policy.CloudReportingEnabled.description'                        = 'Disable enterprise cloud reporting.'
-    'policy.ComponentUpdatesEnabled.description'                      = 'Disable Chromium component updates (e.g. Widevine). Only tick if you know what this breaks.'
-    'policy.CreateThemesSettings.description'                         = 'Disable AI-generated themes.'
-    'policy.DefaultBraveAdblockSetting.description'                   = 'Force default ad-blocking to Block (2). 1=Allow.'
-    'policy.DefaultBraveFingerprintingV2Setting.description'          = 'Set fingerprint protection to Standard (3). 1=Off.'
-    'policy.DefaultBraveHttpsUpgradeSetting.description'              = 'Force HTTPS upgrade to Strict (2). 3=Standard, 1=Disabled.'
-    'policy.DefaultBraveReferrersSetting.description'                 = 'Cap cross-site referrers to strict-origin-when-cross-origin (2).'
-    'policy.DefaultBraveRemember1PStorageSetting.description'         = 'Forget first-party storage on tab close (2). 1=Remember.'
-    'policy.DefaultBrowserSettingEnabled.description'                 = 'Disable the "make default browser" prompt.'
-    'policy.DevToolsGenAiSettings.description'                        = 'Disable GenAI features inside DevTools.'
-    'policy.DiskCacheSize.description'                                = 'Cap disk cache at 250 MB (value in bytes). Prevents unbounded cache growth on SSDs.'
-    'policy.DnsOverHttpsMode.description'                             = 'Allow DoH ("automatic"). Set to "secure" to force, "off" to disable.'
-    'policy.GenAiDefaultSettings.description'                         = 'Disable ALL upstream Chromium GenAI features (2).'
-    'policy.HardwareAccelerationModeEnabled.choice.disable'           = 'Disable (0)'
-    'policy.HardwareAccelerationModeEnabled.choice.enable'            = 'Enable (1)'
-    'policy.HardwareAccelerationModeEnabled.description'              = 'GPU hardware acceleration. Enabled by default in every mode. Pick Disable (0) to fix GPU driver glitches, artifacts or crashes. Untick the box to leave Brave in control.'
-    'policy.HelpMeWriteSettings.description'                          = 'Disable "Help me write" compose features.'
-    'policy.HighEfficiencyModeEnabled.description'                    = 'Memory Saver: sleep inactive tabs to reclaim RAM/CPU.'
-    'policy.HistorySearchSettings.description'                        = 'Disable AI-powered history search.'
-    'policy.HomepageIsNewTabPage.description'                         = 'Decouple home button from the bloated NTP.'
-    'policy.HomepageLocation.description'                             = 'Blank homepage = fastest possible startup.'
-    'policy.IPFSEnabled.description'                                  = 'Disable IPFS protocol support.'
-    'policy.ImportAutofillFormData.description'                       = 'Block autofill import on first run.'
-    'policy.ImportBookmarks.description'                              = 'Block bookmark import prompt on first run.'
-    'policy.ImportHistory.description'                                = 'Block history import on first run.'
-    'policy.ImportSavedPasswords.description'                         = 'Block password import on first run.'
-    'policy.ImportSearchEngine.description'                           = 'Block search-engine import on first run.'
-    'policy.LensDesktopNTPSearchEnabled.description'                  = 'Hide Google Lens search box on new tab page.'
-    'policy.LensOverlaySettings.description'                          = 'Disable the Lens overlay feature (1 = disabled).'
-    'policy.LensRegionSearchEnabled.description'                      = 'Disable right-click Google Lens region search.'
-    'policy.LiveCaptionEnabled.description'                           = 'Disable Live Caption (stops background download of speech-recognition model).'
-    'policy.MediaRouterEnabled.description'                           = 'Disable Google Cast / Media Router. Stops background mDNS discovery and memory overhead.'
-    'policy.MetricsReportingEnabled.description'                      = 'Disable Chromium UMA crash/usage metrics.'
-    'policy.NTPCustomBackgroundEnabled.description'                   = 'Disable the custom new-tab-page background (stops wallpaper download).'
-    'policy.NetworkPredictionOptions.description'                     = 'Never prefetch DNS/TCP/SSL (2). 0/1 = predict.'
-    'policy.NewTabPageLocation.description'                           = 'Force new tab page to about:blank. Kills all NTP bloat.'
-    'policy.PasswordLeakDetectionEnabled.description'                 = 'Disable leaked-credential check (avoids sending hashed pw to Google).'
-    'policy.PasswordManagerEnabled.description'                       = 'Disable built-in password manager (use Bitwarden / Proton Pass instead).'
-    'policy.PaymentMethodQueryEnabled.description'                    = 'Prevent sites from querying for saved payment methods.'
-    'policy.PromotionalTabsEnabled.description'                       = 'Disable the welcome/promo new-tab content.'
-    'policy.PromptForDownloadLocation.description'                    = 'Auto-save to Downloads without prompting. Set 1 if you prefer prompts.'
-    'policy.QuicAllowed.description'                                  = 'Enable QUIC / HTTP/3 protocol. Faster TLS handshake, lower latency.'
-    'policy.ReadingListEnabled.description'                           = 'Remove the Reading List UI.'
-    'policy.RestoreOnStartup.description'                             = 'Open blank new-tab on launch (5). Faster than restoring last session (1).'
-    'policy.SafeBrowsingDeepScanningEnabled.description'              = 'Disable uploading downloads to Google for deep scan.'
-    'policy.SafeBrowsingExtendedReportingEnabled.description'         = 'Disable sending extra info to Google Safe Browsing.'
-    'policy.SafeBrowsingProtectionLevel.description'                  = 'Set Safe Browsing to Standard (1). 0=Off, 2=Enhanced (sends more to Google).'
-    'policy.SafeBrowsingSurveysEnabled.description'                   = 'Disable Safe Browsing user surveys.'
-    'policy.SearchSuggestEnabled.description'                         = 'Disable search-engine autosuggest in the omnibox.'
-    'policy.ShowHomeButton.description'                               = 'Hide the Home button (tiny UI/render win).'
-    'policy.SigninAllowed.description'                                = 'Disable Google/Brave account sign-in.'
-    'policy.SpellCheckServiceEnabled.description'                     = 'Disable the enhanced (cloud) spellcheck service.'
-    'policy.SpellcheckEnabled.description'                            = 'Disable local spellcheck entirely.'
-    'policy.SyncDisabled.description'                                 = 'Disable profile sync entirely.'
-    'policy.TabOrganizerSettings.description'                         = 'Disable AI Tab Organizer.'
-    'policy.TorDisabled.description'                                  = 'Disable "Private Window with Tor". (Brave Tor is not recommended over real Tor Browser.)'
-    'policy.TranslateEnabled.description'                             = 'Disable the "translate this page" Google prompt.'
-    'policy.UrlKeyedAnonymizedDataCollectionEnabled.description'      = 'Disable "Make searches and browsing better" URL reporting.'
-    'policy.UserFeedbackAllowed.description'                          = 'Disable the "Send feedback" UI that uploads diagnostics to Brave/Google.'
-    'policy.WebRtcEventLogCollectionAllowed.description'              = 'Block upload of WebRTC event logs to Google.'
-    'policy.WebTorrentDisabled.description'                           = 'Disable WebTorrent / magnet link integration.'
-    'policy.WelcomePageOnOSUpgradeEnabled.description'                = 'Disable the "welcome back after OS upgrade" tab.'
+    'action.apply'       = 'Apply to Brave'
+    'action.backup'      = 'Back up first'
+    'action.fullRestore' = 'Restore stock...'
+    'action.preview'     = 'Preview changes'
+    'bar.none'           = 'No changes pending'
+    'bar.pending'        = '{0} pending:  {1} to apply,  {2} to change,  {3} to remove'
+    'bar.problem'        = 'Check the Search engine and startup page'
+    'status.hideLog'     = 'Hide log'
+    'status.showLog'     = 'Show log'
+    'tools.backups'      = 'Open backups folder'
+    'tools.button'       = 'Tools  v'
+    'tools.help'         = 'How this works...'
+    'tools.load'         = 'Load current state'
+    'tools.log'          = 'Show or hide the log'
+    'util.close'         = 'Close'
+    'util.export'        = 'Export config...'
+    'util.import'        = 'Import config...'
+    'util.openPolicy'    = 'Open brave://policy'
+    'util.verify'        = 'Verify'
 }
 
-# ---- Tasks and services ------------------------------------------------------
+# ---- Updater page ---------------------------------------------------------------------
 Add-Strings @{
-    'service.BraveElevationService.description'           = 'Brave Elevation Service - helper used by Omaha for per-machine updates.'
-    'service.BraveVPNService.description'                 = 'Brave VPN Service (present only if VPN feature installed).'
-    'service.BraveVpnWireguardService.description'        = 'Brave VPN Wireguard Service (present only if VPN feature installed).'
-    'service.brave.description'                           = 'Brave Update Service - main Omaha update service.'
-    'service.bravem.description'                          = 'Brave Update Service (medium-integrity on-demand helper).'
-    'system.intro'                                        = 'Background updaters matter most for the Privacy + Boost, Max Performance, and Max Privacy modes. Disabling services is the riskiest step because it can block Brave auto-updates.'
-    'system.svcHdr'                                       = 'Windows Services'
-    'system.tasksHdr'                                     = 'Scheduled Tasks'
-    'task.BraveSoftwareUpdateTaskMachineCore.description' = 'Hourly "core" update check launched by Brave Omaha.'
-    'task.BraveSoftwareUpdateTaskMachineUA.description'   = 'The actual version-check/download task.'
+    'log.updater.missing'              = 'That updater item is not installed on this PC, so there is nothing to change.'
+    'log.updater.reading'              = 'Reading updater tasks and services...'
+    'service.brave.description'                 = 'The main background service of Brave''s updater.'
+    'service.brave.title'                       = 'Brave Update Service'
+    'service.bravem.description'                = 'The on-demand helper of Brave''s updater.'
+    'service.bravem.title'                      = 'Brave Update Service (on demand)'
+    'task.core.description'                     = 'Brave''s updater wakes up on a schedule to look for a new version. Turning it off means no automatic updates.'
+    'task.core.title'                           = 'Stop the updater''s scheduled check'
+    'task.ua.description'                       = 'The scheduled task that actually checks for and downloads new Brave versions.'
+    'task.ua.title'                             = 'Stop the updater''s version check'
+    'updater.checkNow'                          = 'Check for updates now'
+    'updater.rescan'                            = 'Re-scan'
+    'updater.warning'                           = 'Turning these off stops Brave from updating itself, so it will no longer get security fixes unless you update it by hand (Brave menu > About Brave). Only do this if you know why. Presets never touch this page.'
 }
 
-# ---- Hosts blocklist ---------------------------------------------------------
+# ---- Hosts blocklist -------------------------------------------------------------------
 Add-Strings @{
-    'hosts.components.description'   = 'WARNING: blocking this stops Widevine/CRX/iOS-style components from updating. Use only if ComponentUpdatesEnabled is also off.'
-    'hosts.components.name'          = 'Component Updates'
-    'hosts.news.description'         = 'News content CDN. Block ONLY if you have disabled News - unblocking is needed if you ever re-enable it.'
-    'hosts.news.name'                = 'Brave News CDN'
-    'hosts.p3a.description'          = 'Privacy-preserving analytics endpoints. Pure telemetry, never user-facing. Safe to block.'
-    'hosts.p3a.name'                 = 'Brave P3A telemetry'
-    'hosts.rewards.description'      = 'Brave Rewards (BAT) servers. Block ONLY if you do not use Rewards. Will break the feature if you turn it on later.'
-    'hosts.rewards.name'             = 'Brave Rewards / BAT'
-    'hosts.stats.description'        = 'Daily/weekly/monthly anonymous usage ping. Safe to block.'
-    'hosts.stats.name'               = 'Brave Stats ping'
-    'hosts.variations.description'   = 'Field-trial / experiment config. Safe to block - matches ChromeVariations=2 policy.'
-    'hosts.variations.name'          = 'Brave Variations'
-    'hosts.webDiscovery.description' = 'Web Discovery Project endpoints. Already covered by BraveWebDiscoveryEnabled policy; only useful if policy is bypassed.'
-    'hosts.webDiscovery.name'        = 'Web Discovery'
+    'hosts.components.description'   = 'The servers Brave''s Shields filter lists, extensions and Tor come from. Blocking them freezes ad blocking, Widevine and extension updates. Experts only - never needed for privacy.'
+    'hosts.components.name'          = 'Component and extension updates'
+    'hosts.news.description'         = 'The servers behind the News feed and its images. Block them only if News is switched off - it stops working if you turn it back on.'
+    'hosts.news.name'                = 'Brave News servers'
+    'hosts.p3a.description'          = 'The servers that receive Brave''s anonymous usage analytics (P3A). Pure telemetry, never needed by a feature.'
+    'hosts.p3a.name'                 = 'Brave usage analytics (P3A)'
+    'hosts.rewards.description'      = 'Servers for Brave Rewards. Block them only if you do not use Rewards - it stops working if you turn it back on.'
+    'hosts.rewards.name'             = 'Brave Rewards servers'
+    'hosts.stats.description'        = 'The server behind Brave''s anonymous daily usage ping. Pure telemetry.'
+    'hosts.stats.name'               = 'Brave usage ping'
+    'hosts.variations.description'   = 'The server that sends Brave remote experiments and kill switches. Matches the Max Privacy setting that turns experiments off.'
+    'hosts.variations.name'          = 'Brave experiments (Variations)'
+    'hosts.webDiscovery.description' = 'Servers for the Web Discovery Project. It is opt-in and off by default; blocking them is a safety net.'
+    'hosts.webDiscovery.name'        = 'Web Discovery Project'
     'hostsTab.apply'                 = 'Apply hosts blocks'
-    'hostsTab.groupLabel'            = '{0}  [{1} domain(s)]'
-    'hostsTab.intro'                 = 'Optional second layer of defense: nullroute Brave telemetry domains in C:\Windows\System32\drivers\etc\hosts. Even if a policy is bypassed by an update, the network call still fails. Sentinel-tagged for clean revert. Backups land in Documents\Brave-Free-Origin-Backups.'
     'hostsTab.load'                  = 'Load current state'
     'hostsTab.open'                  = 'Open hosts file'
     'hostsTab.preview'               = 'Preview hosts'
     'hostsTab.remove'                = 'Remove hosts block'
-    'hostsTab.warn'                  = 'Independent of the "Apply to Brave" button. Use the buttons in this tab to apply or remove the hosts block.'
+    'hostsTab.warn'                  = 'Independent of the Apply to Brave button: use the buttons below to write or remove the hosts block. Only the Brave Free Origin block is edited; a backup is saved first.'
+}
+
+# ---- Search engine, new tab and startup ---------------------------------------------------
+Add-Strings @{
+    'destination.blank'           = 'Blank page (about:blank)'
+    'destination.braveSearchHome' = 'Brave Search homepage'
+    'destination.custom'          = 'Custom URL...'
+    'destination.duckduckgoHome'  = 'DuckDuckGo homepage'
+    'destination.googleHome'      = 'Google homepage'
+    'destination.matchSearch'     = 'Match the search engine I picked above'
+    'destination.ntpDefault'      = 'Default new tab page (do not override)'
+    'engine.bing'                 = 'Bing'
+    'engine.brave'                = 'Brave Search'
+    'engine.custom'               = 'Custom...'
+    'engine.duckduckgo'           = 'DuckDuckGo'
+    'engine.ecosia'               = 'Ecosia'
+    'engine.google'               = 'Google'
+    'engine.kagi'                 = 'Kagi (paid)'
+    'engine.mojeek'               = 'Mojeek'
+    'engine.qwant'                = 'Qwant'
+    'engine.startpage'            = 'Startpage'
+    'engine.yandex'               = 'Yandex'
+    'err.ntp.badUrl'              = 'The New Tab address is not a valid web address. Use a full address such as https://example.com, or about:blank.'
+    'err.ntp.empty'               = 'The New Tab override has no address. Pick a destination or type a custom URL.'
+    'err.search.badUrl'           = 'The custom search address is not a valid web address. It should look like https://example.com/search?q={{searchTerms}}.'
+    'err.search.empty'            = 'The custom search address is empty. Type an address that contains {{searchTerms}}.'
+    'err.search.placeholder'      = 'The custom search address must contain {{searchTerms}} where the query goes.'
+    'err.search.unknown'          = 'Pick a search engine first.'
+    'err.startup.badUrl'          = 'The startup page "{0}" is not a valid web address.'
+    'err.startup.empty'           = 'The startup override needs at least one page address.'
+    'err.startup.unknown'         = 'Pick a startup behavior first.'
+    'ext.bitwarden'               = 'Install Bitwarden (password manager)'
+    'ext.intro'                   = 'Brave Shields is already a native ad and tracker blocker (same filter-list lineage as uBlock Origin, but built in, so slightly faster). Nothing is force-installed - that would show a "Managed by your organization" banner and lock the extension on. These buttons just open the install pages in Brave.'
+    'ext.section'                 = 'Extensions and shortcuts (optional, manual install)'
+    'ext.shields'                 = 'Open Brave Shields settings'
+    'ext.uboLite'                 = 'Install uBlock Origin Lite (MV3)'
+    'ext.warn'                    = 'Caution: uBlock Origin on top of Shields blocks the same things twice, wastes CPU per tab and can break sites Shields handles fine. If you add it, set Shields to Standard rather than Aggressive.'
+    'searchTab.chkNtp'            = 'Override the New Tab page (writes the NewTabPageLocation policy)'
+    'searchTab.chkSearch'         = 'Force this search engine (writes the DefaultSearchProvider* policies)'
+    'searchTab.chkStartup'        = 'Override startup behavior (writes RestoreOnStartup and RestoreOnStartupURLs)'
+    'searchTab.conflictNote'      = 'These choices win over the matching settings on the other pages (New Tab page, Home page and startup). Untick a box and press Apply to remove its override and hand control back to Brave.'
+    'searchTab.customLabel'       = 'Custom URL:'
+    'searchTab.engineLabel'       = 'Engine:'
+    'searchTab.modeLabel'         = 'Mode:'
+    'searchTab.ntpCustomLabel'    = 'Custom URL:'
+    'searchTab.ntpOpenLabel'      = 'Open:'
+    'searchTab.searchHelp'        = 'A custom address must contain {{searchTerms}} where the query goes. Example: https://my-searx/search?q={{searchTerms}}'
+    'searchTab.secNtp'            = 'New Tab page'
+    'searchTab.secSearch'         = 'Default search engine (address bar)'
+    'searchTab.secStartup'        = 'On startup (what opens when you launch Brave)'
+    'searchTab.startupHelp'       = 'For "specific page or set", separate several addresses with a comma. Each opens in its own tab.'
+    'searchTab.urlLabel'          = 'URL(s):'
+    'startupMode.blankPage'       = 'Open a blank page'
+    'startupMode.newTab'          = 'Open the New Tab page'
+    'startupMode.restoreSession'  = 'Restore my last session'
+    'startupMode.specificPages'   = 'Open a specific page or set'
+}
+
+
+# ---- Policy titles and descriptions -----------------------------------------------
+# Keyed on the registry value name, which is never translated. The title states
+# the RESULT of ticking the box; the description says what the feature is and
+# what changes. Rows marked "locks" in the table already match Brave's default:
+# ticking them only makes the behaviour mandatory.
+
+# -- Brave extras
+Add-Strings @{
+    'policy.BraveAIChatEnabled.description'   = 'Removes Leo, Brave''s built-in AI chat, from the sidebar, the address bar and the right-click menu.'
+    'policy.BraveAIChatEnabled.title'         = 'Turn off Leo AI assistant'
+    'policy.BraveNewsDisabled.description'    = 'Removes the news feed from the New Tab page and its related settings.'
+    'policy.BraveNewsDisabled.title'          = 'Turn off Brave News'
+    'policy.BravePlaylistEnabled.description' = 'Removes Playlist, which saves videos and audio from web pages so you can play them later or offline.'
+    'policy.BravePlaylistEnabled.title'       = 'Turn off Playlist'
+    'policy.BraveRewardsDisabled.description' = 'Removes Brave Rewards (BAT tokens for viewing ads), its ads, tips and buttons. It cannot be switched back on in Settings.'
+    'policy.BraveRewardsDisabled.title'       = 'Turn off Brave Rewards'
+    'policy.BraveSpeedreaderEnabled.description' = 'Removes the reading-mode button that turns cluttered articles into a clean view.'
+    'policy.BraveSpeedreaderEnabled.title'    = 'Turn off Speedreader'
+    'policy.BraveTalkDisabled.description'    = 'Removes the Brave Talk video-call button and its promotions from the browser.'
+    'policy.BraveTalkDisabled.title'          = 'Turn off Brave Talk'
+    'policy.BraveVPNDisabled.description'     = 'Removes the paid Brave VPN button, menu entries and upsell. Other VPNs are not affected.'
+    'policy.BraveVPNDisabled.title'           = 'Turn off Brave VPN'
+    'policy.BraveWalletDisabled.description'  = 'Removes the built-in crypto wallet (Ethereum, Solana, Bitcoin and more), its toolbar button and Web3 features such as .eth and .sol addresses.'
+    'policy.BraveWalletDisabled.title'        = 'Turn off Brave Wallet'
+    'policy.BraveWaybackMachineEnabled.description' = 'Stops Brave from offering an archived copy from the Internet Archive when a page is missing, and hides its icon and settings.'
+    'policy.BraveWaybackMachineEnabled.title' = 'Turn off Wayback Machine prompts'
+    'policy.EmailAliasesEnabled.description'  = 'Removes Email Aliases, the feature that creates disposable addresses for sign-ups, together with its buttons.'
+    'policy.EmailAliasesEnabled.title'        = 'Turn off Email Aliases'
+    'policy.PsstEnabled.description'          = 'Stops Brave from suggesting and adjusting site-specific privacy settings on its own.'
+    'policy.PsstEnabled.title'                = 'Turn off Privacy Settings Tuning'
+    'policy.TorDisabled.description'          = 'Removes "New Private Window with Tor". Tor inside Brave is weaker than the official Tor Browser, so you may not miss it.'
+    'policy.TorDisabled.title'                = 'Turn off Tor private windows'
+}
+
+# -- Shields and tracking
+Add-Strings @{
+    'policy.BraveDeAmpEnabled.description'    = 'Opens the publisher''s real page instead of Google''s AMP copy, which limits tracking. Brave does this by default; ticking locks it on.'
+    'policy.BraveDeAmpEnabled.title'          = 'Skip Google AMP pages'
+    'policy.BraveDebouncingEnabled.description' = 'Sends you straight to your destination when a link goes through a known tracking redirect. On by default; ticking locks it on. Rarely, a redirect-based login can behave differently.'
+    'policy.BraveDebouncingEnabled.title'     = 'Skip tracker redirects'
+    'policy.BraveGlobalPrivacyControlEnabled.description' = 'Tells websites you do not want your data sold or shared (Global Privacy Control). On by default; ticking locks it on.'
+    'policy.BraveGlobalPrivacyControlEnabled.title' = 'Always send "Do Not Sell" (GPC)'
+    'policy.BraveReduceLanguageEnabled.description' = 'Limits what sites can learn from your language settings, which makes fingerprinting harder. On by default; ticking locks it on. A few multilingual sites may pick a default language.'
+    'policy.BraveReduceLanguageEnabled.title' = 'Hide language details from sites'
+    'policy.BraveTrackingQueryParametersFilteringEnabled.description' = 'Removes known tracking codes (such as fbclid) from links when Shields is on. On by default; ticking locks it on. Rarely, a link that needs such a code stops working.'
+    'policy.BraveTrackingQueryParametersFilteringEnabled.title' = 'Strip tracking codes from links'
+    'policy.DefaultBraveAdblockSetting.description' = 'Sets Shields'' default to "Block ads and trackers" and stops the global default being changed to "Allow". Brave already blocks by default; ticking locks it.'
+    'policy.DefaultBraveAdblockSetting.title' = 'Keep ad blocking on'
+    'policy.DefaultBraveFingerprintingV2Setting.description' = 'Locks fingerprinting protection to Standard, which makes it harder for sites to recognise your browser by its unique traits. Brave''s default; a few captchas and web apps may misbehave.'
+    'policy.DefaultBraveFingerprintingV2Setting.title' = 'Keep fingerprint protection on'
+    'policy.DefaultBraveHttpsUpgradeSetting.description' = 'Upgrades every link to HTTPS and shows a warning page instead of opening a site that has no HTTPS. Old routers, NAS boxes and local http:// pages need extra clicks or will not open.'
+    'policy.DefaultBraveHttpsUpgradeSetting.title' = 'Require HTTPS (Strict)'
+    'policy.DefaultBraveReferrersSetting.description' = 'Limits the "Referer" header to your site''s origin for cross-site requests, so other sites do not see the full address you came from. Brave does this by default; ticking locks it.'
+    'policy.DefaultBraveReferrersSetting.title' = 'Limit the referrer sent to sites'
+    'policy.DefaultBraveRemember1PStorageSetting.description' = 'Deletes a site''s cookies and storage when you close its tab, so you are signed out of sites all the time and lose saved site settings. Brave normally keeps them.'
+    'policy.DefaultBraveRemember1PStorageSetting.title' = 'Forget site data when a tab closes'
+}
+
+# -- Telemetry and reports
+Add-Strings @{
+    'policy.BraveP3AEnabled.description'      = 'P3A sends anonymous, privacy-preserving answers about how Brave features are used. Ticking turns it off and it cannot be switched back on in Settings.'
+    'policy.BraveP3AEnabled.title'            = 'Turn off usage analytics (P3A)'
+    'policy.BraveStatsPingEnabled.description' = 'Stops the small daily ping that lets Brave count active users.'
+    'policy.BraveStatsPingEnabled.title'      = 'Turn off the usage ping'
+    'policy.BraveWebDiscoveryEnabled.description' = 'The Web Discovery Project anonymously shares data to help build Brave Search. It is opt-in and off by default; ticking makes sure it stays off.'
+    'policy.BraveWebDiscoveryEnabled.title'   = 'Keep Web Discovery off'
+    'policy.ChromeVariations.description'     = 'Variations let Brave switch features on or off remotely (experiments, staged rollouts, kill switches). Ticking blocks all of them, so you only get built-in defaults - which can delay remote fixes.'
+    'policy.ChromeVariations.title'           = 'Turn off remote experiments'
+    'policy.MetricsReportingEnabled.description' = 'Stops Chromium''s usage statistics and crash reports from being sent. Brave then gets no crash data from you, which can slow down bug fixes.'
+    'policy.MetricsReportingEnabled.title'    = 'Turn off crash and usage reports'
+    'policy.UrlKeyedAnonymizedDataCollectionEnabled.description' = 'Prevents the addresses of pages you visit from being sent to Google to "make searches and browsing better". It is opt-in; ticking makes sure it cannot be enabled.'
+    'policy.UrlKeyedAnonymizedDataCollectionEnabled.title' = 'Stop "make searches better" sharing'
+    'policy.UserFeedbackAllowed.description'  = 'Removes the "Send feedback" option that can attach diagnostics to a report.'
+    'policy.UserFeedbackAllowed.title'        = 'Turn off "Send feedback"'
+    'policy.WebRtcEventLogCollectionAllowed.description' = 'Stops services such as Google Meet from collecting WebRTC diagnostic logs from your browser. Brave already blocks this; ticking locks it.'
+    'policy.WebRtcEventLogCollectionAllowed.title' = 'Block WebRTC log uploads'
+}
+
+# -- Passwords and autofill
+Add-Strings @{
+    'policy.AutofillAddressEnabled.description' = 'Brave stops suggesting, saving and filling addresses and contact details. Entries you already saved are kept but no longer offered.'
+    'policy.AutofillAddressEnabled.title'     = 'Turn off address autofill'
+    'policy.AutofillCreditCardEnabled.description' = 'Brave stops suggesting, saving and filling payment cards, so you type card numbers by hand.'
+    'policy.AutofillCreditCardEnabled.title'  = 'Turn off card autofill'
+    'policy.PasswordLeakDetectionEnabled.description' = 'Stops the breach check that sends a hashed copy of credentials to a Google service. Brave already has it off; ticking locks it off.'
+    'policy.PasswordLeakDetectionEnabled.title' = 'Turn off password leak checks'
+    'policy.PasswordManagerEnabled.description' = 'Brave stops asking to save new passwords. Passwords you already saved still fill in. You will need another password manager for new logins.'
+    'policy.PasswordManagerEnabled.title'     = 'Stop offering to save passwords'
+    'policy.PaymentMethodQueryEnabled.description' = 'Stops websites from checking (through the Payment Request API) whether you have a saved payment method. Some checkouts lose their one-click card option.'
+    'policy.PaymentMethodQueryEnabled.title'  = 'Hide saved cards from websites'
+}
+
+# -- Search and suggestions
+Add-Strings @{
+    'policy.AlternateErrorPagesEnabled.description' = 'Stops asking a web service for suggestions when a page cannot be found. Brave already has this off; ticking locks it.'
+    'policy.AlternateErrorPagesEnabled.title' = 'Turn off error-page suggestions'
+    'policy.SearchSuggestEnabled.description' = 'Stops the address bar from sending what you type to your search engine to fetch suggestions. Brave already has this off; ticking locks it. History and bookmark suggestions still work.'
+    'policy.SearchSuggestEnabled.title'       = 'Turn off search suggestions'
+    'policy.SpellCheckServiceEnabled.description' = 'Stops sending the text you type to a Google web service for smarter spell checking. Local spell checking keeps working.'
+    'policy.SpellCheckServiceEnabled.title'   = 'Turn off cloud spellcheck'
+    'policy.SpellcheckEnabled.description'    = 'Disables all spell checking, local and cloud. No red underlines or suggestions anywhere, and it cannot be turned back on in Settings.'
+    'policy.SpellcheckEnabled.title'          = 'Turn off spellcheck completely'
+    'policy.TranslateEnabled.description'     = 'Removes Brave''s built-in "Translate this page" offer. Pages in other languages stay untranslated.'
+    'policy.TranslateEnabled.title'           = 'Turn off page translation'
+}
+
+# -- Safety and prompts
+Add-Strings @{
+    'policy.ComponentUpdatesEnabled.description' = 'Stops Brave from updating its internal components (such as Widevine, and probably ad-block filter lists) between browser releases. Streaming and blocking data can go stale or break. Experts only.'
+    'policy.ComponentUpdatesEnabled.title'    = 'Stop background component updates'
+    'policy.DefaultBrowserSettingEnabled.description' = 'Stops Brave from checking whether it is your default browser and asking you to change it. Set your default in Windows Settings instead.'
+    'policy.DefaultBrowserSettingEnabled.title' = 'Stop "make Brave default" prompts'
+    'policy.PromotionsEnabled.description'    = 'Stops Brave from opening full-tab promotional content and welcome pages.'
+    'policy.PromotionsEnabled.title'          = 'Hide promo and welcome tabs'
+    'policy.SafeBrowsingDeepScanningEnabled.description' = 'Stops suspicious downloads from being uploaded to Google for a malware scan. Brave already has this off; ticking locks it.'
+    'policy.SafeBrowsingDeepScanningEnabled.title' = 'Block download deep-scan uploads'
+    'policy.SafeBrowsingExtendedReportingEnabled.description' = 'Stops sending system information and page content to Google when a threat is detected. Brave already has this off; ticking locks it.'
+    'policy.SafeBrowsingExtendedReportingEnabled.title' = 'Never send extra Safe Browsing reports'
+    'policy.SafeBrowsingProtectionLevel.description' = 'Keeps Safe Browsing (dangerous-site and download warnings) on Standard and blocks "Enhanced" (shares more data with Google) and "Off".'
+    'policy.SafeBrowsingProtectionLevel.title' = 'Keep Safe Browsing on Standard'
+    'policy.SafeBrowsingSurveysEnabled.description' = 'Prevents Safe Browsing satisfaction surveys from appearing.'
+    'policy.SafeBrowsingSurveysEnabled.title' = 'Stop Safe Browsing surveys'
+}
+
+# -- AI features
+Add-Strings @{
+    'policy.AIModeSettings.description'       = 'Blocks Google''s AI Mode shortcuts in the address bar and New Tab search box. Only relevant when Google is your search engine.'
+    'policy.AIModeSettings.title'             = 'Turn off Google AI Mode shortcuts'
+    'policy.AutofillPredictionSettings.description' = 'Stops Chromium from using generative AI to understand forms and fill more fields.'
+    'policy.AutofillPredictionSettings.title' = 'Turn off AI-enhanced autofill'
+    'policy.BraveLocalAIEnabled.description'  = 'Hides Brave''s on-device AI features (such as history embeddings) and stops the AI model component from being installed.'
+    'policy.BraveLocalAIEnabled.title'        = 'Turn off Brave''s on-device AI'
+    'policy.CreateThemesSettings.description' = 'Blocks the feature that generates custom themes and wallpapers with AI.'
+    'policy.CreateThemesSettings.title'       = 'Turn off AI-generated themes'
+    'policy.DevToolsGenAiSettings.description' = 'DevTools'' Console Insights and AI assistance send errors, code and network details to a Google AI model. Ticking turns them off; developers lose the AI hints.'
+    'policy.DevToolsGenAiSettings.title'      = 'Turn off AI helpers in DevTools'
+    'policy.GenAILocalFoundationalModelSettings.description' = 'Stops Chromium''s large on-device AI model from being downloaded, and deletes it if it is already there.'
+    'policy.GenAILocalFoundationalModelSettings.title' = 'Do not download the on-device AI model'
+    'policy.GeminiSettings.description'       = 'Blocks the Gemini app integration in the browser.'
+    'policy.GeminiSettings.title'             = 'Turn off Gemini integration'
+    'policy.HelpMeWriteSettings.description'  = 'Blocks "Help me write", Google''s AI writing helper for text boxes on the web.'
+    'policy.HelpMeWriteSettings.title'        = 'Turn off "Help me write"'
+    'policy.HistorySearchSettings.description' = 'Blocks Google''s AI history search, which answers questions using the content of pages in your history.'
+    'policy.HistorySearchSettings.title'      = 'Turn off AI history search'
+    'policy.SearchContentSharingSettings.description' = 'Stops the browser from sharing page or file content with Google AI Mode and Lens. This one policy replaces the older Lens policies.'
+    'policy.SearchContentSharingSettings.title' = 'Stop sharing page content with Google AI'
+    'policy.TabCompareSettings.description'   = 'Blocks the AI tool that compares information across your open tabs.'
+    'policy.TabCompareSettings.title'         = 'Turn off AI tab comparison'
+    'policy.ThirdPartyAiChatSettings.description' = 'Blocks AI chat shortcuts from third-party search engines in the address bar and New Tab search box.'
+    'policy.ThirdPartyAiChatSettings.title'   = 'Turn off third-party AI chat shortcuts'
+}
+
+# -- Sign-in, sync and import
+Add-Strings @{
+    'policy.BrowserSignin.description'        = 'Prevents signing in to the browser with an account. Brave has no Google-account sign-in, so this is mostly a safety lock.'
+    'policy.BrowserSignin.title'              = 'Block browser sign-in'
+    'policy.ImportAutofillFormData.description' = 'Stops form-autofill data from being imported from your previous browser on first run; the import box starts unticked.'
+    'policy.ImportAutofillFormData.title'     = 'Do not import form data'
+    'policy.ImportBookmarks.description'      = 'Stops bookmarks from being imported from your previous browser on first run; the import box starts unticked.'
+    'policy.ImportBookmarks.title'            = 'Do not import bookmarks'
+    'policy.ImportHistory.description'        = 'Stops browsing history from being imported from your previous browser on first run; the import box starts unticked.'
+    'policy.ImportHistory.title'              = 'Do not import history'
+    'policy.ImportSavedPasswords.description' = 'Blocks importing saved passwords from another browser, on first run and also manually from Settings.'
+    'policy.ImportSavedPasswords.title'       = 'Block importing saved passwords'
+    'policy.ImportSearchEngine.description'   = 'Stops the search engine from being imported from your previous browser on first run; the import box starts unticked.'
+    'policy.ImportSearchEngine.title'         = 'Do not import search engines'
+    'policy.SyncDisabled.description'         = 'Turns off syncing of bookmarks, passwords, history and settings between your devices, and it cannot be turned back on in Settings.'
+    'policy.SyncDisabled.title'               = 'Turn off Brave Sync'
+}
+
+# -- Network and background
+Add-Strings @{
+    'policy.BackgroundModeEnabled.description' = 'Stops Brave from staying alive in the system tray after you close the last window, which would keep extensions and notifications running.'
+    'policy.BackgroundModeEnabled.title'      = 'Do not run Brave in the background'
+    'policy.BuiltInDnsClientEnabled.description' = 'Makes Brave ask Windows for DNS lookups instead of using its own DNS client. The built-in client is still used when secure DNS is on.'
+    'policy.BuiltInDnsClientEnabled.title'    = 'Use Windows for DNS lookups'
+    'policy.DnsOverHttpsMode.description'     = 'Encrypts DNS lookups (DNS-over-HTTPS) when your provider supports it, and falls back to normal DNS if not. You cannot switch it off or pick a custom provider.'
+    'policy.DnsOverHttpsMode.title'           = 'Use secure DNS when available'
+    'policy.EnableMediaRouter.description'    = 'Removes Google Cast (sending tabs to TVs and speakers) and stops Brave scanning your network for Cast devices.'
+    'policy.EnableMediaRouter.title'          = 'Turn off Google Cast'
+    'policy.NetworkPredictionOptions.description' = 'Stops DNS prefetching, pre-connecting and pre-rendering of pages the browser guesses you will open. Brave already has this off; ticking locks it. Some pages may load slightly slower.'
+    'policy.NetworkPredictionOptions.title'   = 'Turn off page preloading'
+    'policy.QuicAllowed.description'          = 'Allows QUIC, the faster HTTP/3 web protocol. It is allowed by default, so ticking only locks it on. A few corporate firewalls block QUIC.'
+    'policy.QuicAllowed.title'                = 'Always allow QUIC (HTTP/3)'
+}
+
+# -- Performance and startup
+Add-Strings @{
+    'policy.BatterySaverModeAvailability.description' = 'Reduces animations and background work when a laptop is unplugged and the battery is low. Users cannot turn Battery Saver off.'
+    'policy.BatterySaverModeAvailability.title' = 'Use Battery Saver on low battery'
+    'policy.BrowserLabsEnabled.description'   = 'Hides the Labs (experiments) button from the toolbar. Brave already does not show it; ticking locks it.'
+    'policy.BrowserLabsEnabled.title'         = 'Hide the Labs button'
+    'policy.DiskCacheSize.description'        = 'Caps how much disk space the page cache may use (250 MB). The limit is a hint, not exact, and heavy browsing re-downloads more files.'
+    'policy.DiskCacheSize.title'              = 'Limit the disk cache to 250 MB'
+    'policy.HardwareAccelerationModeEnabled.choice.disable' = 'Off'
+    'policy.HardwareAccelerationModeEnabled.choice.enable'  = 'On'
+    'policy.HardwareAccelerationModeEnabled.description' = 'Lets Brave use your graphics card to draw pages and decode video. On is Brave''s default. Pick Off only to work around GPU driver glitches, artifacts or crashes - video and scrolling get slower.'
+    'policy.HardwareAccelerationModeEnabled.title' = 'Set GPU hardware acceleration'
+    'policy.HighEfficiencyModeEnabled.description' = 'Puts tabs you have not used for a while to sleep so their memory can be reused. They reload when you return to them.'
+    'policy.HighEfficiencyModeEnabled.title'  = 'Turn on Memory Saver'
+    'policy.HomepageIsNewTabPage.description' = 'Separates the Home page from the New Tab page, so the Home button opens its own address. Only matters when the Home button is shown.'
+    'policy.HomepageIsNewTabPage.title'       = 'Home page is not the New Tab page'
+    'policy.HomepageLocation.description'     = 'Makes the Home button open a blank page and stops it being changed.'
+    'policy.HomepageLocation.title'           = 'Set the Home page to blank'
+    'policy.NTPCustomBackgroundEnabled.description' = 'Users can no longer set their own New Tab background, and a custom background already set is permanently deleted - removing this policy later does not bring it back.'
+    'policy.NTPCustomBackgroundEnabled.title' = 'Block custom New Tab backgrounds'
+    'policy.NewTabPageLocation.description'   = 'Every new tab opens an empty page instead of Brave''s New Tab page (top sites, background, News). No favorites or search box on new tabs.'
+    'policy.NewTabPageLocation.title'         = 'Make new tabs blank'
+    'policy.RestoreOnStartup.description'     = 'Brave normally continues where you left off. Ticking makes it always open the New Tab page instead, and you lose your tabs after a restart or crash.'
+    'policy.RestoreOnStartup.title'           = 'Start on the New Tab page'
+    'policy.ShowHomeButton.description'       = 'Removes the Home button from the toolbar. Brave hides it by default; ticking locks it hidden.'
+    'policy.ShowHomeButton.title'             = 'Hide the Home button'
+}
+
+# -- Interface clutter
+Add-Strings @{
+    'policy.AccessibilityImageLabelsEnabled.description' = 'For screen-reader users: stops unlabeled images from being sent to a Google service to get automatic descriptions. Screen-reader users lose those descriptions.'
+    'policy.AccessibilityImageLabelsEnabled.title' = 'Turn off Google image descriptions'
+    'policy.AutoplayAllowed.description'      = 'Stops videos and audio from starting on their own. Sites need a click to play, so some previews and players wait for you.'
+    'policy.AutoplayAllowed.title'            = 'Block media autoplay'
+    'policy.BookmarkBarEnabled.description'   = 'Hides the bookmarks bar under the address bar, and it cannot be shown again in Settings.'
+    'policy.BookmarkBarEnabled.title'         = 'Hide the bookmarks bar'
+    'policy.LiveCaptionEnabled.description'   = 'Turns off Live Caption, which creates on-device captions for audio and video and needs a speech-model download. Deaf and hard-of-hearing users lose automatic captions.'
+    'policy.LiveCaptionEnabled.title'         = 'Turn off Live Caption'
+    'policy.PromptForDownloadLocation.description' = 'Downloads start at once into your Downloads folder instead of asking where to save each file. Unwanted downloads are less obvious.'
+    'policy.PromptForDownloadLocation.title'  = 'Save downloads without asking'
 }
 
 # ---- Scriptlet manager -------------------------------------------------------
@@ -774,9 +1151,7 @@ Add-Strings @{
     'scriptlet.exportCsv'       = 'Export visible CSV'
     'scriptlet.exportPrefs'     = 'Export disabled prefs'
     'scriptlet.filter'          = 'Filter'
-    'scriptlet.footer'          = 'Tip: if Scan finds nothing, use Browse and select the folder named "User Data" under your Brave profile. This feature edits component filter lists only when Advanced edit mode is ticked.'
     'scriptlet.importPrefs'     = 'Import + reapply prefs'
-    'scriptlet.intro'           = 'Optional advanced tool: view Brave''s built-in adblock scriptlet rules from component filter lists. Editing is manual-only, never part of presets, and never triggered by Apply to Brave.'
     'scriptlet.openFolder'      = 'Open folder'
     'scriptlet.restoreAll'      = 'Restore all backups'
     'scriptlet.restoreSelected' = 'Restore selected file'
@@ -802,76 +1177,45 @@ Add-Strings @{
     'scriptlet.viewSelected'    = 'View selected'
 }
 
-# ---- Search and startup ------------------------------------------------------
-# Search engine brand names are labels only; ProviderName in the data model is what reaches the registry.
+
+# ---- Added in 1.13: site permissions, a few extra policies, corrected hosts groups ----
 Add-Strings @{
-    'destination.blank'           = 'Blank page (about:blank)'
-    'destination.braveSearchHome' = 'Brave Search homepage'
-    'destination.custom'          = 'Custom URL...'
-    'destination.duckduckgoHome'  = 'DuckDuckGo homepage'
-    'destination.googleHome'      = 'Google homepage'
-    'destination.matchSearch'     = 'Match the search engine I picked above'
-    'destination.ntpDefault'      = 'Default new tab page (do not override)'
-    'engine.bing'                 = 'Bing'
-    'engine.brave'                = 'Brave Search'
-    'engine.custom'               = 'Custom...'
-    'engine.duckduckgo'           = 'DuckDuckGo'
-    'engine.ecosia'               = 'Ecosia'
-    'engine.google'               = 'Google'
-    'engine.kagi'                 = 'Kagi (paid)'
-    'engine.mojeek'               = 'Mojeek'
-    'engine.qwant'                = 'Qwant'
-    'engine.startpage'            = 'Startpage'
-    'engine.yandex'               = 'Yandex'
-    'searchTab.chkNtp'            = 'Override new tab page (writes NewTabPageLocation policy)'
-    'searchTab.chkSearch'         = 'Force a default search engine (writes DefaultSearchProvider* policies)'
-    'searchTab.chkStartup'        = 'Override startup behavior (writes RestoreOnStartup + RestoreOnStartupURLs policies)'
-    'searchTab.conflictNote'      = 'Note: this tab is processed AFTER the Performance / Startup tab, so it cleanly overrides any ''NewTabPageLocation'' / ''HomepageLocation'' / ''RestoreOnStartup'' values set there. Untick + Apply removes the override and lets your Performance tab values (or stock Brave) take back over.'
-    'searchTab.customLabel'       = 'Custom search URL:'
-    'searchTab.engineLabel'       = 'Engine:'
-    'searchTab.intro'             = 'Pick the omnibox search engine and what opens when Brave launches / when you open a new tab. Each section is independent and only fires when its checkbox is ticked. Unticking + Apply removes the override.'
-    'searchTab.modeLabel'         = 'Mode:'
-    'searchTab.ntpCustomLabel'    = 'Custom URL:'
-    'searchTab.ntpOpenLabel'      = 'Open:'
-    'searchTab.searchHelp'        = 'Custom must use {{searchTerms}} as the placeholder. Example: https://my-searx/search?q={{searchTerms}}'
-    'searchTab.secNtp'            = 'New Tab Page'
-    'searchTab.secSearch'         = 'Default search engine (omnibox / address bar)'
-    'searchTab.secStartup'        = 'Startup Behavior (what opens when you launch Brave)'
-    'searchTab.startupHelp'       = 'For "specific page or set", separate multiple URLs with a comma. Each opens in its own tab.'
-    'searchTab.urlLabel'          = 'URL(s):'
-    'startupMode.blankPage'       = 'Open a blank page'
-    'startupMode.newTab'          = 'Open the new tab page'
-    'startupMode.restoreSession'  = 'Restore my last session'
-    'startupMode.specificPages'   = 'Open a specific page or set'
+    'page.sitePermissions.intro'   = 'Decide for every site at once instead of being asked. Ticking blocks the permission by default; sites that need it stop working.'
+    'page.sitePermissions.title'   = 'Site permissions'
+    'policy.BlockExternalExtensions.description' = 'Stops other programs on this PC from adding browser extensions to Brave behind your back (through the registry or extension files). Apps that bundle a companion extension can no longer install it on their own - add it from the store instead.'
+    'policy.BlockExternalExtensions.title' = 'Block extensions added by other programs'
+    'policy.DNSInterceptionChecksEnabled.description' = 'Brave normally sends a few test DNS lookups at startup and when your network changes, to spot ISPs that redirect unknown names. Ticking skips them. On such networks, a single word typed in the address bar may act oddly.'
+    'policy.DNSInterceptionChecksEnabled.title' = 'Skip the DNS hijack test at startup'
+    'policy.DefaultIdleDetectionSetting.description' = 'Sites can ask to know when you step away from the computer. Ticking answers "no" for every site without asking. Chat and team apps can no longer show an automatic "away" status.'
+    'policy.DefaultIdleDetectionSetting.title' = 'Block sites from seeing when you are idle'
+    'policy.DefaultLocalFontsSetting.description' = 'Your installed fonts are a fingerprinting signal. Ticking stops sites from asking to see them. Online design tools cannot use your installed fonts.'
+    'policy.DefaultLocalFontsSetting.title' = 'Block sites from listing your fonts'
+    'policy.DefaultSensorsSetting.description' = 'Sites can read device motion, orientation and light sensors, which helps them fingerprint you. Ticking denies that by default. Some maps, 360 viewers and web games that react to tilt stop responding to motion.'
+    'policy.DefaultSensorsSetting.title' = 'Block sites from reading motion sensors'
+    'policy.DefaultSerialGuardSetting.description' = 'Websites can normally ask to open serial (COM) ports, for 3D printers or microcontrollers. Ticking answers "no" without asking. Web serial consoles and hardware flashers stop working.'
+    'policy.DefaultSerialGuardSetting.title' = 'Block sites from using serial ports'
+    'policy.DefaultWebBluetoothGuardSetting.description' = 'Websites can normally ask to connect to nearby Bluetooth gadgets. Ticking answers "no" without asking. Web tools for Bluetooth hardware stop working; regular Windows Bluetooth (headphones, mice) is not affected.'
+    'policy.DefaultWebBluetoothGuardSetting.title' = 'Block sites from using Bluetooth devices'
+    'policy.DefaultWebHidGuardSetting.description' = 'Websites can normally ask to talk to game controllers, keyboards and macro pads directly. Ticking answers "no" without asking. Web configurators for such devices stop working.'
+    'policy.DefaultWebHidGuardSetting.title' = 'Block sites from using HID input devices'
+    'policy.DefaultWebUsbGuardSetting.description' = 'Websites can normally ask to talk to USB gadgets. Ticking answers "no" without asking. Web tools that flash or configure USB hardware stop working.'
+    'policy.DefaultWebUsbGuardSetting.title' = 'Block sites from using USB devices'
+    'policy.DefaultWindowManagementSetting.description' = 'Sites can ask about your screens and place windows across them. Ticking answers "no" without asking. Presentation and multi-monitor web apps lose that ability.'
+    'policy.DefaultWindowManagementSetting.title' = 'Block sites from seeing your monitors'
+    'policy.DesktopSharingHubEnabled.description' = 'Removes the Share menu from the address bar and the page right-click menu.'
+    'policy.DesktopSharingHubEnabled.title'   = 'Remove the Share button'
+    'policy.QRCodeGeneratorEnabled.description' = 'Removes "Create QR code for this page" from the address bar and the right-click menu.'
+    'policy.QRCodeGeneratorEnabled.title'     = 'Remove "Create QR code"'
+    'policy.WebRtcIPHandling.description'     = 'Websites can normally learn your device''s local network address through WebRTC. Ticking limits WebRTC to your public address only, which some video-call and peer-to-peer sites do not like.'
+    'policy.WebRtcIPHandling.title'           = 'Hide your local network address (WebRTC)'
+    'hosts.ads.description'          = 'Servers for Brave Ads. Block them only if Rewards is switched off - Ads stop working if you turn Rewards back on.'
+    'hosts.ads.name'                 = 'Brave Ads servers'
+    'hosts.crash.description'        = 'The server that receives Brave crash reports. Reports are only sent if you agreed to them; blocking it is a safety net.'
+    'hosts.crash.name'               = 'Brave crash reports'
 }
 
-# ---- Extensions --------------------------------------------------------------
-Add-Strings @{
-    'ext.bitwarden' = 'Install Bitwarden (password manager)'
-    'ext.intro'     = 'Brave Shields is already a native ad/tracker blocker (same filter-list lineage as uBlock Origin, runs in-engine so slightly faster). We do NOT force-install anything - that would show a ''Managed by your organization'' banner and lock the extension on. These buttons just open the install pages in Brave so you can decide.'
-    'ext.section'   = 'Extensions (optional, manual install)'
-    'ext.shields'   = 'Open Brave Shields settings'
-    'ext.uboLite'   = 'Install uBlock Origin Lite (MV3)'
-    'ext.warn'      = 'Caution: running uBlock Origin on top of Shields = double-blocking. Wastes CPU per tab and can break sites Shields handles fine. If you install uBO, consider switching Shields to Standard (not Aggressive) to reduce overlap.'
-}
 
-# ---- Utility bar -------------------------------------------------------------
-Add-Strings @{
-    'action.apply'       = 'Apply to Brave'
-    'action.backup'      = 'Backup existing policies before applying'
-    'action.fullRestore' = 'Full restore / stock'
-    'action.preview'     = 'Preview changes'
-    'util.close'         = 'Close'
-    'util.export'        = 'Export config'
-    'util.flow'          = 'Pick mode -> tweak -> Preview -> Apply -> restart Brave -> Verify'
-    'util.import'        = 'Import config'
-    'util.loadState'     = 'Load current state'
-    'util.openPolicy'    = 'Open brave://policy'
-    'util.verify'        = 'Verify'
-}
-
-# ---- Reports -----------------------------------------------------------------
-# Report bodies stay English on purpose - they get pasted into bug reports.
+# ---- Reports (bodies stay English on purpose - they get pasted into bug reports) --
 Add-Strings @{
     'report.close'          = 'Close'
     'report.copy'           = 'Copy'
@@ -894,21 +1238,71 @@ Add-Strings @{
     'dialog.filter.textReport'     = 'Text report'
 }
 
+# ---- Help --------------------------------------------------------------------
+Add-Strings @{
+    'help.compat.body'    = "This list of settings was checked against Brave {0} (Chromium {1}) on {2}. Brave changes its policies over time, so on a newer Brave a few settings may be renamed or gone, and on an older one some may not exist yet. Brave simply ignores policies it does not know, so nothing breaks - open brave://policy to see which ones your version accepts.`r`n`r`nYour Brave: {3}. Everything this app does is reversible."
+    'help.compat.title'   = 'Brave versions'
+    'help.footer'         = 'Brave Free Origin v{0}  -  {1}  -  log file: {2}'
+    'help.managed.body'   = "Brave shows this whenever any machine policy is active. It is a Chromium transparency feature and cannot be hidden safely. It disappears when you remove the policies (Stock / None, then Apply, or Restore stock)."
+    'help.managed.title'  = 'The "Managed by your organization" note'
+    'help.openLog'        = 'Open the log file'
+    'help.reportIssue'    = 'Report a problem'
+    'help.status.body'    = "Active: already applied.`r`nWill apply, Will change, Will remove: waiting for you to press Apply.`r`nNot set: Brave decides.`r`n`r`nRisk says what you could lose. Safe and Low are fine for everyone; Medium and High change how Brave behaves, so read the description first. Rows marked as locks only make Brave's own default mandatory."
+    'help.status.title'   = 'What the Status and Risk columns mean'
+    'help.tick.body'      = "Tick a setting to make this app enforce it. Untick it to hand control back to Brave: the policy is removed when you press Apply. Nothing is written until you press Apply, and Preview changes shows exactly what would happen first."
+    'help.tick.title'     = 'Ticking a setting'
+    'help.title'          = 'How Brave Free Origin works'
+    'help.undo.body'      = "Pick Stock / None and press Apply, or use Restore stock. A backup of your policies is saved to:`r`n{0}`r`nbefore every Apply. Restore stock also removes the hosts block and turns the updater tasks and services back on if they were disabled."
+    'help.undo.title'     = 'Undoing everything'
+    'help.what.body'      = "Brave Free Origin switches off Brave features you do not want. It uses Brave's official group policies - the same mechanism companies use to manage browsers - written to the Windows registry. It never modifies Brave's program files (only the optional expert Scriptlets page edits filter-list files, and only when you ask, with a backup), and it works for every Brave channel installed on this PC."
+    'help.what.title'     = 'What this app does'
+    'header.alsoInstalled' = 'Also installed: {0}'
+    'header.policiesShared' = 'Policies apply to every Brave channel on this PC (Stable, Beta, Nightly and Dev share one policy location).'
+}
+
+# ---- Result and follow-up dialogs ---------------------------------------------
+Add-Strings @{
+    'result.backup'    = 'Backup saved: {0}'
+    'result.counts'    = 'Added {0}, changed {1}, removed {2}, already correct {3}.'
+    'result.done'      = 'Changes applied'
+    'result.failures'  = '{0} change(s) could not be made:'
+    'result.partial'   = 'Applied with problems'
+    'result.restart'   = 'Fully close and reopen Brave for the changes to take effect. Then open brave://policy or press Verify to check.'
+    'result.system'    = '{0} updater change(s) made.'
+    'result.verify'    = 'Verify'
+}
+
 # ---- Dialogs -----------------------------------------------------------------
 Add-Strings @{
-    'msg.apply.done'                  = "Mode: {0}`r`nApplied {1} policies, cleared {2}.`r`n`r`nRestart Brave to see changes.`r`nVerify at: brave://policy"
-    'msg.braveMissing'                = 'Brave not found on this machine.'
-    'msg.config.badJson'              = 'Bad JSON: {0}'
-    'msg.config.imported'             = "Config loaded into checkboxes.`r`nClick 'Apply to Brave' (and the Hosts tab if needed) to commit."
+    'msg.apply.nothing'               = 'There is nothing to change. Tick or untick settings first, or pick a preset.'
+    'msg.backup.failed'               = "The policy backup could not be saved:`r`n{0}`r`n`r`nApply anyway?"
+    'msg.braveMissing'                = 'Brave was not found on this PC.'
+    'msg.config.badJson'              = 'That file is not a valid config: {0}'
+    'msg.config.imported'             = "Config loaded into the pages.`r`nPress 'Apply to Brave' (and Apply hosts blocks on the Hosts page if needed) to commit."
+    'msg.error.body'                  = "{0} did not work.`r`n`r`n{1}`r`n`r`nDetails were saved to:`r`n{2}"
     'msg.failed'                      = 'Failed: {0}'
     'msg.hosts.applied'               = "Hosts file updated. {0} domain(s) blocked.`r`nDNS cache flushed."
     'msg.hosts.confirmApply'          = "About to add {0} entries to:`r`n{1}`r`n`r`nA timestamped backup will be saved first. Continue?"
-    'msg.hosts.confirmRemove'         = "Remove the Brave-Free-Origin sentinel block from hosts?`r`n(Your other hosts entries are not touched.)"
-    'msg.hosts.noGroups'              = 'No groups ticked. This will remove the existing hosts block (if any). Continue?'
-    'msg.hosts.removed'               = 'Sentinel block removed.'
+    'msg.hosts.confirmRemove'         = "Remove the Brave-Free-Origin block from the hosts file?`r`n(Your other hosts entries are not touched.)"
+    'msg.hosts.noGroups'              = 'No groups are ticked. This will remove the existing hosts block (if any). Continue?'
+    'msg.hosts.removed'               = 'Hosts block removed.'
     'msg.language.switched'           = 'Language switched to {0}.'
-    'msg.restore.confirm'             = "This will restore stock behavior for: {0}`r`n`r`nIt removes Brave policy keys, clears the Brave-Free-Origin hosts block, re-enables known Brave update tasks, and resets known disabled Brave services to Manual.`r`n`r`nContinue?"
-    'msg.restore.done'                = 'Full restore completed. Restart Brave to see stock behavior.'
+    'msg.openBrave.copied'            = "Brave could not be started from here.`r`n`r`nThe address was copied to the clipboard:`r`n{0}`r`n`r`nPaste it into Brave's address bar."
+    'msg.restore.confirm'             = "This restores stock Brave.`r`n`r`nIt removes the policies this tool set, clears the Brave-Free-Origin hosts block and turns Brave's updater tasks and services back on if they are disabled.`r`n`r`nContinue?"
+    'msg.restore.confirmForeign'      = "This restores stock Brave.`r`n`r`nBrave's policy key also holds {0} other value(s) this tool did not create, for example: {1}.`r`n`r`nYes: remove only this tool's settings (recommended)`r`nNo: remove everything, including those {0}`r`nCancel: do nothing"
+    'msg.restore.done'                = 'Stock Brave restored. Restart Brave to see stock behavior.'
+    'msg.restore.partial'             = '{0} step(s) could not be completed:'
+    'msg.title.app'                   = 'Brave Free Origin'
+    'msg.title.done'                  = 'Done'
+    'msg.title.error'                 = 'Something went wrong'
+    'msg.title.fullRestore'           = 'Restore stock Brave'
+    'msg.title.hosts'                 = 'Hosts blocklist'
+    'msg.title.importError'           = 'Import error'
+    'msg.title.imported'              = 'Imported'
+    'msg.title.info'                  = 'Info'
+    'msg.title.scriptlet'             = 'Scriptlet manager'
+    'msg.title.updater'               = 'Turn off Brave updates?'
+    'msg.updater.confirm'             = "You are about to turn off part of Brave's updater.`r`n`r`nBrave will stop installing security fixes by itself, and you will have to update it by hand (Brave menu > About Brave) to stay safe.`r`n`r`nContinue?"
     'msg.scriptlet.backupDone'        = 'Backups checked/created for {0} list file(s).'
     'msg.scriptlet.backupFailed'      = "Backup failed:`r`n{0}"
     'msg.scriptlet.braveRunning'      = "Brave is currently running ({0} process(es)).`r`n`r`nClose Brave first if you want the safest patch. Continue anyway?"
@@ -920,7 +1314,7 @@ Add-Strings @{
     'msg.scriptlet.enableFailed'      = "Enable failed:`r`n{0}"
     'msg.scriptlet.exportFailed'      = "Export failed:`r`n{0}"
     'msg.scriptlet.folderMissing'     = 'Folder not found. Use Browse to choose the correct Brave User Data folder.'
-    'msg.scriptlet.locked'            = "Editing Brave's internal filter-list files is disabled.`r`n`r`nTick 'Advanced edit mode' in the Scriptlets tab first."
+    'msg.scriptlet.locked'            = "Editing Brave's internal filter-list files is disabled.`r`n`r`nTick 'Advanced edit mode' on the Scriptlets page first."
     'msg.scriptlet.noFiles'           = "No Brave filter-list files were found in:`r`n{0}`r`n`r`nUse Browse if your Brave User Data folder lives somewhere else."
     'msg.scriptlet.noRules'           = "No Brave scriptlet rules were found in:`r`n{0}`r`n`r`nUse Browse if your Brave User Data folder lives somewhere else."
     'msg.scriptlet.noRulesLoaded'     = 'Scan first; there are no scriptlet rules loaded.'
@@ -933,281 +1327,1482 @@ Add-Strings @{
     'msg.scriptlet.scanFirst'         = 'Scan first; no scriptlet list files are loaded.'
     'msg.scriptlet.selectFirst'       = 'Check or select one or more scriptlet rules first.'
     'msg.scriptlet.selectOne'         = 'Select a scriptlet rule first.'
-    'msg.title.app'                   = 'Brave Free Origin'
-    'msg.title.done'                  = 'Done'
-    'msg.title.error'                 = 'Error'
-    'msg.title.fullRestore'           = 'Full restore / stock'
-    'msg.title.hosts'                 = 'Hosts blocklist'
-    'msg.title.importError'           = 'Import error'
-    'msg.title.imported'              = 'Imported'
-    'msg.title.info'                  = 'Info'
-    'msg.title.scriptlet'             = 'Scriptlet manager'
 }
 
 #endregion
 
-#region Configuration filter --------------------------------------------------
-# One index over every configurable row in the app (policies, scheduled tasks,
-# Windows services, hosts groups). The Scriptlets tab keeps its own dedicated
-# scanner/filter - it deals with thousands of records and is already tuned.
-#
-# Rows are absolutely positioned, so filtering also re-flows each tab: hidden
-# rows collapse instead of leaving holes.
-$script:ConfigFilterItems = New-Object System.Collections.ArrayList
-$script:TabFlows          = @{}
-$script:RowDescLabels     = New-Object System.Collections.ArrayList
-$script:FilterDebounce    = $null
-$script:FilterReady       = $false
 
-# One flow record per tab, created by whichever call reaches the tab first.
-# That is deliberately not always Register-FlowEntry: a tab sets its title key
-# while it is being built, before it has any rows.
-function Get-TabFlow {
-    param($TabPage, [int]$BaseTop = 0)
-    $key = $TabPage.Name
-    if (-not $script:TabFlows.ContainsKey($key)) {
-        $script:TabFlows[$key] = [pscustomobject]@{
-            TabPage  = $TabPage
-            Top      = $BaseTop
-            TitleKey = $null
-            Entries  = (New-Object System.Collections.ArrayList)
-        }
-    }
-    return $script:TabFlows[$key]
+#region Catalog data ----------------------------------------------------------
+# Verified against Brave 154.1.96.59 (Chromium 154.0.8037.58, brave-core 1.96.x):
+# every policy below is compiled into that build's policy table. Human-readable
+# text lives in the string catalog under 'policy.<Name>.title' / '.description',
+# keyed on the registry value name, which is never translated.
+#
+# One line per policy:  Page | Name | Type | Value | Kind | Risk | Lock | Presets
+#   Kind   Off = turns a feature off, On = keeps a protection on, Set = sets a value
+#   Risk   safe | low | medium | high  (what an everyday user could lose)
+#   Lock   1 = Brave already behaves this way; ticking only makes it mandatory
+#   Presets  Q Quick Debloat, O Origin Mode, R Recommended, B Privacy + Boost,
+#            X Max Performance, P Max Privacy
+$script:PolicyPageOrder = @(
+    'braveFeatures', 'shieldsProtection', 'privacyTelemetry', 'sitePermissions', 'autofillPasswords', 'searchSuggestions',
+    'safetyUpdates', 'aiGenAi', 'signinImport', 'webServicesBackground', 'performanceStartup', 'uiBloatExtras'
+)
+
+$script:PolicyTable = @(
+    # -- Brave extras ---------------------------------------------------------
+    'braveFeatures|BraveRewardsDisabled|DWORD|1|Off|low|0|QORBXP'
+    'braveFeatures|BraveWalletDisabled|DWORD|1|Off|low|0|QORBXP'
+    'braveFeatures|BraveVPNDisabled|DWORD|1|Off|low|0|QORBXP'
+    'braveFeatures|BraveAIChatEnabled|DWORD|0|Off|low|0|QORBXP'
+    'braveFeatures|BraveNewsDisabled|DWORD|1|Off|low|0|QORBXP'
+    'braveFeatures|BraveTalkDisabled|DWORD|1|Off|low|0|QORBXP'
+    'braveFeatures|TorDisabled|DWORD|1|Off|low|0|OBX'
+    'braveFeatures|BraveWaybackMachineEnabled|DWORD|0|Off|safe|0|OBX'
+    'braveFeatures|BravePlaylistEnabled|DWORD|0|Off|low|0|OBX'
+    'braveFeatures|BraveSpeedreaderEnabled|DWORD|0|Off|low|0|OBX'
+    'braveFeatures|EmailAliasesEnabled|DWORD|0|Off|low|0|OBX'
+    'braveFeatures|PsstEnabled|DWORD|0|Off|low|0|OBX'
+    # -- Shields and tracking protection ----------------------------------------
+    'shieldsProtection|DefaultBraveAdblockSetting|DWORD|2|On|low|1|RBXP'
+    'shieldsProtection|DefaultBraveFingerprintingV2Setting|DWORD|3|On|low|1|RBXP'
+    'shieldsProtection|DefaultBraveReferrersSetting|DWORD|2|On|low|1|RBXP'
+    'shieldsProtection|BraveTrackingQueryParametersFilteringEnabled|DWORD|1|On|low|1|RBXP'
+    'shieldsProtection|BraveDeAmpEnabled|DWORD|1|On|low|1|RBXP'
+    'shieldsProtection|BraveDebouncingEnabled|DWORD|1|On|low|1|RBXP'
+    'shieldsProtection|BraveGlobalPrivacyControlEnabled|DWORD|1|On|safe|1|RBXP'
+    'shieldsProtection|BraveReduceLanguageEnabled|DWORD|1|On|low|1|RBXP'
+    'shieldsProtection|DefaultBraveHttpsUpgradeSetting|DWORD|2|Set|medium|0|P'
+    'shieldsProtection|DefaultBraveRemember1PStorageSetting|DWORD|2|Set|high|0|P'
+    # -- Telemetry and reports -----------------------------------------------------
+    'privacyTelemetry|BraveP3AEnabled|DWORD|0|Off|safe|0|ORBXP'
+    'privacyTelemetry|BraveStatsPingEnabled|DWORD|0|Off|safe|0|ORBXP'
+    'privacyTelemetry|BraveWebDiscoveryEnabled|DWORD|0|Off|safe|1|ORBXP'
+    'privacyTelemetry|MetricsReportingEnabled|DWORD|0|Off|low|0|RBXP'
+    'privacyTelemetry|UserFeedbackAllowed|DWORD|0|Off|safe|0|RBXP'
+    'privacyTelemetry|UrlKeyedAnonymizedDataCollectionEnabled|DWORD|0|Off|safe|1|RBXP'
+    'privacyTelemetry|WebRtcEventLogCollectionAllowed|DWORD|0|Off|safe|1|RBXP'
+    'privacyTelemetry|ChromeVariations|DWORD|2|Set|medium|0|P'
+    'privacyTelemetry|WebRtcIPHandling|STRING|default_public_interface_only|Set|medium|0|P'
+    # -- Site permissions (all blocked by default, for every site) ---------------------
+    'sitePermissions|DefaultWebUsbGuardSetting|DWORD|2|Off|low|0|P'
+    'sitePermissions|DefaultWebBluetoothGuardSetting|DWORD|2|Off|low|0|P'
+    'sitePermissions|DefaultSerialGuardSetting|DWORD|2|Off|low|0|P'
+    'sitePermissions|DefaultWebHidGuardSetting|DWORD|2|Off|low|0|P'
+    'sitePermissions|DefaultSensorsSetting|DWORD|2|Off|low|0|P'
+    'sitePermissions|DefaultIdleDetectionSetting|DWORD|2|Off|safe|0|P'
+    'sitePermissions|DefaultLocalFontsSetting|DWORD|2|Off|low|0|P'
+    'sitePermissions|DefaultWindowManagementSetting|DWORD|2|Off|low|0|P'
+    # -- Passwords and autofill --------------------------------------------------------
+    'autofillPasswords|PasswordManagerEnabled|DWORD|0|Off|medium|0|P'
+    'autofillPasswords|PasswordLeakDetectionEnabled|DWORD|0|Off|safe|1|RBXP'
+    'autofillPasswords|AutofillAddressEnabled|DWORD|0|Off|low|0|P'
+    'autofillPasswords|AutofillCreditCardEnabled|DWORD|0|Off|low|0|P'
+    'autofillPasswords|PaymentMethodQueryEnabled|DWORD|0|Off|low|0|P'
+    # -- Search and suggestions -------------------------------------------------------
+    'searchSuggestions|SearchSuggestEnabled|DWORD|0|Off|low|1|P'
+    'searchSuggestions|SpellCheckServiceEnabled|DWORD|0|Off|low|1|RBXP'
+    'searchSuggestions|SpellcheckEnabled|DWORD|0|Off|medium|0|-'
+    'searchSuggestions|TranslateEnabled|DWORD|0|Off|low|0|P'
+    'searchSuggestions|AlternateErrorPagesEnabled|DWORD|0|Off|safe|1|RBXP'
+    # -- Safety and prompts ---------------------------------------------------------------
+    'safetyUpdates|SafeBrowsingProtectionLevel|DWORD|1|Set|low|1|P'
+    'safetyUpdates|SafeBrowsingExtendedReportingEnabled|DWORD|0|Off|safe|1|RBXP'
+    'safetyUpdates|SafeBrowsingDeepScanningEnabled|DWORD|0|Off|safe|1|RBXP'
+    'safetyUpdates|SafeBrowsingSurveysEnabled|DWORD|0|Off|safe|1|RBXP'
+    'safetyUpdates|DefaultBrowserSettingEnabled|DWORD|0|Off|safe|0|RBXP'
+    'safetyUpdates|BlockExternalExtensions|DWORD|1|On|low|0|RBXP'
+    'safetyUpdates|PromotionsEnabled|DWORD|0|Off|safe|0|RBXP'
+    'safetyUpdates|ComponentUpdatesEnabled|DWORD|0|Off|high|0|-'
+    # -- AI features -------------------------------------------------------------------------
+    'aiGenAi|BraveLocalAIEnabled|DWORD|0|Off|low|0|ORBXP'
+    'aiGenAi|HelpMeWriteSettings|DWORD|2|Off|safe|1|RBXP'
+    'aiGenAi|CreateThemesSettings|DWORD|2|Off|safe|1|RBXP'
+    'aiGenAi|HistorySearchSettings|DWORD|2|Off|safe|1|RBXP'
+    'aiGenAi|DevToolsGenAiSettings|DWORD|2|Off|low|1|RBXP'
+    'aiGenAi|GeminiSettings|DWORD|1|Off|safe|1|RBXP'
+    'aiGenAi|AIModeSettings|DWORD|1|Off|safe|1|RBXP'
+    'aiGenAi|ThirdPartyAiChatSettings|DWORD|1|Off|safe|1|RBXP'
+    'aiGenAi|SearchContentSharingSettings|DWORD|1|Off|safe|1|RBXP'
+    'aiGenAi|GenAILocalFoundationalModelSettings|DWORD|1|Off|safe|1|RBXP'
+    'aiGenAi|TabCompareSettings|DWORD|2|Off|safe|1|RBXP'
+    'aiGenAi|AutofillPredictionSettings|DWORD|2|Off|safe|1|RBXP'
+    # -- Sign-in, sync and import ---------------------------------------------------------
+    'signinImport|BrowserSignin|DWORD|0|Off|safe|1|P'
+    'signinImport|SyncDisabled|DWORD|1|Off|medium|0|P'
+    'signinImport|ImportAutofillFormData|DWORD|0|Off|low|0|P'
+    'signinImport|ImportBookmarks|DWORD|0|Off|low|0|P'
+    'signinImport|ImportHistory|DWORD|0|Off|low|0|P'
+    'signinImport|ImportSavedPasswords|DWORD|0|Off|medium|0|P'
+    'signinImport|ImportSearchEngine|DWORD|0|Off|low|0|P'
+    # -- Network and background -----------------------------------------------------------
+    'webServicesBackground|BackgroundModeEnabled|DWORD|0|Off|low|0|BX'
+    'webServicesBackground|EnableMediaRouter|DWORD|0|Off|low|0|BX'
+    'webServicesBackground|DNSInterceptionChecksEnabled|DWORD|0|Off|low|0|BXP'
+    'webServicesBackground|NetworkPredictionOptions|DWORD|2|Off|low|1|P'
+    'webServicesBackground|DnsOverHttpsMode|STRING|automatic|Set|low|0|P'
+    'webServicesBackground|BuiltInDnsClientEnabled|DWORD|0|Set|low|0|-'
+    'webServicesBackground|QuicAllowed|DWORD|1|On|safe|1|-'
+    # -- Performance and startup -----------------------------------------------------------
+    'performanceStartup|HighEfficiencyModeEnabled|DWORD|1|On|low|0|BX'
+    'performanceStartup|BatterySaverModeAvailability|DWORD|1|On|low|0|BX'
+    'performanceStartup|HardwareAccelerationModeEnabled|DWORD|1|Set|low|1|-'
+    'performanceStartup|DiskCacheSize|DWORD|262144000|Set|low|0|X'
+    'performanceStartup|RestoreOnStartup|DWORD|5|Set|medium|0|X'
+    'performanceStartup|NewTabPageLocation|STRING|about:blank|Set|medium|0|X'
+    'performanceStartup|HomepageIsNewTabPage|DWORD|0|Set|safe|0|X'
+    'performanceStartup|HomepageLocation|STRING|about:blank|Set|safe|0|X'
+    'performanceStartup|ShowHomeButton|DWORD|0|Off|safe|1|-'
+    'performanceStartup|BrowserLabsEnabled|DWORD|0|Off|safe|1|-'
+    'performanceStartup|NTPCustomBackgroundEnabled|DWORD|0|Off|medium|0|-'
+    # -- Interface clutter ------------------------------------------------------------------
+    'uiBloatExtras|LiveCaptionEnabled|DWORD|0|Off|low|0|BX'
+    'uiBloatExtras|AccessibilityImageLabelsEnabled|DWORD|0|Off|low|1|P'
+    'uiBloatExtras|AutoplayAllowed|DWORD|0|Off|low|0|P'
+    'uiBloatExtras|DesktopSharingHubEnabled|DWORD|0|Off|safe|0|X'
+    'uiBloatExtras|QRCodeGeneratorEnabled|DWORD|0|Off|safe|0|X'
+    'uiBloatExtras|PromptForDownloadLocation|DWORD|0|Off|low|0|-'
+    'uiBloatExtras|BookmarkBarEnabled|DWORD|0|Off|low|0|-'
+)
+
+# Policies that offer a choice instead of a fixed value. The first entry is the
+# default the table row starts with; ids are stable, labels are translated.
+$script:PolicyChoices = @{
+    'HardwareAccelerationModeEnabled' = ([ordered]@{ 'enable' = 1; 'disable' = 0 })
 }
 
-function Register-FlowEntry {
-    param(
-        $TabPage,
-        [ValidateSet('Row', 'Header', 'Trailer')][string]$Kind,
-        $Controls,
-        [int]$BaseTop,
-        [int]$Height,
-        [int]$CjkExtra = 0,
-        [string]$Group = 'default',
-        [string]$Id,
-        [string]$Type,
-        [string]$CategoryId,
-        [scriptblock]$SearchText,
-        [scriptblock]$IsSelected
+# ---- Updater scheduled tasks and Windows services (manual page, never in presets) ----
+# Pattern and name lists live in the Core region; the strings are
+# task.<id>.title / service.<id>.title and their .description.
+
+# ---- Hosts blocklist groups (DNS-level, separate Apply on its own page) --------------
+# Verified against brave-core v1.96.59 and the shipped chrome.dll. A hosts entry
+# matches one exact name (no wildcards), so it is only a second line of defence
+# behind the policies above. Presets only pre-tick a group when the feature it
+# belongs to is also switched off by that preset. 'components' carries the
+# servers Brave's Shields filter lists, extensions and Tor come from: blocking
+# them silently freezes ad blocking, so no preset ever pre-ticks it.
+$script:HostsBlocks = @(
+    @{ Id = 'p3a';          Risk = 'safe';   Domains = @('collector.bsg.brave.com', 'star-randsrv.bsg.brave.com') }
+    @{ Id = 'stats';        Risk = 'safe';   Domains = @('usage-ping.brave.com') }
+    @{ Id = 'crash';        Risk = 'safe';   Domains = @('cr.brave.com') }
+    @{ Id = 'webDiscovery'; Risk = 'safe';   Domains = @('collector.wdp.brave.com', 'quorum.wdp.brave.com', 'patterns.wdp.brave.com', 'star.wdp.brave.com') }
+    @{ Id = 'rewards';      Risk = 'low';    Domains = @('api.rewards.brave.com', 'rewards.brave.com', 'grant.rewards.brave.com') }
+    @{ Id = 'ads';          Risk = 'low';    Domains = @('anonymous.ads.brave.com', 'mywallet.ads.brave.com', 'geo.ads.brave.com', 'static.ads.brave.com', 'ohttp.ads.brave.com', 'search.anonymous.ads.brave.com') }
+    @{ Id = 'news';         Risk = 'low';    Domains = @('brave-today-cdn.brave.com', 'pcdn.brave.com') }
+    @{ Id = 'variations';   Risk = 'medium'; Domains = @('variations.brave.com') }
+    @{ Id = 'components';   Risk = 'high';   Domains = @('go-updater.brave.com', 'componentupdater.brave.com', 'extensionupdater.brave.com', 'crxdownload.brave.com', 'brave-core-ext.s3.brave.com', 'redirector.brave.com', 'tor.bravesoftware.com') }
+)
+$script:PresetHosts = @{
+    Minimal        = @('rewards', 'ads', 'news')
+    Origin         = @('p3a', 'stats', 'webDiscovery', 'rewards', 'ads', 'news')
+    Recommended    = @('p3a', 'stats', 'crash', 'webDiscovery', 'rewards', 'ads', 'news')
+    Performance    = @('p3a', 'stats', 'crash', 'webDiscovery', 'rewards', 'ads', 'news')
+    MaxPerformance = @('p3a', 'stats', 'crash', 'webDiscovery', 'rewards', 'ads', 'news')
+    MaxPrivacy     = @('p3a', 'stats', 'crash', 'webDiscovery', 'rewards', 'ads', 'news', 'variations')
+}
+
+# ---- Search engines (opt-in override on the Search & startup page) -----------------------
+# {searchTerms} is the standard Chromium placeholder Brave fills in. Brand names
+# are not translated; only the "Custom..." entry has a real label.
+$script:SearchEngines = [ordered]@{
+    'brave'       = @{ LabelKey = 'engine.brave';      ProviderName = 'Brave Search'; URL = 'https://search.brave.com/search?q={searchTerms}';       Suggest = 'https://search.brave.com/api/suggest?q={searchTerms}';                    Keyword = 'brave';     Home = 'https://search.brave.com' }
+    'duckduckgo'  = @{ LabelKey = 'engine.duckduckgo'; ProviderName = 'DuckDuckGo';   URL = 'https://duckduckgo.com/?q={searchTerms}';               Suggest = 'https://duckduckgo.com/ac/?q={searchTerms}&type=list';                    Keyword = 'ddg';       Home = 'https://duckduckgo.com' }
+    'startpage'   = @{ LabelKey = 'engine.startpage';  ProviderName = 'Startpage';    URL = 'https://www.startpage.com/sp/search?query={searchTerms}'; Suggest = '';                                                                       Keyword = 'startpage'; Home = 'https://www.startpage.com' }
+    'qwant'       = @{ LabelKey = 'engine.qwant';      ProviderName = 'Qwant';        URL = 'https://www.qwant.com/?q={searchTerms}';                 Suggest = 'https://api.qwant.com/v3/suggest/?q={searchTerms}&client=opensearch';     Keyword = 'qwant';     Home = 'https://www.qwant.com' }
+    'ecosia'      = @{ LabelKey = 'engine.ecosia';     ProviderName = 'Ecosia';       URL = 'https://www.ecosia.org/search?q={searchTerms}';          Suggest = 'https://ac.ecosia.org/autocomplete?q={searchTerms}&type=list';            Keyword = 'ecosia';    Home = 'https://www.ecosia.org' }
+    'mojeek'      = @{ LabelKey = 'engine.mojeek';     ProviderName = 'Mojeek';       URL = 'https://www.mojeek.com/search?q={searchTerms}';          Suggest = '';                                                                       Keyword = 'mojeek';    Home = 'https://www.mojeek.com' }
+    'kagi'        = @{ LabelKey = 'engine.kagi';       ProviderName = 'Kagi (paid)';  URL = 'https://kagi.com/search?q={searchTerms}';                Suggest = 'https://kagisuggest.com/api/autosuggest?q={searchTerms}';                 Keyword = 'kagi';      Home = 'https://kagi.com' }
+    'google'      = @{ LabelKey = 'engine.google';     ProviderName = 'Google';       URL = 'https://www.google.com/search?q={searchTerms}';          Suggest = 'https://www.google.com/complete/search?output=chrome&q={searchTerms}';    Keyword = 'google';    Home = 'https://www.google.com' }
+    'bing'        = @{ LabelKey = 'engine.bing';       ProviderName = 'Bing';         URL = 'https://www.bing.com/search?q={searchTerms}';            Suggest = 'https://www.bing.com/osjson.aspx?query={searchTerms}';                    Keyword = 'bing';      Home = 'https://www.bing.com' }
+    'yandex'      = @{ LabelKey = 'engine.yandex';     ProviderName = 'Yandex';       URL = 'https://yandex.com/search/?text={searchTerms}';          Suggest = 'https://suggest.yandex.com/suggest-ff.cgi?part={searchTerms}';            Keyword = 'yandex';    Home = 'https://yandex.com' }
+    'custom'      = @{ LabelKey = 'engine.custom';     ProviderName = 'Custom...';    URL = '';                                                       Suggest = '';                                                                       Keyword = 'custom';    Home = ''; IsCustom = $true }
+}
+
+# Destination presets for "new tab" and "startup specific page". '__SEARCH__'
+# resolves at apply time to the chosen engine's home URL.
+$script:DestinationOptions = [ordered]@{
+    'blank'           = @{ LabelKey = 'destination.blank';           Value = 'about:blank' }
+    'ntpDefault'      = @{ LabelKey = 'destination.ntpDefault';      Value = '__SKIP__' }
+    'matchSearch'     = @{ LabelKey = 'destination.matchSearch';     Value = '__SEARCH__' }
+    'braveSearchHome' = @{ LabelKey = 'destination.braveSearchHome'; Value = 'https://search.brave.com' }
+    'duckduckgoHome'  = @{ LabelKey = 'destination.duckduckgoHome';  Value = 'https://duckduckgo.com' }
+    'googleHome'      = @{ LabelKey = 'destination.googleHome';      Value = 'https://www.google.com' }
+    'custom'          = @{ LabelKey = 'destination.custom';          Value = '__CUSTOM__' }
+}
+
+# Startup behavior modes (RestoreOnStartup values: 1 last session, 4 list of URLs, 5 New Tab page).
+$script:StartupModes = [ordered]@{
+    'newTab'         = @{ LabelKey = 'startupMode.newTab';         Code = 5; UsesURL = $false }
+    'restoreSession' = @{ LabelKey = 'startupMode.restoreSession'; Code = 1; UsesURL = $false }
+    'blankPage'      = @{ LabelKey = 'startupMode.blankPage';      Code = 4; UsesURL = $true; FixedURL = 'about:blank' }
+    'specificPages'  = @{ LabelKey = 'startupMode.specificPages';  Code = 4; UsesURL = $true; FixedURL = $null }
+}
+
+# ---- Stable id arrays that back the ComboBoxes ---------------------------------------------
+# Item order in each ComboBox matches these arrays; the link is SelectedIndex.
+$script:SearchEngineIds       = @($script:SearchEngines.Keys)
+$script:SearchEngineLabelKeys = @($script:SearchEngineIds | ForEach-Object { $script:SearchEngines[$_].LabelKey })
+# 'ntpDefault' stays in the data model so Load current state can match it, but it
+# is never offered in the new-tab dropdown.
+$script:DestinationIds        = @($script:DestinationOptions.Keys | Where-Object { $_ -ne 'ntpDefault' })
+$script:DestinationLabelKeys  = @($script:DestinationIds | ForEach-Object { $script:DestinationOptions[$_].LabelKey })
+$script:StartupModeIds        = @($script:StartupModes.Keys)
+$script:StartupModeLabelKeys  = @($script:StartupModeIds | ForEach-Object { $script:StartupModes[$_].LabelKey })
+
+# ---- Legacy config migration (v1.5-v1.11 exports stored English display labels) ------------
+$script:LegacyHostsIds = @{
+    'Brave P3A telemetry' = 'p3a'; 'Brave Variations' = 'variations'; 'Brave Stats ping' = 'stats'
+    'Brave Rewards / BAT' = 'rewards'; 'Brave News CDN' = 'news'; 'Component Updates' = 'components'; 'Web Discovery' = 'webDiscovery'
+}
+$script:LegacySearchEngineIds = @{
+    'Brave Search' = 'brave'; 'DuckDuckGo' = 'duckduckgo'; 'Startpage' = 'startpage'; 'Qwant' = 'qwant'; 'Ecosia' = 'ecosia'
+    'Mojeek' = 'mojeek'; 'Kagi (paid)' = 'kagi'; 'Google' = 'google'; 'Bing' = 'bing'; 'Yandex' = 'yandex'; 'Custom...' = 'custom'
+}
+$script:LegacyDestinationIds = @{
+    'Blank page (about:blank)' = 'blank'; 'Default new tab page (do not override)' = 'ntpDefault'
+    'Match the search engine I picked above' = 'matchSearch'; 'Brave Search homepage' = 'braveSearchHome'
+    'DuckDuckGo homepage' = 'duckduckgoHome'; 'Google homepage' = 'googleHome'; 'Custom URL...' = 'custom'
+}
+$script:LegacyStartupModeIds = @{
+    'Open the new tab page' = 'newTab'; 'Restore my last session' = 'restoreSession'
+    'Open a blank page' = 'blankPage'; 'Open a specific page or set' = 'specificPages'
+}
+#endregion
+
+
+#region Core: Brave installs, registry, backups ---------------------------------
+# Brave reads ONE policy key, for every channel and edition (Stable, Beta,
+# Nightly, Dev and Brave Origin): brave-core defines a single policy key and the
+# shipped chrome.dll contains exactly one. Versions 1.5 to 1.12 of this tool also
+# wrote ...\Brave-Beta, ...\Brave-Nightly and ...\Brave-Dev, which Brave never
+# reads; those legacy keys are only ever cleaned up (see Invoke-FullRestore).
+$script:PolicyKeyPath    = Get-PolicyHivePath 'Brave'
+$script:LegacyPolicyKeys = @('Brave-Beta', 'Brave-Nightly', 'Brave-Dev')
+
+# Where each channel lives on disk. A policy applies to all of them at once.
+$script:BraveInstalls = [ordered]@{
+    'Stable'  = @{ Dir = 'Brave-Browser' }
+    'Beta'    = @{ Dir = 'Brave-Browser-Beta' }
+    'Nightly' = @{ Dir = 'Brave-Browser-Nightly' }
+    'Dev'     = @{ Dir = 'Brave-Browser-Dev' }
+}
+foreach ($installName in @($script:BraveInstalls.Keys)) {
+    $c = $script:BraveInstalls[$installName]
+    $c.UserDataRoot  = Join-Path $env:LOCALAPPDATA ("BraveSoftware\{0}\User Data" -f $c.Dir)
+    $c.InstallProbes = @(
+        (Join-Path $env:ProgramFiles ("BraveSoftware\{0}\Application\brave.exe" -f $c.Dir)),
+        (Join-Path ${env:ProgramFiles(x86)} ("BraveSoftware\{0}\Application\brave.exe" -f $c.Dir)),
+        (Join-Path $env:LOCALAPPDATA ("BraveSoftware\{0}\Application\brave.exe" -f $c.Dir))
     )
-    $flow = Get-TabFlow -TabPage $TabPage -BaseTop $BaseTop
-    # The first entry registered defines where the tab's flow starts, whether
-    # or not the record already existed.
-    if ($flow.Entries.Count -eq 0) { $flow.Top = $BaseTop }
-    $offsets = @()
-    foreach ($c in $Controls) { $offsets += ($c.Top - $BaseTop) }
-
-    $entry = [pscustomobject]@{
-        Kind = $Kind; Controls = $Controls; Offsets = $offsets
-        Height = $Height; CjkExtra = $CjkExtra; Group = $Group
-        Id = $Id; Type = $Type; CategoryId = $CategoryId
-        SearchText = $SearchText; IsSelected = $IsSelected
-        Visible = $true
-    }
-    [void]$flow.Entries.Add($entry)
-    if ($Kind -eq 'Row') { [void]$script:ConfigFilterItems.Add($entry) }
-    # No return value on purpose: call sites are statements at script scope,
-    # and emitting the object would print it to the console the .bat opened.
 }
 
-# Called while the tab is still being built, so the flow record has to be
-# created on demand here - looking it up and giving up when absent silently
-# dropped every title key, and the per-tab match count never appeared.
-function Set-FlowTabTitleKey {
-    param($TabPage, [string]$Key)
-    (Get-TabFlow -TabPage $TabPage).TitleKey = $Key
-}
-
-function Start-FilterDebounce {
-    if (-not $script:FilterDebounce) {
-        $script:FilterDebounce = New-Object System.Windows.Forms.Timer
-        $script:FilterDebounce.Interval = 180
-        $script:FilterDebounce.Add_Tick({
-            $script:FilterDebounce.Stop()
-            Update-ConfigurationFilter
-        })
+# Finds brave.exe for one channel. The probes cover the standard per-machine and
+# per-user locations; Stable additionally honours the "App Paths" registration
+# so a custom install folder is still found.
+function Get-BraveExecutable {
+    param([string]$Channel = 'Stable')
+    if (-not $script:BraveInstalls.Contains($Channel)) { return $null }
+    foreach ($probe in $script:BraveInstalls[$Channel].InstallProbes) {
+        if ($probe -and (Test-Path -LiteralPath $probe)) { return $probe }
     }
-    $script:FilterDebounce.Stop()
-    $script:FilterDebounce.Start()
-}
-
-function Update-ConfigurationFilter {
-    if (-not $script:FilterReady) { return }
-    if (-not $script:TxtConfigFilter) { return }
-
-    $query        = "$($script:TxtConfigFilter.Text)".Trim()
-    $selectedOnly = [bool]$script:ChkSelectedOnly.Checked
-    $terms        = @($query -split '\s+' | Where-Object { $_ })
-    $filtering    = ($terms.Count -gt 0 -or $selectedOnly)
-    $cjk          = ($script:CurrentLocale -like 'zh-*')
-
-    $totalRows = 0
-    $shownRows = 0
-    $firstMatchTab = $null
-
-    foreach ($key in @($script:TabFlows.Keys)) {
-        $flow = $script:TabFlows[$key]
-
-        # Pass 1 - decide row visibility.
-        $groupHasVisible = @{}
-        foreach ($entry in $flow.Entries) {
-            if ($entry.Kind -ne 'Row') { continue }
-            $totalRows++
-            $visible = $true
-            if ($selectedOnly) {
-                try { $visible = [bool](& $entry.IsSelected) } catch { $visible = $true }
-            }
-            if ($visible -and $terms.Count -gt 0) {
-                $hay = ''
-                try { $hay = "$(& $entry.SearchText)" } catch { $hay = '' }
-                foreach ($t in $terms) {
-                    if ($hay -notmatch [regex]::Escape($t)) { $visible = $false; break }
-                }
-            }
-            $entry.Visible = $visible
-            if ($visible) {
-                $shownRows++
-                $groupHasVisible[$entry.Group] = $true
-            }
-        }
-
-        # Pass 2 - headers follow their group, trailers always stay.
-        foreach ($entry in $flow.Entries) {
-            if ($entry.Kind -eq 'Header')  { $entry.Visible = [bool]$groupHasVisible[$entry.Group] }
-            if ($entry.Kind -eq 'Trailer') { $entry.Visible = $true }
-        }
-
-        # Pass 3 - re-flow.
-        $tabVisibleRows = 0
-        $y = $flow.Top
-        $flow.TabPage.SuspendLayout()
-        foreach ($entry in $flow.Entries) {
-            if (-not $entry.Visible) {
-                foreach ($c in $entry.Controls) { $c.Visible = $false }
-                continue
-            }
-            for ($i = 0; $i -lt $entry.Controls.Count; $i++) {
-                $c = $entry.Controls[$i]
-                $c.Top = $y + $entry.Offsets[$i]
-                $c.Visible = $true
-            }
-            $y += $entry.Height
-            if ($cjk) { $y += $entry.CjkExtra }
-            if ($entry.Kind -eq 'Row') { $tabVisibleRows++ }
-        }
-        $flow.TabPage.ResumeLayout()
-
-        # Tab caption gets a live match count while filtering.
-        if ($flow.TitleKey) {
-            if ($filtering) {
-                $flow.TabPage.Text = T 'filter.tabCount' @((T $flow.TitleKey), $tabVisibleRows)
-            } else {
-                $flow.TabPage.Text = T $flow.TitleKey
-            }
-        }
-        if ($filtering -and $tabVisibleRows -gt 0 -and -not $firstMatchTab) { $firstMatchTab = $flow.TabPage }
-    }
-
-    if ($script:LblFilterCount) {
-        if ($shownRows -eq 0 -and $filtering) {
-            $script:LblFilterCount.Text = T 'filter.noMatches'
-        } else {
-            $script:LblFilterCount.Text = T 'filter.matches' @($shownRows, $totalRows)
+    if ($Channel -eq 'Stable') {
+        foreach ($hive in @('HKCU:', 'HKLM:')) {
+            try {
+                $key = Get-Item -LiteralPath "$hive\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\brave.exe" -ErrorAction Stop
+                $value = $key.GetValue('')
+                if ($value -and (Test-Path -LiteralPath $value) -and $value -notmatch 'Brave-Browser-(Beta|Nightly|Dev)') { return $value }
+            } catch { }
         }
     }
+    return $null
+}
 
-    # Jump to the first tab that actually has a hit, but never fight the user
-    # while they are reading a tab that already matches.
-    if ($filtering -and $firstMatchTab -and $script:Tabs) {
-        # SelectedTab can legitimately be $null (no tab selected yet, or the
-        # control has no handle), and indexing a hashtable with $null is a
-        # terminating error - which would abort the whole filter pass.
-        $currentTab  = $script:Tabs.SelectedTab
-        $currentFlow = $null
-        if ($currentTab -and $currentTab.Name) { $currentFlow = $script:TabFlows[$currentTab.Name] }
-        $currentHasHit = $false
-        if ($currentFlow) {
-            foreach ($e in $currentFlow.Entries) {
-                if ($e.Kind -eq 'Row' -and $e.Visible) { $currentHasHit = $true; break }
-            }
-        }
-        if (-not $currentHasHit) { $script:Tabs.SelectedTab = $firstMatchTab }
+function Get-DetectedChannels {
+    return @($script:BraveInstalls.Keys | Where-Object { Get-BraveExecutable -Channel $_ })
+}
+
+# The install the app talks about and opens: Stable first, then the others.
+function Get-PrimaryChannel {
+    $found = @(Get-DetectedChannels)
+    if ($found.Count -gt 0) { return $found[0] }
+    return 'Stable'
+}
+
+function Get-BraveInfo {
+    param([string]$Channel = 'Stable')
+    $exe = Get-BraveExecutable -Channel $Channel
+    $info = [pscustomobject]@{ Channel = $Channel; Exe = $exe; Version = ''; Major = 0; Scope = ''; Installed = [bool]$exe }
+    if ($exe) {
+        try { $info.Version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion } catch { $info.Version = '' }
+        if ($info.Version -match '^(\d+)\.') { $info.Major = [int]$Matches[1] }
+        $info.Scope = if ($exe.StartsWith($env:LOCALAPPDATA, [System.StringComparison]::OrdinalIgnoreCase)) { 'user' } else { 'machine' }
     }
+    return $info
 }
 
-function Clear-ConfigurationFilter {
-    $script:TxtConfigFilter.Text = ''
-    $script:ChkSelectedOnly.Checked = $false
-    Update-ConfigurationFilter
+# ---- Registry ----------------------------------------------------------------
+# One pass over a policy key: every value with its registry type, plus the
+# subkeys (RestoreOnStartupURLs, 3rdparty, ExtensionInstallForcelist...).
+function Read-PolicySnapshot {
+    param([string]$Path)
+    $snap = [pscustomobject]@{
+        Path = $Path; Exists = $false
+        Values = @{}; Kinds = @{}; SubKeys = @(); Urls = @()
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { return $snap }
+    $snap.Exists = $true
+    $key = Get-Item -LiteralPath $Path
+    foreach ($name in $key.GetValueNames()) {
+        $snap.Values[$name] = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $snap.Kinds[$name]  = $key.GetValueKind($name).ToString()
+    }
+    $snap.SubKeys = @($key.GetSubKeyNames())
+    if ($snap.SubKeys -contains 'RestoreOnStartupURLs') {
+        $sub = Get-Item -LiteralPath (Join-Path $Path 'RestoreOnStartupURLs')
+        $numbered = @()
+        foreach ($n in $sub.GetValueNames()) {
+            if ($n -match '^\d+$') { $numbered += [pscustomobject]@{ Index = [int]$n; Value = [string]$sub.GetValue($n) } }
+        }
+        $snap.Urls = @($numbered | Sort-Object Index | ForEach-Object { $_.Value })
+    }
+    return $snap
 }
 
-# Description labels are re-measured on language switch: CJK needs a larger
-# point size and more vertical room than the 8pt English default.
-#
-# The height is ASSIGNED, never max()'d against the current value. Growing
-# monotonically looked fine going en -> zh, then left 34px labels inside 28px
-# rows on the way back, so consecutive descriptions overlapped. The active
-# locale alone decides the geometry, every time, in both directions.
-function Update-LocalizedRowText {
-    $size = Get-PolicyDescFontSize
-    $h    = Get-PolicyDescHeight
-    foreach ($lbl in $script:RowDescLabels) {
+function Set-PolicyRegistryValue {
+    param([string]$Path, [string]$Name, [string]$Type, $Value)
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+    $kind = if ($Type -eq 'DWORD') { 'DWord' } else { 'String' }
+    if ($kind -eq 'DWord') { $Value = [int]$Value }
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $kind -Force | Out-Null
+}
+
+function Remove-PolicyRegistryValue {
+    param([string]$Path, [string]$Name)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $key = Get-Item -LiteralPath $Path
+    if ($key.GetValueNames() -notcontains $Name) { return $false }
+    Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
+    return $true
+}
+
+# ---- Backups -------------------------------------------------------------------
+# [Environment]::GetFolderPath knows where Documents really is; the folder is
+# redirected to OneDrive on many PCs, so USERPROFILE\Documents can be a stray.
+function Get-BackupDirectory {
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    if (-not $docs) { $docs = Join-Path $env:USERPROFILE 'Documents' }
+    $dir = Join-Path $docs 'Brave-Free-Origin-Backups'
+    if ($script:SelfTestMode) { $dir = Join-Path ([System.IO.Path]::GetTempPath()) 'bfo-selftest-backups' }
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Remove-OldBackups {
+    param([string]$Filter, [int]$Keep = 30)
+    try {
+        Get-ChildItem -LiteralPath (Get-BackupDirectory) -Filter $Filter -File -ErrorAction Stop |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep | Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+# Returns @{ Ok; File; Reason }. "Nothing to back up" and "the backup failed" are
+# different outcomes and must not be reported the same way.
+function Export-PolicyBackup {
+    # The whole BraveSoftware policy branch, so legacy per-channel keys are saved too.
+    $hive = if ($script:SelfTestMode) { $script:SandboxRegistryRoot } else { 'HKLM:\Software\Policies\BraveSoftware' }
+    if (-not (Test-Path -LiteralPath $hive)) { return @{ Ok = $true; File = $null; Reason = 'none' } }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $file  = Join-Path (Get-BackupDirectory) "brave-policies-backup-$stamp.reg"
+    $regKey = $hive -replace '^(HK[A-Z]+):\\', '$1\'
+    $output = & reg.exe EXPORT $regKey $file /y 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        return @{ Ok = $false; File = $null; Reason = ("reg.exe exit code {0}: {1}" -f $LASTEXITCODE, (($output | Out-String).Trim())) }
+    }
+    Remove-OldBackups -Filter 'brave-policies-backup-*.reg'
+    return @{ Ok = $true; File = $file; Reason = '' }
+}
+#endregion
+
+#region Core: hosts file -------------------------------------------------------
+$script:HostsSentinelStart = '# === Brave-Free-Origin START - managed block, do not edit between sentinels ==='
+$script:HostsSentinelEnd   = '# === Brave-Free-Origin END ==='
+$script:HostsFile = if ($script:SelfTestMode) { $script:SandboxHostsFile } else { Join-Path $env:WINDIR 'System32\drivers\etc\hosts' }
+$script:HostsStartRx = [regex]'^\s*#\s*===\s*Brave-Free-Origin START\b'
+$script:HostsEndRx   = [regex]'^\s*#\s*===\s*Brave-Free-Origin END\b'
+
+# The hosts file is a system file the user may have edited by hand, in any
+# encoding. Decoding it as text and writing it back as ASCII destroys every
+# non-ASCII character (accented comments, IDN names). So the bytes are handled
+# losslessly: Latin-1 maps every byte to exactly one char and back, and only a
+# real UTF-16 file (BOM) is decoded as such. The block we add is pure ASCII.
+function Read-HostsFileText {
+    if (-not (Test-Path -LiteralPath $script:HostsFile)) {
+        return [pscustomobject]@{ Text = ''; Encoding = [System.Text.Encoding]::GetEncoding(28591); Exists = $false }
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($script:HostsFile)
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        $enc = New-Object System.Text.UnicodeEncoding($false, $true)
+        return [pscustomobject]@{ Text = $enc.GetString($bytes, 2, $bytes.Length - 2); Encoding = $enc; Exists = $true }
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+        $enc = New-Object System.Text.UnicodeEncoding($true, $true)
+        return [pscustomobject]@{ Text = $enc.GetString($bytes, 2, $bytes.Length - 2); Encoding = $enc; Exists = $true }
+    }
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+    return [pscustomobject]@{ Text = $latin1.GetString($bytes); Encoding = $latin1; Exists = $true }
+}
+
+function Split-HostsLines {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    $lines = [regex]::Split($Text, "\r\n|\n|\r")
+    # A trailing newline yields one empty last element that is not a real line.
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines = $lines[0..($lines.Count - 2)] }
+    return @($lines)
+}
+
+function Get-HostsManagedDomains {
+    $domains = @()
+    $inBlock = $false
+    foreach ($line in (Split-HostsLines (Read-HostsFileText).Text)) {
+        if ($script:HostsStartRx.IsMatch($line)) { $inBlock = $true; continue }
+        if ($script:HostsEndRx.IsMatch($line))   { $inBlock = $false; continue }
+        if ($inBlock -and $line -match '^\s*0\.0\.0\.0\s+(\S+)') { $domains += $Matches[1] }
+    }
+    return $domains
+}
+
+function Backup-HostsFile {
+    if (-not (Test-Path -LiteralPath $script:HostsFile)) { return $null }
+    $file = Join-Path (Get-BackupDirectory) ("hosts-backup-{0}.bak" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Copy-Item -LiteralPath $script:HostsFile -Destination $file -Force
+    Remove-OldBackups -Filter 'hosts-backup-*.bak'
+    Write-Log "Hosts backup saved: $file" 'OK'
+    return $file
+}
+
+# Rebuilds the hosts file with our sentinel block replaced (or removed when
+# $Domains is empty). Everything outside the block is preserved byte for byte.
+function Set-HostsManagedDomains {
+    param([string[]]$Domains)
+    [void](Backup-HostsFile)
+    $current = Read-HostsFileText
+    $newline = if ($current.Text -match "\r\n") { "`r`n" } elseif ($current.Text -match "\n") { "`n" } else { "`r`n" }
+
+    $kept = New-Object System.Collections.ArrayList
+    $skipping = $false
+    foreach ($line in (Split-HostsLines $current.Text)) {
+        if ($script:HostsStartRx.IsMatch($line)) { $skipping = $true; continue }
+        if ($script:HostsEndRx.IsMatch($line))   { $skipping = $false; continue }
+        if (-not $skipping) { [void]$kept.Add($line) }
+    }
+    while ($kept.Count -gt 0 -and [string]::IsNullOrWhiteSpace($kept[$kept.Count - 1])) { $kept.RemoveAt($kept.Count - 1) }
+
+    if ($Domains -and $Domains.Count -gt 0) {
+        [void]$kept.Add('')
+        [void]$kept.Add($script:HostsSentinelStart)
+        [void]$kept.Add("# Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by Brave Free Origin. Remove it from the app or delete these lines.")
+        foreach ($d in ($Domains | Sort-Object -Unique)) { [void]$kept.Add("0.0.0.0 $d") }
+        [void]$kept.Add($script:HostsSentinelEnd)
+    }
+    $text = ($kept -join $newline) + $newline
+
+    $bom = @()
+    if ($current.Encoding -is [System.Text.UnicodeEncoding]) { $bom = $current.Encoding.GetPreamble() }
+    $bytes = $bom + $current.Encoding.GetBytes($text)
+
+    # The file may be read-only, or briefly locked by antivirus.
+    $attributes = $null
+    if (Test-Path -LiteralPath $script:HostsFile) {
+        $attributes = (Get-Item -LiteralPath $script:HostsFile).Attributes
+        if ($attributes -band [System.IO.FileAttributes]::ReadOnly) {
+            Set-ItemProperty -LiteralPath $script:HostsFile -Name Attributes -Value ($attributes -bxor [System.IO.FileAttributes]::ReadOnly)
+        }
+    }
+    $written = $false
+    for ($attempt = 1; $attempt -le 4 -and -not $written; $attempt++) {
         try {
-            $lbl.Font   = Get-BfoUiFont -Size $size
-            $lbl.Height = $h
-        } catch { }
+            [System.IO.File]::WriteAllBytes($script:HostsFile, [byte[]]$bytes)
+            $written = $true
+        } catch [System.IO.IOException] {
+            if ($attempt -eq 4) { throw }
+            Start-Sleep -Milliseconds (250 * $attempt)
+        }
     }
+    if ($attributes -band [System.IO.FileAttributes]::ReadOnly) {
+        Set-ItemProperty -LiteralPath $script:HostsFile -Name Attributes -Value $attributes
+    }
+    # Prove it: read back and compare, so "hosts updated" is never a guess.
+    $back = @(Get-HostsManagedDomains)
+    $want = @($Domains | Sort-Object -Unique)
+    if (($back -join ',') -ne ($want -join ',')) {
+        throw "The hosts file was written but its managed block does not match what was requested ($($back.Count) of $($want.Count) domains)."
+    }
+    if (-not $script:SelfTestMode) { & ipconfig.exe /flushdns | Out-Null }
+    Write-Log "Hosts block written: $($want.Count) domain(s)." 'OK'
+}
+#endregion
+
+#region Core: updater tasks and services ----------------------------------------
+# Brave's updater (Omaha) names its scheduled tasks with a GUID suffix, and with
+# the user's SID for per-user installs, e.g.
+#   BraveSoftwareUpdateTaskMachineCore{GUID}   per-machine install
+#   BraveSoftwareUpdateTaskUserS-1-5-21-...Core{GUID}   per-user install
+# so they can only be found by pattern, never by exact name. Enumerating tasks
+# takes about a second, so results are cached and refreshed on demand.
+$script:UpdaterTaskDefs = @(
+    @{ Id = 'core'; Pattern = 'BraveSoftwareUpdateTask*Core*' }
+    @{ Id = 'ua';   Pattern = 'BraveSoftwareUpdateTask*UA*' }
+)
+$script:UpdaterServiceDefs = @(
+    @{ Id = 'brave';  Name = 'brave';  Default = 'Automatic' }
+    @{ Id = 'bravem'; Name = 'bravem'; Default = 'Manual' }
+)
+# Never offered as a checkbox: Brave Elevation Service guards the keys that encrypt
+# cookies and saved data (App-Bound Encryption) and is not an updater; the VPN
+# services only exist after a VPN purchase. Versions 1.5-1.12 could have switched
+# them off, so Restore turns them back on when it finds them disabled.
+$script:RestoreOnlyServices = @(
+    @{ Name = 'BraveElevationService';    Default = 'Manual' }
+    @{ Name = 'BraveVpnService';          Default = 'Manual' }
+    @{ Name = 'BraveVpnWireguardService'; Default = 'Manual' }
+)
+$script:TaskCache    = $null
+$script:FakeTasks    = @()      # sandbox: objects with Name, State
+$script:FakeServices = @()      # sandbox: objects with Name, StartType, Status
+
+function Get-BfoTasks {
+    param([switch]$Refresh)
+    if ($script:SelfTestMode) { return @($script:FakeTasks) }
+    if ($script:TaskCache -and -not $Refresh) { return @($script:TaskCache) }
+    $found = @()
+    try {
+        foreach ($t in @(Get-ScheduledTask -TaskName 'BraveSoftwareUpdateTask*' -ErrorAction SilentlyContinue)) {
+            # A foreign task that merely shares the prefix must never be touched.
+            $exe = (@($t.Actions | ForEach-Object { "$($_.Execute)" }) -join ' ')
+            if ($exe -and $exe -notlike '*BraveUpdate.exe*') { continue }
+            $found += [pscustomobject]@{ Name = $t.TaskName; State = "$($t.State)"; Task = $t }
+        }
+    } catch { Write-Log "Scheduled task lookup failed: $_" 'WARN' }
+    $script:TaskCache = $found
+    return @($found)
+}
+
+function Find-BfoTasks {
+    param([string]$Pattern, [switch]$Refresh)
+    return @(Get-BfoTasks -Refresh:$Refresh | Where-Object { $_.Name -like $Pattern })
+}
+
+function Set-BfoTaskEnabled {
+    param($TaskInfo, [bool]$Enabled)
+    if ($script:SelfTestMode) {
+        foreach ($t in $script:FakeTasks) { if ($t.Name -eq $TaskInfo.Name) { $t.State = if ($Enabled) { 'Ready' } else { 'Disabled' } } }
+        return
+    }
+    if ($Enabled) { Enable-ScheduledTask -InputObject $TaskInfo.Task -ErrorAction Stop | Out-Null }
+    else          { Disable-ScheduledTask -InputObject $TaskInfo.Task -ErrorAction Stop | Out-Null }
+}
+
+# Updater services (per-machine installs only) matched by name prefix AND image
+# path. Id is 'brave' or 'bravem' ('bravem' also starts with 'brave').
+function Find-BfoUpdaterServices {
+    param([string]$Id)
+    $all = @()
+    if ($script:SelfTestMode) { $all = @($script:FakeServices) }
+    else {
+        try {
+            foreach ($c in @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop | Where-Object { $_.PathName -like '*\BraveSoftware\Update\BraveUpdate.exe*' })) {
+                $start = switch ("$($c.StartMode)") { 'Auto' { 'Automatic' } default { "$($c.StartMode)" } }
+                $all += [pscustomobject]@{ Name = $c.Name; StartType = $start; Status = "$($c.State)" }
+            }
+        } catch { Write-Log "Service lookup failed: $_" 'WARN' }
+    }
+    return @($all | Where-Object {
+        if ($Id -eq 'bravem') { $_.Name -like 'bravem*' } else { $_.Name -like 'brave*' -and $_.Name -notlike 'bravem*' }
+    })
+}
+
+# One service by exact name (used to undo what older versions may have disabled).
+function Get-BfoService {
+    param([string]$Name)
+    if ($script:SelfTestMode) { return $script:FakeServices | Where-Object { $_.Name -eq $Name } | Select-Object -First 1 }
+    return Get-Service -Name $Name -ErrorAction SilentlyContinue
+}
+
+function Set-BfoServiceStartType {
+    param([string]$Name, [string]$StartType, [switch]$StopIfRunning)
+    if ($script:SelfTestMode) {
+        foreach ($s in $script:FakeServices) {
+            if ($s.Name -eq $Name) { $s.StartType = $StartType; if ($StopIfRunning) { $s.Status = 'Stopped' } }
+        }
+        return
+    }
+    if ($StopIfRunning) {
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
+    }
+    Set-Service -Name $Name -StartupType $StartType -ErrorAction Stop
+}
+#endregion
+
+#region Core: opening Brave --------------------------------------------------
+# This app runs elevated, but Brave must not. A browser started from an elevated
+# process runs with administrator rights (dangerous) or, on current Chromium,
+# tries to relaunch itself unelevated and may silently do nothing when another
+# instance already owns the profile. Handing the launch to Explorer - which
+# runs at normal privilege - starts it the way a double-click would. If that is
+# impossible the address is copied so the user can paste it.
+$script:TempFiles = New-Object System.Collections.ArrayList
+$script:LastOpenedUrl = $null
+
+function Start-UnelevatedProcess {
+    param([string]$FilePath, [string]$Arguments)
+    if ($script:SelfTestMode) { $script:LastOpenedUrl = $Arguments; return $true }
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { return $false }
+    $shortcut = Join-Path ([System.IO.Path]::GetTempPath()) ("bfo-open-{0}.lnk" -f ([guid]::NewGuid().ToString('N')))
+    $shell = New-Object -ComObject WScript.Shell
+    try {
+        $link = $shell.CreateShortcut($shortcut)
+        $link.TargetPath = $FilePath
+        $link.Arguments  = $Arguments
+        $link.WorkingDirectory = Split-Path -Parent $FilePath
+        $link.Save()
+    } finally {
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    }
+    [void]$script:TempFiles.Add($shortcut)
+    Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ('"{0}"' -f $shortcut) | Out-Null
+    return $true
+}
+
+function Remove-TempShortcuts {
+    foreach ($f in @($script:TempFiles)) { try { Remove-Item -LiteralPath $f -Force -ErrorAction Stop } catch { } }
+    $script:TempFiles.Clear()
+}
+
+# $Target is a URL such as brave://policy or an https:// address.
+function Open-InBrave {
+    param([string]$Target)
+    $exe = Get-BraveExecutable -Channel (Get-PrimaryChannel)
+    if (-not $exe) {
+        [void](Show-Message -Text (T 'msg.braveMissing') -Title (T 'msg.title.info') -Icon 'Information')
+        return $false
+    }
+    $opened = $false
+    try { $opened = Start-UnelevatedProcess -FilePath $exe -Arguments $Target }
+    catch { Write-Log "Could not start Brave for $Target : $_" 'WARN' }
+    if ($opened) {
+        Write-Log "Opened $Target in Brave." 'OK'
+        return $true
+    }
+    try { [System.Windows.Forms.Clipboard]::SetText($Target) } catch { }
+    Write-Log "Brave could not be started from here; copied $Target to the clipboard." 'WARN'
+    [void](Show-Message -Text (T 'msg.openBrave.copied' @($Target)) -Title (T 'msg.title.info') -Icon 'Information')
+    return $false
 }
 #endregion
 
 
-$script:BravePolicyPath = 'HKLM:\Software\Policies\BraveSoftware\Brave'
+#region Model: settings, presets, planning -------------------------------------
+# Everything in this region is UI-independent: the window only reads and writes
+# the item list below, and Preview, Apply and Verify all derive from the same
+# plan. That keeps "what you see" and "what gets written" from drifting apart,
+# and lets the self-test drive the whole pipeline without a window.
+$script:Items       = New-Object System.Collections.Generic.List[object]
+$script:ItemIndex   = @{}
+$script:PolicyByName = @{}
+$script:PolicyPages = [ordered]@{}
+$script:ActiveProfile = 'Custom'
+$script:Snapshot    = $null      # snapshot of the policy key as last read
 
-# ---- Multi-channel support (v1.5) -------------------------------------------
-# Each Brave channel keeps its own policy hive. Default target is Stable.
-# If user picks "All installed channels", every detected install gets the apply.
-$script:Channels = [ordered]@{
-    'Stable'  = @{
-        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave'
-        InstallProbes = @(
-            "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
-        )
-    }
-    'Beta'    = @{
-        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave-Beta'
-        InstallProbes = @(
-            "$env:ProgramFiles\BraveSoftware\Brave-Browser-Beta\Application\brave.exe",
-            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser-Beta\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Beta\Application\brave.exe"
-        )
-    }
-    'Nightly' = @{
-        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave-Nightly'
-        InstallProbes = @(
-            "$env:ProgramFiles\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe",
-            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Nightly\Application\brave.exe"
-        )
-    }
-    'Dev'     = @{
-        Path = 'HKLM:\Software\Policies\BraveSoftware\Brave-Dev'
-        InstallProbes = @(
-            "$env:ProgramFiles\BraveSoftware\Brave-Browser-Dev\Application\brave.exe",
-            "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser-Dev\Application\brave.exe",
-            "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Dev\Application\brave.exe"
-        )
+# Presets are stable ids; labels live in the string catalog. Order is the order
+# of the buttons.
+$script:PresetKeys  = @('Minimal', 'Recommended', 'Origin', 'Performance', 'MaxPerformance', 'MaxPrivacy', 'None')
+$script:AllPresetKeys = $script:PresetKeys + @('CurrentState', 'Custom')
+$script:PresetCodes = @{ Minimal = 'Q'; Origin = 'O'; Recommended = 'R'; Performance = 'B'; MaxPerformance = 'X'; MaxPrivacy = 'P' }
+
+function Initialize-PolicyCatalog {
+    $script:PolicyPages.Clear()
+    $script:PolicyByName.Clear()
+    foreach ($row in $script:PolicyTable) {
+        if ($row -match '^\s*(#|$)') { continue }
+        $f = $row.Split('|')
+        if ($f.Count -ne 8) { throw "Bad policy table row: $row" }
+        $value = if ($f[2] -eq 'DWORD') { [int]$f[3] } else { $f[3] }
+        $def = @{
+            Page = $f[0]; Name = $f[1]; Type = $f[2]; Value = $value
+            Kind = $f[4]; Risk = $f[5]; Lock = ($f[6] -eq '1'); Presets = $f[7]; Choices = $null
+        }
+        if ($script:PolicyChoices.ContainsKey($def.Name)) { $def.Choices = $script:PolicyChoices[$def.Name] }
+        if (-not $script:PolicyPages.Contains($def.Page)) { $script:PolicyPages[$def.Page] = New-Object System.Collections.ArrayList }
+        [void]$script:PolicyPages[$def.Page].Add($def)
+        $script:PolicyByName[$def.Name] = $def
     }
 }
-$script:TargetChannels = @('Stable')
-$script:ScriptletUserDataRoots = [ordered]@{
-    'Stable'  = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"
-    'Beta'    = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Beta\User Data"
-    'Nightly' = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Nightly\User Data"
-    'Dev'     = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser-Dev\User Data"
+
+function New-BfoItem {
+    param([string]$Kind, [string]$Id, [string]$Page, $Def)
+    $item = [pscustomobject]@{
+        Kind = $Kind; Id = $Id; Page = $Page; Def = $Def
+        Checked = $false; Value = $null; Baseline = $null; Loaded = $false; Detail = $null
+        Row = $null; Status = ''
+    }
+    if ($Def -and $Def.ContainsKey('Value')) { $item.Value = $Def.Value }
+    [void]$script:Items.Add($item)
+    $script:ItemIndex["$Kind|$Id"] = $item
+    return $item
 }
+
+function Get-BfoItem {
+    param([string]$Kind, [string]$Id)
+    return $script:ItemIndex["$Kind|$Id"]
+}
+
+function Initialize-Items {
+    $script:Items.Clear()
+    $script:ItemIndex.Clear()
+    foreach ($page in $script:PolicyPageOrder) {
+        if (-not $script:PolicyPages.Contains($page)) { continue }
+        foreach ($def in $script:PolicyPages[$page]) { [void](New-BfoItem -Kind 'Policy' -Id $def.Name -Page $page -Def $def) }
+    }
+    foreach ($def in $script:UpdaterTaskDefs)    { [void](New-BfoItem -Kind 'Task'    -Id $def.Id -Page 'updater' -Def $def) }
+    foreach ($def in $script:UpdaterServiceDefs) { [void](New-BfoItem -Kind 'Service' -Id $def.Id -Page 'updater' -Def $def) }
+    foreach ($def in $script:HostsBlocks)        { [void](New-BfoItem -Kind 'Host'    -Id $def.Id -Page 'hosts'   -Def $def) }
+}
+
+# ---- Overrides (search engine / new tab / startup) ---------------------------
+# These three are plain model state; the window edits it, the plan reads it.
+$script:Overrides = @{
+    Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
+    Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
+    Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
+}
+# Policies that versions 1.5-1.12 wrote and that Brave 154 no longer has (removed upstream, cloud-only or renamed).
+# They are not offered any more, but they are still this tool's own leftovers: Apply and Restore stock clean them up
+# and Verify does not call them foreign. Some (SigninAllowed, the Lens policies, IPFSEnabled) are still honoured by
+# Brave, so leaving them behind would keep sign-in or Lens switched off after a "restore".
+$script:LegacyPolicyNames = @(
+    'ChromeCleanupEnabled', 'ChromeCleanupReportingEnabled', 'CloudPrintSubmitEnabled', 'CloudReportingEnabled',
+    'GenAiDefaultSettings', 'IPFSEnabled', 'LensDesktopNTPSearchEnabled', 'LensOverlaySettings', 'LensRegionSearchEnabled',
+    'MediaRouterEnabled', 'PromotionalTabsEnabled', 'ReadingListEnabled', 'SigninAllowed', 'TabOrganizerSettings',
+    'WebTorrentDisabled', 'WelcomePageOnOSUpgradeEnabled'
+)
+$script:OverridePolicyNames = @(
+    'DefaultSearchProviderEnabled', 'DefaultSearchProviderName', 'DefaultSearchProviderKeyword',
+    'DefaultSearchProviderSearchURL', 'DefaultSearchProviderSuggestURL',
+    'NewTabPageLocation', 'RestoreOnStartup'
+)
+
+function Resolve-Destination {
+    param([string]$DestinationId, [string]$CustomUrl, [string]$SearchEngineHome)
+    $entry = $script:DestinationOptions[$DestinationId]
+    if (-not $entry) { return $null }
+    switch ($entry.Value) {
+        '__SKIP__'   { return $null }
+        '__SEARCH__' { return $SearchEngineHome }
+        '__CUSTOM__' { return $CustomUrl.Trim() }
+        default      { return $entry.Value }
+    }
+}
+
+function Test-HttpUrl {
+    param([string]$Url)
+    $u = $null
+    return ([System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$u) -and ($u.Scheme -in @('http', 'https', 'about', 'brave', 'chrome', 'file')))
+}
+
+# Returns the registry values the search/new-tab/startup overrides want, or
+# throws a message the user can act on when the input is unusable.
+function Get-DesiredOverrides {
+    $desired = [ordered]@{}
+    $urls = @()
+
+    $s = $script:Overrides.Search
+    $engine = $script:SearchEngines[$s.EngineId]
+    if ($s.Enabled) {
+        if (-not $engine) { throw (T 'err.search.unknown') }
+        $url = $engine.URL; $name = $engine.ProviderName
+        if ($engine.IsCustom) {
+            $url = "$($s.CustomUrl)".Trim()
+            if ([string]::IsNullOrWhiteSpace($url)) { throw (T 'err.search.empty') }
+            if ($url -notmatch '\{searchTerms\}')   { throw (T 'err.search.placeholder') }
+            if (-not (Test-HttpUrl ($url -replace '\{searchTerms\}', 'x'))) { throw (T 'err.search.badUrl') }
+            $name = 'Custom Search'
+        }
+        $desired['DefaultSearchProviderEnabled'] = @{ Type = 'DWORD';  Value = 1 }
+        $desired['DefaultSearchProviderName']    = @{ Type = 'STRING'; Value = $name }
+        $desired['DefaultSearchProviderKeyword'] = @{ Type = 'STRING'; Value = $engine.Keyword }
+        $desired['DefaultSearchProviderSearchURL'] = @{ Type = 'STRING'; Value = $url }
+        if ($engine.Suggest) { $desired['DefaultSearchProviderSuggestURL'] = @{ Type = 'STRING'; Value = $engine.Suggest } }
+    }
+
+    $n = $script:Overrides.Ntp
+    if ($n.Enabled) {
+        $engineHome = ''
+        if ($engine -and -not $engine.IsCustom) { $engineHome = $engine.Home }
+        $target = Resolve-Destination -DestinationId $n.DestinationId -CustomUrl "$($n.CustomUrl)" -SearchEngineHome $engineHome
+        if ([string]::IsNullOrWhiteSpace($target)) { throw (T 'err.ntp.empty') }
+        if (-not (Test-HttpUrl $target)) { throw (T 'err.ntp.badUrl') }
+        $desired['NewTabPageLocation'] = @{ Type = 'STRING'; Value = $target }
+    }
+
+    $st = $script:Overrides.Startup
+    if ($st.Enabled) {
+        $mode = $script:StartupModes[$st.ModeId]
+        if (-not $mode) { throw (T 'err.startup.unknown') }
+        $desired['RestoreOnStartup'] = @{ Type = 'DWORD'; Value = $mode.Code }
+        if ($mode.UsesURL) {
+            $urls = if ($mode.FixedURL) { @($mode.FixedURL) }
+                    else { @("$($st.Urls)" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+            if ($urls.Count -eq 0) { throw (T 'err.startup.empty') }
+            foreach ($u in $urls) { if (-not (Test-HttpUrl $u)) { throw (T 'err.startup.badUrl' @($u)) } }
+        }
+    }
+    return [pscustomobject]@{ Values = $desired; Urls = @($urls) }
+}
+
+# ---- Desired state -----------------------------------------------------------
+function Get-DesiredPolicyMap {
+    $map = [ordered]@{}
+    foreach ($item in $script:Items) {
+        if ($item.Kind -eq 'Policy' -and $item.Checked) {
+            $map[$item.Id] = @{ Type = $item.Def.Type; Value = $item.Value }
+        }
+    }
+    $ov = Get-DesiredOverrides
+    # Overrides run last and always win over a same-named ticked policy.
+    foreach ($k in $ov.Values.Keys) { $map[$k] = $ov.Values[$k] }
+    return [pscustomobject]@{ Values = $map; Urls = $ov.Urls; HasStartupOverride = $script:Overrides.Startup.Enabled }
+}
+
+function Get-ManagedPolicyNames {
+    return @(@($script:PolicyByName.Keys) + $script:OverridePolicyNames + $script:LegacyPolicyNames | Select-Object -Unique)
+}
+
+# What Apply would do to the policy key. Each op has an Action of Add, Change,
+# Keep or Clear so the same list drives Preview and Apply.
+function Get-RegistryOps {
+    param($Desired, $Snapshot)
+    $ops = New-Object System.Collections.ArrayList
+    foreach ($name in (Get-ManagedPolicyNames)) {
+        $has = $Snapshot.Values.ContainsKey($name)
+        if ($Desired.Values.Contains($name)) {
+            $want = $Desired.Values[$name]
+            $kindWanted = if ($want.Type -eq 'DWORD') { 'DWord' } else { 'String' }
+            $action = 'Add'
+            if ($has) {
+                $same = ("$($Snapshot.Values[$name])" -eq "$($want.Value)") -and ($Snapshot.Kinds[$name] -eq $kindWanted)
+                $action = if ($same) { 'Keep' } else { 'Change' }
+            }
+            [void]$ops.Add([pscustomobject]@{
+                Path = $script:PolicyKeyPath; Action = $action; Name = $name
+                Type = $want.Type; Value = $want.Value; Old = $(if ($has) { $Snapshot.Values[$name] } else { $null })
+            })
+        } elseif ($has) {
+            [void]$ops.Add([pscustomobject]@{
+                Path = $script:PolicyKeyPath; Action = 'Clear'; Name = $name
+                Type = $null; Value = $null; Old = $Snapshot.Values[$name]
+            })
+        }
+    }
+    return @($ops)
+}
+
+function Get-StartupUrlOp {
+    param($Desired, $Snapshot)
+    $want = @($Desired.Urls)
+    $have = @($Snapshot.Urls)
+    if (-not $Desired.HasStartupOverride) { $want = @() }
+    if (($want -join "`n") -eq ($have -join "`n")) { return $null }
+    return [pscustomobject]@{ Path = (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs'); Want = $want; Have = $have }
+}
+
+# Updater tasks/services only take part when the user changed them: their
+# state is read lazily, and an untouched row must never flip something the
+# user (or another tool) set on purpose.
+function Get-SystemOps {
+    param([switch]$Refresh)
+    $ops = New-Object System.Collections.ArrayList
+    foreach ($item in $script:Items) {
+        if ($item.Kind -eq 'Task') {
+            if (-not $item.Loaded -or $item.Checked -eq $item.Baseline) { continue }
+            foreach ($t in (Find-BfoTasks -Pattern $item.Def.Pattern -Refresh:$Refresh)) {
+                $disabled = ($t.State -eq 'Disabled')
+                if ($item.Checked -and -not $disabled) { [void]$ops.Add([pscustomobject]@{ Kind = 'Task'; Id = $item.Id; Action = 'Disable'; Name = $t.Name; Info = $t }) }
+                if (-not $item.Checked -and $disabled) { [void]$ops.Add([pscustomobject]@{ Kind = 'Task'; Id = $item.Id; Action = 'Enable';  Name = $t.Name; Info = $t }) }
+            }
+        }
+        if ($item.Kind -eq 'Service') {
+            if (-not $item.Loaded -or $item.Checked -eq $item.Baseline) { continue }
+            foreach ($svc in (Find-BfoUpdaterServices -Id $item.Id)) {
+                $disabled = ("$($svc.StartType)" -eq 'Disabled')
+                if ($item.Checked -and -not $disabled) { [void]$ops.Add([pscustomobject]@{ Kind = 'Service'; Id = $item.Id; Action = 'Disable'; Name = $svc.Name; Info = $svc }) }
+                if (-not $item.Checked -and $disabled) { [void]$ops.Add([pscustomobject]@{ Kind = 'Service'; Id = $item.Id; Action = 'Enable';  Name = $svc.Name; Info = $svc; Default = $item.Def.Default }) }
+            }
+        }
+    }
+    return @($ops)
+}
+
+function New-ApplyPlan {
+    $desired = Get-DesiredPolicyMap
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    $plan = [pscustomobject]@{
+        Desired = $desired
+        Registry = @(Get-RegistryOps -Desired $desired -Snapshot $snap)
+        UrlOps = @(); System = @()
+        Counts = @{ Add = 0; Change = 0; Keep = 0; Clear = 0 }
+    }
+    $urlOp = Get-StartupUrlOp -Desired $desired -Snapshot $snap
+    if ($urlOp) { $plan.UrlOps = @($urlOp) }
+    foreach ($op in $plan.Registry) { $plan.Counts[$op.Action]++ }
+    $plan.System = @(Get-SystemOps)
+    return $plan
+}
+
+function Test-PlanHasChanges {
+    param($Plan)
+    return (($Plan.Counts.Add + $Plan.Counts.Change + $Plan.Counts.Clear) -gt 0) -or $Plan.UrlOps.Count -gt 0 -or $Plan.System.Count -gt 0
+}
+
+# Writes the plan. One failing value never aborts the rest; every failure is
+# collected so the final message can say exactly what did not happen.
+function Invoke-ApplyPlan {
+    param($Plan)
+    $result = [pscustomobject]@{ Added = 0; Changed = 0; Cleared = 0; Kept = 0; System = 0; Failures = @() }
+    foreach ($op in $Plan.Registry) {
+        try {
+            switch ($op.Action) {
+                'Add'    { Set-PolicyRegistryValue -Path $op.Path -Name $op.Name -Type $op.Type -Value $op.Value; $result.Added++;   Write-Log "SET $($op.Name) = $($op.Value)" 'OK' }
+                'Change' { Set-PolicyRegistryValue -Path $op.Path -Name $op.Name -Type $op.Type -Value $op.Value; $result.Changed++; Write-Log "SET $($op.Name) = $($op.Value) (was $($op.Old))" 'OK' }
+                'Clear'  { if (Remove-PolicyRegistryValue -Path $op.Path -Name $op.Name) { $result.Cleared++; Write-Log "CLEARED $($op.Name)" 'OK' } }
+                'Keep'   { $result.Kept++ }
+            }
+        } catch {
+            $result.Failures += "$($op.Name): $($_.Exception.Message)"
+            Write-Log "FAIL $($op.Name): $_" 'ERR'
+        }
+    }
+    foreach ($u in $Plan.UrlOps) {
+        try {
+            if (Test-Path -LiteralPath $u.Path) { Remove-Item -LiteralPath $u.Path -Recurse -Force -ErrorAction Stop }
+            if ($u.Want.Count -gt 0) {
+                New-Item -Path $u.Path -Force | Out-Null
+                $i = 1
+                foreach ($url in $u.Want) { New-ItemProperty -LiteralPath $u.Path -Name "$i" -Value $url -PropertyType String -Force | Out-Null; $i++ }
+            }
+            Write-Log "Startup URLs -> $($u.Want -join ', ')" 'OK'
+        } catch {
+            $result.Failures += "RestoreOnStartupURLs: $($_.Exception.Message)"
+            Write-Log "FAIL RestoreOnStartupURLs: $_" 'ERR'
+        }
+    }
+    foreach ($op in $Plan.System) {
+        try {
+            if ($op.Kind -eq 'Task') {
+                Set-BfoTaskEnabled -TaskInfo $op.Info -Enabled ($op.Action -eq 'Enable')
+            } else {
+                if ($op.Action -eq 'Disable') { Set-BfoServiceStartType -Name $op.Name -StartType 'Disabled' -StopIfRunning }
+                else { Set-BfoServiceStartType -Name $op.Name -StartType $(if ($op.Default) { $op.Default } else { 'Manual' }) }
+            }
+            $result.System++
+            Write-Log "$($op.Action.ToUpper()) $($op.Kind.ToLower()) $($op.Name)" 'OK'
+        } catch {
+            $result.Failures += "$($op.Kind) $($op.Name): $($_.Exception.Message)"
+            Write-Log "FAIL $($op.Kind) $($op.Name): $_" 'ERR'
+        }
+    }
+    return $result
+}
+
+# ---- Restore -----------------------------------------------------------------
+# Policy values in the key that this tool did not create (set by an administrator,
+# another tool, or Brave itself). A restore must not delete them silently.
+function Get-ForeignPolicyValues {
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    $managed = Get-ManagedPolicyNames
+    $foreign = @($snap.Values.Keys | Where-Object { $managed -notcontains $_ } | Sort-Object)
+    $extraSub = @($snap.SubKeys | Where-Object { $_ -ne 'RestoreOnStartupURLs' } | Sort-Object)
+    return [pscustomobject]@{ Values = $foreign; SubKeys = $extraSub; Count = ($foreign.Count + $extraSub.Count) }
+}
+
+function Invoke-FullRestore {
+    param([bool]$RemoveForeign = $false)
+    $failures = @()
+    $path = $script:PolicyKeyPath
+    try {
+        if (-not (Test-Path -LiteralPath $path)) { Write-Log 'No Brave policy key found - nothing to remove.' 'INFO' }
+        elseif ($RemoveForeign) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            Write-Log 'Removed the whole Brave policy key.' 'OK'
+        } else {
+            $snap = Read-PolicySnapshot -Path $path
+            $managed = Get-ManagedPolicyNames
+            foreach ($name in $snap.Values.Keys) {
+                if ($managed -contains $name) { Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop }
+            }
+            $urls = Join-Path $path 'RestoreOnStartupURLs'
+            if (Test-Path -LiteralPath $urls) { Remove-Item -LiteralPath $urls -Recurse -Force -ErrorAction Stop }
+            # An empty key adds nothing but the "managed" banner, so drop it.
+            $left = Read-PolicySnapshot -Path $path
+            if ($left.Values.Count -eq 0 -and $left.SubKeys.Count -eq 0) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+            Write-Log 'Removed this tool''s policies.' 'OK'
+        }
+    } catch {
+        $failures += "policies: $($_.Exception.Message)"
+        Write-Log "Restore policy remove: $_" 'ERR'
+    }
+    # Versions 1.5-1.12 also wrote per-channel keys that Brave never reads. They
+    # do no harm, but a restore should leave nothing of ours behind.
+    foreach ($legacy in $script:LegacyPolicyKeys) {
+        $legacyPath = Get-PolicyHivePath $legacy
+        try {
+            if (Test-Path -LiteralPath $legacyPath) { Remove-Item -LiteralPath $legacyPath -Recurse -Force -ErrorAction Stop; Write-Log "Removed legacy key $legacy." 'OK' }
+        } catch { $failures += "legacy $legacy : $($_.Exception.Message)"; Write-Log "Restore legacy key ${legacy}: $_" 'WARN' }
+    }
+    if (@(Get-HostsManagedDomains).Count -gt 0) {
+        try { Set-HostsManagedDomains -Domains @(); Write-Log 'Hosts block removed.' 'OK' }
+        catch { $failures += "hosts: $($_.Exception.Message)"; Write-Log "Restore hosts clear: $_" 'ERR' }
+    }
+    # Only undo what this tool could have done: re-enable updater pieces that
+    # are currently disabled.
+    foreach ($def in $script:UpdaterTaskDefs) {
+        foreach ($t in (Find-BfoTasks -Pattern $def.Pattern -Refresh)) {
+            if ($t.State -eq 'Disabled') {
+                try { Set-BfoTaskEnabled -TaskInfo $t -Enabled $true; Write-Log "ENABLED task $($t.Name)" 'OK' }
+                catch { $failures += "task $($t.Name): $($_.Exception.Message)"; Write-Log "Restore task $($t.Name): $_" 'WARN' }
+            }
+        }
+    }
+    $toReset = @()
+    foreach ($def in $script:UpdaterServiceDefs) {
+        foreach ($svc in (Find-BfoUpdaterServices -Id $def.Id)) { $toReset += [pscustomobject]@{ Name = $svc.Name; StartType = "$($svc.StartType)"; Default = $def.Default } }
+    }
+    foreach ($def in $script:RestoreOnlyServices) {
+        $svc = Get-BfoService -Name $def.Name
+        if ($svc) { $toReset += [pscustomobject]@{ Name = $def.Name; StartType = "$($svc.StartType)"; Default = $def.Default } }
+    }
+    foreach ($r in $toReset) {
+        if ($r.StartType -ne 'Disabled') { continue }
+        try { Set-BfoServiceStartType -Name $r.Name -StartType $r.Default; Write-Log "RESET service $($r.Name) to $($r.Default)" 'OK' }
+        catch { $failures += "service $($r.Name): $($_.Exception.Message)"; Write-Log "Restore service $($r.Name): $_" 'WARN' }
+    }
+    return $failures
+}
+
+# ---- Presets -----------------------------------------------------------------
+function Get-PresetSelection {
+    param([string]$Preset)
+    $sel = [pscustomobject]@{ Policies = @(); Hosts = @() }
+    $code = $script:PresetCodes[$Preset]
+    if ($code) {
+        $sel.Policies = @($script:PolicyByName.Values | Where-Object { $_.Presets.Contains($code) } | ForEach-Object { $_.Name })
+        if ($script:PresetHosts.ContainsKey($Preset)) { $sel.Hosts = @($script:PresetHosts[$Preset]) }
+    }
+    return $sel
+}
+
+# Presets set the policy and hosts ticks only. The updater tasks/services are
+# never touched by a preset (disabling them stops security updates), and the
+# search/new-tab/startup overrides are never touched either.
+function Set-PresetChecks {
+    param([string]$Preset)
+    $sel = Get-PresetSelection -Preset $Preset
+    foreach ($item in $script:Items) {
+        if ($item.Kind -eq 'Policy') { Set-ItemChecked $item ($sel.Policies -contains $item.Id) }
+        elseif ($item.Kind -eq 'Host') { Set-ItemChecked $item ($sel.Hosts -contains $item.Id) }
+    }
+    $script:ActiveProfile = $Preset
+}
+
+# ---- Config export / import ---------------------------------------------------
+$script:ConfigSchema = 3
+function New-ConfigObject {
+    $cfg = [ordered]@{
+        schemaVersion = $script:ConfigSchema
+        appVersion    = $script:AppVersion
+        exported      = (Get-Date -Format 's')
+        profile       = $script:ActiveProfile
+        policies      = [ordered]@{}
+        policyValues  = [ordered]@{}
+        tasks         = [ordered]@{}
+        services      = [ordered]@{}
+        hosts         = [ordered]@{}
+        search  = [ordered]@{ enabled = [bool]$script:Overrides.Search.Enabled;  engineId = "$($script:Overrides.Search.EngineId)"; customUrl = "$($script:Overrides.Search.CustomUrl)" }
+        ntp     = [ordered]@{ enabled = [bool]$script:Overrides.Ntp.Enabled;     destinationId = "$($script:Overrides.Ntp.DestinationId)"; customUrl = "$($script:Overrides.Ntp.CustomUrl)" }
+        startup = [ordered]@{ enabled = [bool]$script:Overrides.Startup.Enabled; modeId = "$($script:Overrides.Startup.ModeId)"; urls = "$($script:Overrides.Startup.Urls)" }
+    }
+    foreach ($item in $script:Items) {
+        switch ($item.Kind) {
+            'Policy'  { $cfg.policies[$item.Id] = [bool]$item.Checked; if ($item.Def.Choices) { $cfg.policyValues[$item.Id] = $item.Value } }
+            'Task'    { $cfg.tasks[$item.Id]    = [bool]$item.Checked }
+            'Service' { $cfg.services[$item.Id] = [bool]$item.Checked }
+            'Host'    { $cfg.hosts[$item.Id]    = [bool]$item.Checked }
+        }
+    }
+    return $cfg
+}
+
+function ConvertTo-BoolStrict {
+    param($Value)
+    if ($Value -is [bool]) { return $Value }
+    if ($Value -is [string]) { return ($Value.Trim().ToLowerInvariant() -in @('true', '1', 'yes')) }
+    return [bool]$Value
+}
+
+# Applies a parsed config to the item list. Unknown names are skipped (a config
+# from an older version may mention a policy that no longer exists) and counted.
+function Import-ConfigObject {
+    param($Cfg)
+    $unknown = 0
+    if ($Cfg.policies) {
+        foreach ($p in $Cfg.policies.PSObject.Properties) {
+            $item = Get-BfoItem 'Policy' $p.Name
+            if ($item) { Set-ItemChecked $item (ConvertTo-BoolStrict $p.Value) } else { $unknown++ }
+        }
+    }
+    if ($Cfg.policyValues) {
+        foreach ($p in $Cfg.policyValues.PSObject.Properties) {
+            $item = Get-BfoItem 'Policy' $p.Name
+            if ($item -and $item.Def.Choices) {
+                foreach ($cid in $item.Def.Choices.Keys) { if ("$($item.Def.Choices[$cid])" -eq "$($p.Value)") { Set-ItemChoice $item $cid; break } }
+            }
+        }
+    }
+    $legacyTasks = @{ 'BraveSoftwareUpdateTaskMachineCore' = 'core'; 'BraveSoftwareUpdateTaskMachineUA' = 'ua' }
+    if ($Cfg.tasks) {
+        foreach ($p in $Cfg.tasks.PSObject.Properties) {
+            $id = if ($legacyTasks.ContainsKey($p.Name)) { $legacyTasks[$p.Name] } else { $p.Name }
+            $item = Get-BfoItem 'Task' $id
+            if ($item) { Set-ItemChecked $item (ConvertTo-BoolStrict $p.Value); $item.Loaded = $true } else { $unknown++ }
+        }
+    }
+    if ($Cfg.services) {
+        foreach ($p in $Cfg.services.PSObject.Properties) {
+            $item = Get-BfoItem 'Service' $p.Name
+            if ($item) { Set-ItemChecked $item (ConvertTo-BoolStrict $p.Value); $item.Loaded = $true } else { $unknown++ }
+        }
+    }
+    if ($Cfg.hosts) {
+        foreach ($p in $Cfg.hosts.PSObject.Properties) {
+            $id = if ($script:LegacyHostsIds.ContainsKey($p.Name)) { $script:LegacyHostsIds[$p.Name] } else { $p.Name }
+            $item = Get-BfoItem 'Host' $id
+            if ($item) { Set-ItemChecked $item (ConvertTo-BoolStrict $p.Value) } else { $unknown++ }
+        }
+    }
+    if ($Cfg.search) {
+        $script:Overrides.Search.Enabled = ConvertTo-BoolStrict $Cfg.search.enabled
+        $id = if ($Cfg.search.engineId) { "$($Cfg.search.engineId)" } elseif ($Cfg.search.engine -and $script:LegacySearchEngineIds.ContainsKey("$($Cfg.search.engine)")) { $script:LegacySearchEngineIds["$($Cfg.search.engine)"] } else { $null }
+        if ($id -and $script:SearchEngines.Contains($id)) { $script:Overrides.Search.EngineId = $id }
+        if ($Cfg.search.customUrl) { $script:Overrides.Search.CustomUrl = "$($Cfg.search.customUrl)" }
+    }
+    if ($Cfg.ntp) {
+        $script:Overrides.Ntp.Enabled = ConvertTo-BoolStrict $Cfg.ntp.enabled
+        $id = if ($Cfg.ntp.destinationId) { "$($Cfg.ntp.destinationId)" } elseif ($Cfg.ntp.destination -and $script:LegacyDestinationIds.ContainsKey("$($Cfg.ntp.destination)")) { $script:LegacyDestinationIds["$($Cfg.ntp.destination)"] } else { $null }
+        if ($id -and $script:DestinationOptions.Contains($id) -and $id -ne 'ntpDefault') { $script:Overrides.Ntp.DestinationId = $id }
+        if ($Cfg.ntp.customUrl) { $script:Overrides.Ntp.CustomUrl = "$($Cfg.ntp.customUrl)" }
+    }
+    if ($Cfg.startup) {
+        $script:Overrides.Startup.Enabled = ConvertTo-BoolStrict $Cfg.startup.enabled
+        $id = if ($Cfg.startup.modeId) { "$($Cfg.startup.modeId)" } elseif ($Cfg.startup.mode -and $script:LegacyStartupModeIds.ContainsKey("$($Cfg.startup.mode)")) { $script:LegacyStartupModeIds["$($Cfg.startup.mode)"] } else { $null }
+        if ($id -and $script:StartupModes.Contains($id)) { $script:Overrides.Startup.ModeId = $id }
+        if ($Cfg.startup.urls) { $script:Overrides.Startup.Urls = "$($Cfg.startup.urls)" }
+    }
+    $script:ActiveProfile = if ($Cfg.profile -and ($script:AllPresetKeys -contains "$($Cfg.profile)")) { "$($Cfg.profile)" } else { 'Custom' }
+    return $unknown
+}
+#endregion
+
+
+#region Model: item state, loading, reports ------------------------------------
+function Set-ItemChecked {
+    param($Item, [bool]$Checked)
+    $Item.Checked = $Checked
+    if ($Item.Row) { Update-ItemView $Item }
+}
+
+function Set-ItemChoice {
+    param($Item, [string]$ChoiceId)
+    if (-not $Item.Def.Choices -or -not $Item.Def.Choices.Contains($ChoiceId)) { return }
+    $Item.Value = $Item.Def.Choices[$ChoiceId]
+    if ($Item.Row) { Update-ItemView $Item }
+}
+
+function Get-ItemChoiceId {
+    param($Item)
+    if (-not $Item.Def.Choices) { return $null }
+    foreach ($cid in $Item.Def.Choices.Keys) { if ("$($Item.Def.Choices[$cid])" -eq "$($Item.Value)") { return $cid } }
+    return @($Item.Def.Choices.Keys)[0]
+}
+
+# Loads what is really configured on this PC into the ticks: a policy is ticked
+# when its value in the registry is the one this tool would write.
+function Import-CurrentPolicyState {
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    $script:Snapshot = $snap
+    foreach ($item in $script:Items) {
+        if ($item.Kind -ne 'Policy') { continue }
+        $has = $snap.Values.ContainsKey($item.Id)
+        if ($item.Def.Choices) {
+            if ($has) {
+                foreach ($cid in $item.Def.Choices.Keys) { if ("$($item.Def.Choices[$cid])" -eq "$($snap.Values[$item.Id])") { $item.Value = $item.Def.Choices[$cid]; break } }
+            }
+            Set-ItemChecked $item $has
+        } else {
+            Set-ItemChecked $item ($has -and "$($snap.Values[$item.Id])" -eq "$($item.Def.Value)")
+        }
+    }
+
+    # Overrides: ticked only when the registry holds a value that maps back to
+    # one of the choices this tool offers (otherwise it is a foreign setting).
+    $so = $script:Overrides
+    $so.Search.Enabled = $false; $so.Ntp.Enabled = $false; $so.Startup.Enabled = $false
+    if ($snap.Values['DefaultSearchProviderEnabled'] -eq 1 -and $snap.Values.ContainsKey('DefaultSearchProviderSearchURL')) {
+        $url = "$($snap.Values['DefaultSearchProviderSearchURL'])"
+        $so.Search.Enabled = $true
+        $matched = $false
+        foreach ($id in $script:SearchEngines.Keys) {
+            if (-not $script:SearchEngines[$id].IsCustom -and $script:SearchEngines[$id].URL -eq $url) { $so.Search.EngineId = $id; $matched = $true; break }
+        }
+        if (-not $matched) { $so.Search.EngineId = 'custom'; $so.Search.CustomUrl = $url }
+    }
+    if ($snap.Values.ContainsKey('NewTabPageLocation')) {
+        $so.Ntp.Enabled = $true
+        $ntp = "$($snap.Values['NewTabPageLocation'])"
+        $matched = $false
+        foreach ($id in $script:DestinationIds) {
+            if ($script:DestinationOptions[$id].Value -eq $ntp) { $so.Ntp.DestinationId = $id; $matched = $true; break }
+        }
+        if (-not $matched) { $so.Ntp.DestinationId = 'custom'; $so.Ntp.CustomUrl = $ntp }
+    }
+    if ($snap.Values.ContainsKey('RestoreOnStartup')) {
+        $so.Startup.Enabled = $true
+        $code = [int]$snap.Values['RestoreOnStartup']
+        foreach ($id in $script:StartupModeIds) {
+            $mode = $script:StartupModes[$id]
+            if ($mode.Code -ne $code) { continue }
+            # Code 4 covers both "blank page" and "specific pages": tell them apart by URL.
+            if ($mode.FixedURL -and (@($snap.Urls).Count -ne 1 -or $snap.Urls[0] -ne $mode.FixedURL)) { continue }
+            $so.Startup.ModeId = $id; break
+        }
+        if ($snap.Urls.Count -gt 0) { $so.Startup.Urls = ($snap.Urls -join ', ') }
+    }
+    Import-CurrentHostsState
+    $script:ActiveProfile = 'CurrentState'
+}
+
+# The hosts file is read once and cached: row status is recomputed on every
+# tick, and re-reading a system file for each row would be wasteful.
+$script:HostsCurrent = @()
+function Update-HostsCache { $script:HostsCurrent = @(Get-HostsManagedDomains) }
+
+function Import-CurrentHostsState {
+    Update-HostsCache
+    $current = @($script:HostsCurrent)
+    foreach ($item in $script:Items) {
+        if ($item.Kind -ne 'Host') { continue }
+        $all = $true
+        foreach ($d in $item.Def.Domains) { if ($current -notcontains $d) { $all = $false; break } }
+        Set-ItemChecked $item $all
+    }
+}
+
+# Updater tasks and services are read on demand (enumerating scheduled tasks
+# takes about a second) and remembered as the baseline: only rows the user
+# changes afterwards take part in Apply.
+function Import-CurrentSystemState {
+    param([switch]$Refresh)
+    foreach ($item in $script:Items) {
+        if ($item.Kind -eq 'Task') {
+            $found = @(Find-BfoTasks -Pattern $item.Def.Pattern -Refresh:$Refresh)
+            $item.Detail = $found.Count
+            $item.Baseline = ($found.Count -gt 0 -and @($found | Where-Object { $_.State -ne 'Disabled' }).Count -eq 0)
+            $item.Loaded = $true
+            Set-ItemChecked $item $item.Baseline
+        } elseif ($item.Kind -eq 'Service') {
+            $found = @(Find-BfoUpdaterServices -Id $item.Id)
+            $item.Detail = $found.Count
+            $item.Baseline = ($found.Count -gt 0 -and @($found | Where-Object { "$($_.StartType)" -ne 'Disabled' }).Count -eq 0)
+            $item.Loaded = $true
+            Set-ItemChecked $item $item.Baseline
+        }
+    }
+}
+
+# ---- Status of one row -------------------------------------------------------
+# The vocabulary matches the Preview report, so a row and the report can never
+# disagree: Active / Will apply / Will change / Will remove / Not set.
+function Get-ItemState {
+    param($Item)
+    switch ($Item.Kind) {
+        'Policy' {
+            $snap = $script:Snapshot
+            $has = ($snap -and $snap.Values.ContainsKey($Item.Id))
+            if ($Item.Checked) {
+                if (-not $has) { return 'willApply' }
+                if ("$($snap.Values[$Item.Id])" -eq "$($Item.Value)" -and $snap.Kinds[$Item.Id] -eq $(if ($Item.Def.Type -eq 'DWORD') { 'DWord' } else { 'String' })) { return 'active' }
+                return 'willChange'
+            }
+            if ($has) { return 'willRemove' }
+            return 'notSet'
+        }
+        'Task' {
+            if (-not $Item.Loaded) { return 'unknown' }
+            if ($Item.Detail -eq 0) { return 'missing' }
+            if ($Item.Checked -eq $Item.Baseline) { return $(if ($Item.Checked) { 'disabled' } else { 'enabled' }) }
+            return $(if ($Item.Checked) { 'willDisable' } else { 'willEnable' })
+        }
+        'Service' {
+            if (-not $Item.Loaded) { return 'unknown' }
+            if ($Item.Detail -eq 0) { return 'missing' }
+            if ($Item.Checked -eq $Item.Baseline) { return $(if ($Item.Checked) { 'disabled' } else { 'enabled' }) }
+            return $(if ($Item.Checked) { 'willDisable' } else { 'willEnable' })
+        }
+        'Host' {
+            $current = @($script:HostsCurrent)
+            $all = $true; $any = $false
+            foreach ($d in $Item.Def.Domains) { if ($current -contains $d) { $any = $true } else { $all = $false } }
+            if ($Item.Checked) { return $(if ($all) { 'blocked' } else { 'willBlock' }) }
+            return $(if ($any) { 'willUnblock' } else { 'notBlocked' })
+        }
+    }
+    return 'unknown'
+}
+
+# ---- Reports (English on purpose: they get pasted into bug reports) ----------
+function New-ApplyPlanReport {
+    param($Plan)
+    $r = New-Object System.Text.StringBuilder
+    $mode = if ($script:ActiveProfile) { $script:ActiveProfile } else { 'Custom' }
+    [void]$r.AppendLine("Brave Free Origin v$($script:AppVersion) apply preview")
+    [void]$r.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$r.AppendLine("Mode: $(TEn "preset.$mode.name")")
+    [void]$r.AppendLine("Policy key: $($script:PolicyKeyPath)  (shared by every Brave channel)")
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine('This is a dry run. Nothing has been written.')
+    [void]$r.AppendLine('')
+    foreach ($op in $Plan.Registry) {
+        switch ($op.Action) {
+            'Add'    { [void]$r.AppendLine("  ADD    $($op.Name) = $($op.Value)") }
+            'Change' { [void]$r.AppendLine("  CHANGE $($op.Name) : $($op.Old) -> $($op.Value)") }
+            'Keep'   { [void]$r.AppendLine("  KEEP   $($op.Name) = $($op.Value)") }
+            'Clear'  {
+                $note = if ($script:LegacyPolicyNames -contains $op.Name) { '  - leftover from an older version of this tool' } else { '' }
+                [void]$r.AppendLine("  CLEAR  $($op.Name) (currently $($op.Old))$note")
+            }
+        }
+    }
+    foreach ($u in $Plan.UrlOps) {
+        if ($u.Want.Count -gt 0) { [void]$r.AppendLine("  REPLACE RestoreOnStartupURLs with $($u.Want.Count) URL(s): $($u.Want -join ', ')") }
+        else { [void]$r.AppendLine("  CLEAR  RestoreOnStartupURLs ($($u.Have.Count) URL(s))") }
+    }
+    [void]$r.AppendLine("  Summary: $($Plan.Counts.Add) add, $($Plan.Counts.Change) change, $($Plan.Counts.Clear) clear, $($Plan.Counts.Keep) already correct")
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine('=== Updater tasks and services ===')
+    if ($Plan.System.Count -eq 0) { [void]$r.AppendLine('  No change requested.') }
+    foreach ($op in $Plan.System) { [void]$r.AppendLine("  $($op.Action.ToUpper().PadRight(8)) $($op.Kind.ToLower()) $($op.Name)") }
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine('=== Hosts blocklist ===')
+    [void]$r.AppendLine('Apply does not edit hosts. Use Preview hosts / Apply hosts blocks on the Hosts page.')
+    return $r.ToString()
+}
+
+function New-HostsPlanReport {
+    $desired = @(Get-SelectedHostsDomains)
+    $current = @(Get-HostsManagedDomains)
+    $r = New-Object System.Text.StringBuilder
+    [void]$r.AppendLine('Brave Free Origin hosts preview')
+    [void]$r.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$r.AppendLine("File: $($script:HostsFile)")
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine("Current managed domains: $($current.Count)")
+    [void]$r.AppendLine("Desired managed domains: $($desired.Count)")
+    [void]$r.AppendLine('')
+    $add = @($desired | Where-Object { $current -notcontains $_ })
+    $keep = @($desired | Where-Object { $current -contains $_ })
+    $remove = @($current | Where-Object { $desired -notcontains $_ })
+    [void]$r.AppendLine("Add: $($add.Count)");                            foreach ($d in $add)    { [void]$r.AppendLine("  + $d") }
+    [void]$r.AppendLine("Keep: $($keep.Count)");                          foreach ($d in $keep)   { [void]$r.AppendLine("  = $d") }
+    [void]$r.AppendLine("Remove from managed block: $($remove.Count)");  foreach ($d in $remove) { [void]$r.AppendLine("  - $d") }
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine('No other hosts entries are touched. Only the Brave-Free-Origin sentinel block is replaced.')
+    return $r.ToString()
+}
+
+function Get-SelectedHostsDomains {
+    $domains = @()
+    foreach ($item in $script:Items) { if ($item.Kind -eq 'Host' -and $item.Checked) { $domains += $item.Def.Domains } }
+    return @($domains | Sort-Object -Unique)
+}
+
+function New-VerifyReport {
+    $r = New-Object System.Text.StringBuilder
+    [void]$r.AppendLine("Brave Free Origin v$($script:AppVersion) verify report")
+    [void]$r.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    [void]$r.AppendLine("Policy catalog checked against Brave $($script:CatalogBrave) on $($script:CatalogDate)")
+    foreach ($ch in (Get-DetectedChannels)) {
+        $info = Get-BraveInfo -Channel $ch
+        [void]$r.AppendLine("Installed: $ch $($info.Version) ($($info.Scope) install)")
+    }
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine("=== $($script:PolicyKeyPath) ===")
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    if (-not $snap.Exists) {
+        [void]$r.AppendLine('  (no policy key exists - nothing applied)')
+    } else {
+        $ok = 0; $missing = @(); $wrong = @(); $ticked = 0
+        foreach ($item in $script:Items) {
+            if ($item.Kind -ne 'Policy' -or -not $item.Checked) { continue }
+            $ticked++
+            if (-not $snap.Values.ContainsKey($item.Id)) { $missing += $item.Id; continue }
+            if ("$($snap.Values[$item.Id])" -eq "$($item.Value)") { $ok++ }
+            else { $wrong += "$($item.Id): registry=$($snap.Values[$item.Id]), expected=$($item.Value)" }
+        }
+        [void]$r.AppendLine("  Ticked in UI: $ticked")
+        [void]$r.AppendLine("  Match in registry: $ok")
+        [void]$r.AppendLine("  Missing (not in registry): $($missing.Count)")
+        [void]$r.AppendLine("  Mismatch (wrong value): $($wrong.Count)")
+        if ($missing.Count) { [void]$r.AppendLine('  -- missing:'); foreach ($n in $missing) { [void]$r.AppendLine("     - $n") } }
+        if ($wrong.Count)   { [void]$r.AppendLine('  -- mismatch:'); foreach ($n in $wrong) { [void]$r.AppendLine("     - $n") } }
+        $leftovers = @($snap.Values.Keys | Where-Object { $script:LegacyPolicyNames -contains $_ } | Sort-Object)
+        if ($leftovers.Count -gt 0) {
+            [void]$r.AppendLine("  Leftovers from older versions of this tool: $($leftovers.Count) (Apply or Restore stock removes them)")
+            foreach ($n in $leftovers) { [void]$r.AppendLine("     - $n") }
+        }
+        $foreign = Get-ForeignPolicyValues
+        if ($foreign.Count -gt 0) {
+            [void]$r.AppendLine("  Other Brave policies present that this tool does not manage: $($foreign.Count)")
+            foreach ($n in $foreign.Values) { [void]$r.AppendLine("     - $n") }
+            foreach ($n in $foreign.SubKeys) { [void]$r.AppendLine("     - (subkey) $n") }
+        }
+        if ($snap.Values.ContainsKey('DefaultSearchProviderEnabled') -and $snap.Values['DefaultSearchProviderEnabled'] -eq 1) {
+            [void]$r.AppendLine("  Search engine forced: $($snap.Values['DefaultSearchProviderName']) ($($snap.Values['DefaultSearchProviderSearchURL']))")
+        }
+        if ($snap.Values.ContainsKey('NewTabPageLocation')) { [void]$r.AppendLine("  New tab page forced: $($snap.Values['NewTabPageLocation'])") }
+        if ($snap.Values.ContainsKey('RestoreOnStartup')) {
+            $extra = if ($snap.Urls.Count -gt 0) { " URLs: $($snap.Urls -join ', ')" } else { '' }
+            [void]$r.AppendLine("  Startup forced: code $($snap.Values['RestoreOnStartup'])$extra")
+        }
+    }
+    foreach ($legacy in $script:LegacyPolicyKeys) {
+        if (Test-Path -LiteralPath (Get-PolicyHivePath $legacy)) {
+            [void]$r.AppendLine("  Note: legacy key $legacy exists (written by Brave Free Origin 1.5-1.12; Brave does not read it).")
+        }
+    }
+    $hosts = @(Get-HostsManagedDomains)
+    [void]$r.AppendLine('')
+    [void]$r.AppendLine('=== Hosts blocklist ===')
+    [void]$r.AppendLine("  Currently blocked domains: $($hosts.Count)")
+    foreach ($d in $hosts) { [void]$r.AppendLine("     - $d") }
+    return $r.ToString()
+}
+#endregion
+
+
+#region Scriptlets: logic ---------------------------------------------------------------
+# State for the optional expert tool. The UI lives in the Scriptlets page; this is
+# the scanner, the renderer and the rule editing, which the page only calls.
 $script:ScriptletDisablePrefix = '! BFO disabled: '
 $script:ScriptletRules = @()
 $script:ScriptletVisibleRules = @()
@@ -1226,887 +2821,33 @@ $script:ScriptletComponentNames = @{
     'flnkmpokemfpaajmiimmjeiandgoodgg' = 'AdGuard French'
 }
 
-function Get-DetectedChannels {
-    $found = @()
-    foreach ($name in $script:Channels.Keys) {
-        foreach ($probe in $script:Channels[$name].InstallProbes) {
-            if (Test-Path $probe) { $found += $name; break }
-        }
-    }
-    return $found
-}
-
-#region Policy Data -----------------------------------------------------------
-# Each policy: Name (registry value name, never translated), Type (DWORD/STRING),
-#              ApplyValue (what to write when ticked), Recommended, MaxPrivacy.
-# Human-readable text lives in the string catalog under 'policy.<Name>.description'
-# so it can be localized without ever touching the technical identifiers.
-$script:Policies = [ordered]@{
-    'braveFeatures' = @(
-        @{Name='HardwareAccelerationModeEnabled'; Type='DWORD'; ApplyValue=1; Recommended=$true;  MaxPrivacy=$true;  Choices=([ordered]@{'enable'=1; 'disable'=0})},
-        @{Name='BraveRewardsDisabled';         Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveWalletDisabled';          Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveVPNDisabled';             Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveAIChatEnabled';           Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveNewsDisabled';            Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveTalkDisabled';            Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveWaybackMachineEnabled';   Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$true},
-        @{Name='BravePlaylistEnabled';         Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false},
-        @{Name='BraveSpeedreaderEnabled';      Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false},
-        @{Name='TorDisabled';                  Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$false},
-        @{Name='IPFSEnabled';                  Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='WebTorrentDisabled';           Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true}
-    )
-    'privacyTelemetry' = @(
-        @{Name='BraveP3AEnabled';                             Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveStatsPingEnabled';                       Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveWebDiscoveryEnabled';                    Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='MetricsReportingEnabled';                     Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveGlobalPrivacyControlEnabled';            Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveReduceLanguageEnabled';                  Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveTrackingQueryParametersFilteringEnabled';Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveDeAmpEnabled';                           Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BraveDebouncingEnabled';                      Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='DefaultBraveFingerprintingV2Setting';         Type='DWORD';  ApplyValue=3; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='DefaultBraveAdblockSetting';                  Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='DefaultBraveHttpsUpgradeSetting';             Type='DWORD';  ApplyValue=2; Recommended=$false; MaxPrivacy=$true},
-        @{Name='DefaultBraveReferrersSetting';                Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='DefaultBraveRemember1PStorageSetting';        Type='DWORD';  ApplyValue=2; Recommended=$false; MaxPrivacy=$true},
-        @{Name='ChromeVariations';                            Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='CloudReportingEnabled';                       Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='UserFeedbackAllowed';                         Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true}
-    )
-    'autofillPasswords' = @(
-        @{Name='PasswordManagerEnabled';        Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='PasswordLeakDetectionEnabled';  Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='AutofillAddressEnabled';        Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='AutofillCreditCardEnabled';     Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='PaymentMethodQueryEnabled';     Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='AutoplayAllowed';               Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$true}
-    )
-    'searchSuggestions' = @(
-        @{Name='SearchSuggestEnabled';                        Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='UrlKeyedAnonymizedDataCollectionEnabled';     Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='SpellCheckServiceEnabled';                    Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='SpellcheckEnabled';                           Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false},
-        @{Name='TranslateEnabled';                            Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='AlternateErrorPagesEnabled';                  Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true}
-    )
-    'safetyUpdates' = @(
-        @{Name='SafeBrowsingProtectionLevel';         Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$false},
-        @{Name='SafeBrowsingExtendedReportingEnabled';Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='SafeBrowsingDeepScanningEnabled';     Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='SafeBrowsingSurveysEnabled';          Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ComponentUpdatesEnabled';             Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false},
-        @{Name='DefaultBrowserSettingEnabled';        Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ChromeCleanupEnabled';                Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ChromeCleanupReportingEnabled';       Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true}
-    )
-    'aiGenAi' = @(
-        @{Name='GenAiDefaultSettings';      Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='HelpMeWriteSettings';       Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='TabOrganizerSettings';      Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='CreateThemesSettings';      Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='HistorySearchSettings';     Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='DevToolsGenAiSettings';     Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true}
-    )
-    'webServicesBackground' = @(
-        @{Name='BackgroundModeEnabled';           Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='NetworkPredictionOptions';        Type='DWORD';  ApplyValue=2; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='CloudPrintSubmitEnabled';         Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BuiltInDnsClientEnabled';         Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false},
-        @{Name='DnsOverHttpsMode';                Type='STRING'; ApplyValue='automatic'; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='WebRtcEventLogCollectionAllowed'; Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='SyncDisabled';                    Type='DWORD';  ApplyValue=1; Recommended=$false; MaxPrivacy=$true},
-        @{Name='SigninAllowed';                   Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$true},
-        @{Name='BrowserSignin';                   Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$true},
-        @{Name='PromotionalTabsEnabled';          Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='WelcomePageOnOSUpgradeEnabled';   Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ImportAutofillFormData';          Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ImportBookmarks';                 Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$true},
-        @{Name='ImportHistory';                   Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ImportSavedPasswords';            Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ImportSearchEngine';              Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$true}
-    )
-    'performanceStartup' = @(
-        @{Name='QuicAllowed';                     Type='DWORD';  ApplyValue=1;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='HighEfficiencyModeEnabled';       Type='DWORD';  ApplyValue=1;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='BatterySaverModeAvailability';    Type='DWORD';  ApplyValue=2;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='MediaRouterEnabled';              Type='DWORD';  ApplyValue=0;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='DiskCacheSize';                   Type='DWORD';  ApplyValue=262144000;  Recommended=$true;  MaxPrivacy=$false},
-        @{Name='BrowserLabsEnabled';              Type='DWORD';  ApplyValue=0;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='RestoreOnStartup';                Type='DWORD';  ApplyValue=5;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='HomepageIsNewTabPage';            Type='DWORD';  ApplyValue=0;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='HomepageLocation';                Type='STRING'; ApplyValue='about:blank'; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='NewTabPageLocation';              Type='STRING'; ApplyValue='about:blank'; Recommended=$false; MaxPrivacy=$true},
-        @{Name='NTPCustomBackgroundEnabled';      Type='DWORD';  ApplyValue=0;          Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ShowHomeButton';                  Type='DWORD';  ApplyValue=0;          Recommended=$false; MaxPrivacy=$false}
-    )
-    'uiBloatExtras' = @(
-        @{Name='LiveCaptionEnabled';              Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='AccessibilityImageLabelsEnabled'; Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='LensDesktopNTPSearchEnabled';     Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='LensRegionSearchEnabled';         Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='LensOverlaySettings';             Type='DWORD';  ApplyValue=1; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='ReadingListEnabled';              Type='DWORD';  ApplyValue=0; Recommended=$true;  MaxPrivacy=$true},
-        @{Name='PromptForDownloadLocation';       Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false},
-        @{Name='BookmarkBarEnabled';              Type='DWORD';  ApplyValue=0; Recommended=$false; MaxPrivacy=$false}
-    )
-}
-
-# Task / service descriptions live under task.<Name>.description and
-# service.<Name>.description in the string catalog.
-$script:ScheduledTasks = @(
-    @{Name='BraveSoftwareUpdateTaskMachineCore'},
-    @{Name='BraveSoftwareUpdateTaskMachineUA'}
-)
-
-$script:Services = @(
-    @{Name='brave'},
-    @{Name='bravem'},
-    @{Name='BraveElevationService'},
-    @{Name='BraveVPNService'},
-    @{Name='BraveVpnWireguardService'}
-)
-
-# ---- Hosts blocklist groups (v1.5, ID-keyed since v1.12) --------------------
-# DNS-level kill switch via the Windows hosts file. Conservative on purpose -
-# only the safest groups are pre-ticked. Id is the stable key used by presets
-# and by exported configs; the visible name is a translatable string.
-$script:HostsBlocks = @(
-    @{Id='p3a'; NameKey='hosts.p3a.name'; DescriptionKey='hosts.p3a.description'; Recommended=$true; Domains=@('p3a.brave.com', 'p3a-creative.brave.com', 'p2a.brave.com', 'p2a-creative.brave.com')},
-    @{Id='variations'; NameKey='hosts.variations.name'; DescriptionKey='hosts.variations.description'; Recommended=$true; Domains=@('variations.brave.com', 'go-updater.brave.com')},
-    @{Id='stats'; NameKey='hosts.stats.name'; DescriptionKey='hosts.stats.description'; Recommended=$true; Domains=@('laptop-updates.brave.com')},
-    @{Id='rewards'; NameKey='hosts.rewards.name'; DescriptionKey='hosts.rewards.description'; Recommended=$false; Domains=@('rewards.brave.com', 'grant.rewards.brave.com', 'creators.brave.com')},
-    @{Id='news'; NameKey='hosts.news.name'; DescriptionKey='hosts.news.description'; Recommended=$false; Domains=@('brave-today-cdn.brave.com', 'brave-today.brave.com')},
-    @{Id='components'; NameKey='hosts.components.name'; DescriptionKey='hosts.components.description'; Recommended=$false; Domains=@('componentupdater.brave.com', 'brave-core-ext.s3.brave.com')},
-    @{Id='webDiscovery'; NameKey='hosts.webDiscovery.name'; DescriptionKey='hosts.webDiscovery.description'; Recommended=$false; Domains=@('search.anonymous.brave.com', 'wdp.brave.com')}
-)
-$script:HostsSentinelStart = '# === Brave-Free-Origin START - managed block, do not edit between sentinels ==='
-$script:HostsSentinelEnd   = '# === Brave-Free-Origin END ==='
-$script:HostsFile = "$env:WINDIR\System32\drivers\etc\hosts"
-
-# ---- Search engines (v1.6, ID-keyed since v1.12) ---------------------------
-# {searchTerms} is the standard Chromium placeholder Brave fills in.
-# Brand names are NOT translated; only the "Custom..." entry has a real label.
-$script:SearchEngines = [ordered]@{
-    'brave'       = @{ LabelKey='engine.brave'; ProviderName='Brave Search'; URL='https://search.brave.com/search?q={searchTerms}';     Suggest='https://search.brave.com/api/suggest?q={searchTerms}';                       Keyword='brave';     Home='https://search.brave.com' }
-    'duckduckgo'  = @{ LabelKey='engine.duckduckgo'; ProviderName='DuckDuckGo'; URL='https://duckduckgo.com/?q={searchTerms}';             Suggest='https://duckduckgo.com/ac/?q={searchTerms}&type=list';                      Keyword='ddg';       Home='https://duckduckgo.com' }
-    'startpage'   = @{ LabelKey='engine.startpage'; ProviderName='Startpage'; URL='https://www.startpage.com/do/search?q={searchTerms}';  Suggest='';                                                                          Keyword='startpage'; Home='https://www.startpage.com' }
-    'qwant'       = @{ LabelKey='engine.qwant'; ProviderName='Qwant'; URL='https://www.qwant.com/?q={searchTerms}';               Suggest='https://api.qwant.com/api/suggest?q={searchTerms}';                         Keyword='qwant';     Home='https://www.qwant.com' }
-    'ecosia'      = @{ LabelKey='engine.ecosia'; ProviderName='Ecosia'; URL='https://www.ecosia.org/search?q={searchTerms}';        Suggest='https://ac.ecosia.org/?q={searchTerms}';                                    Keyword='ecosia';    Home='https://www.ecosia.org' }
-    'mojeek'      = @{ LabelKey='engine.mojeek'; ProviderName='Mojeek'; URL='https://www.mojeek.com/search?q={searchTerms}';        Suggest='';                                                                          Keyword='mojeek';    Home='https://www.mojeek.com' }
-    'kagi'        = @{ LabelKey='engine.kagi'; ProviderName='Kagi (paid)'; URL='https://kagi.com/search?q={searchTerms}';              Suggest='https://kagi.com/api/autosuggest?q={searchTerms}';                          Keyword='kagi';      Home='https://kagi.com' }
-    'google'      = @{ LabelKey='engine.google'; ProviderName='Google'; URL='https://www.google.com/search?q={searchTerms}';        Suggest='https://www.google.com/complete/search?output=chrome&q={searchTerms}';     Keyword='google';    Home='https://www.google.com' }
-    'bing'        = @{ LabelKey='engine.bing'; ProviderName='Bing'; URL='https://www.bing.com/search?q={searchTerms}';          Suggest='https://www.bing.com/osjson.aspx?query={searchTerms}';                      Keyword='bing';      Home='https://www.bing.com' }
-    'yandex'      = @{ LabelKey='engine.yandex'; ProviderName='Yandex'; URL='https://yandex.com/search/?text={searchTerms}';        Suggest='https://suggest.yandex.com/suggest-ff.cgi?part={searchTerms}';             Keyword='yandex';    Home='https://yandex.com' }
-    'custom'      = @{ LabelKey='engine.custom'; ProviderName='Custom...'; URL='';                                                     Suggest='';                                                                          Keyword='custom';    Home='';                                IsCustom=$true }
-}
-
-# Destination presets for "new tab" and "startup specific page" dropdowns.
-# '__SEARCH__' resolves at apply-time to the chosen engine's home URL.
-$script:DestinationOptions = [ordered]@{
-    'blank'           = @{ LabelKey='destination.blank'; Value='about:blank' }
-    'ntpDefault'      = @{ LabelKey='destination.ntpDefault'; Value='__SKIP__' }
-    'matchSearch'     = @{ LabelKey='destination.matchSearch'; Value='__SEARCH__' }
-    'braveSearchHome' = @{ LabelKey='destination.braveSearchHome'; Value='https://search.brave.com' }
-    'duckduckgoHome'  = @{ LabelKey='destination.duckduckgoHome'; Value='https://duckduckgo.com' }
-    'googleHome'      = @{ LabelKey='destination.googleHome'; Value='https://www.google.com' }
-    'custom'          = @{ LabelKey='destination.custom'; Value='__CUSTOM__' }
-}
-
-# Startup behavior modes (RestoreOnStartup policy values).
-$script:StartupModes = [ordered]@{
-    'newTab'          = @{ LabelKey='startupMode.newTab'; Code=5; UsesURL=$false }
-    'restoreSession'  = @{ LabelKey='startupMode.restoreSession'; Code=1; UsesURL=$false }
-    'blankPage'       = @{ LabelKey='startupMode.blankPage'; Code=4; UsesURL=$true; FixedURL='about:blank' }
-    'specificPages'   = @{ LabelKey='startupMode.specificPages'; Code=4; UsesURL=$true; FixedURL=$null }
-}
-
-# ---- Stable id arrays that back the ComboBoxes -----------------------------
-# Item order in each ComboBox matches the order of these arrays; the link is
-# SelectedIndex, which is the one binding WinForms guarantees for a
-# non-data-bound ComboBox and which survives re-translation intact.
-$script:SearchEngineIds       = @($script:SearchEngines.Keys)
-$script:SearchEngineLabelKeys = @($script:SearchEngineIds | ForEach-Object { $script:SearchEngines[$_].LabelKey })
-# 'ntpDefault' stays in the data model for Load current state matching but is
-# never offered in the new-tab dropdown (parity with v1.11).
-$script:DestinationIds        = @($script:DestinationOptions.Keys | Where-Object { $_ -ne 'ntpDefault' })
-$script:DestinationLabelKeys  = @($script:DestinationIds | ForEach-Object { $script:DestinationOptions[$_].LabelKey })
-$script:StartupModeIds        = @($script:StartupModes.Keys)
-$script:StartupModeLabelKeys  = @($script:StartupModeIds | ForEach-Object { $script:StartupModes[$_].LabelKey })
-
-# Legacy config migration: v1.5-v1.11 exports stored the English display
-# label. Importing those must keep working.
-$script:LegacyHostsIds = @{
-    'Brave P3A telemetry' = 'p3a'
-    'Brave Variations' = 'variations'
-    'Brave Stats ping' = 'stats'
-    'Brave Rewards / BAT' = 'rewards'
-    'Brave News CDN' = 'news'
-    'Component Updates' = 'components'
-    'Web Discovery' = 'webDiscovery'
-}
-$script:LegacySearchEngineIds = @{
-    'Brave Search' = 'brave'
-    'DuckDuckGo' = 'duckduckgo'
-    'Startpage' = 'startpage'
-    'Qwant' = 'qwant'
-    'Ecosia' = 'ecosia'
-    'Mojeek' = 'mojeek'
-    'Kagi (paid)' = 'kagi'
-    'Google' = 'google'
-    'Bing' = 'bing'
-    'Yandex' = 'yandex'
-    'Custom...' = 'custom'
-}
-$script:LegacyDestinationIds = @{
-    'Blank page (about:blank)' = 'blank'
-    'Default new tab page (do not override)' = 'ntpDefault'
-    'Match the search engine I picked above' = 'matchSearch'
-    'Brave Search homepage' = 'braveSearchHome'
-    'DuckDuckGo homepage' = 'duckduckgoHome'
-    'Google homepage' = 'googleHome'
-    'Custom URL...' = 'custom'
-}
-$script:LegacyStartupModeIds = @{
-    'Open the new tab page' = 'newTab'
-    'Restore my last session' = 'restoreSession'
-    'Open a blank page' = 'blankPage'
-    'Open a specific page or set' = 'specificPages'
-}
-#endregion
-
-#region Helpers ---------------------------------------------------------------
-function Write-Log {
-    param([string]$Message, [string]$Level = 'INFO')
-    $ts = Get-Date -Format 'HH:mm:ss'
-    $line = "[$ts] [$Level] $Message"
-    if ($script:LogBox) {
-        $script:LogBox.AppendText("$line`r`n")
-        $script:LogBox.SelectionStart = $script:LogBox.Text.Length
-        $script:LogBox.ScrollToCaret()
-    }
-}
-
-function Get-ExistingPolicy {
-    param([string]$Name)
-    try {
-        $v = Get-ItemProperty -Path $script:BravePolicyPath -Name $Name -ErrorAction Stop
-        return $v.$Name
-    } catch { return $null }
-}
-
-function Set-PolicyValue {
-    param([string]$Name, [string]$Type, $Value)
-    if (-not (Test-Path $script:BravePolicyPath)) {
-        New-Item -Path $script:BravePolicyPath -Force | Out-Null
-    }
-    $regType = if ($Type -eq 'DWORD') { 'DWord' } else { 'String' }
-    New-ItemProperty -Path $script:BravePolicyPath -Name $Name -Value $Value -PropertyType $regType -Force | Out-Null
-}
-
-function Remove-PolicyValue {
-    param([string]$Name)
-    try {
-        Remove-ItemProperty -Path $script:BravePolicyPath -Name $Name -ErrorAction Stop
-        return $true
-    } catch { return $false }
-}
-
-function Export-Backup {
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $dir = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-    $file = Join-Path $dir "brave-policies-backup-$stamp.reg"
-    $regKey = 'HKLM\Software\Policies\BraveSoftware'
-    $result = & reg.exe EXPORT $regKey $file /y 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Log "Backup saved: $file" 'OK'
-        return $file
-    } else {
-        Write-Log "Backup skipped (no existing policies)." 'INFO'
-        return $null
-    }
-}
-
-function Test-BraveInstalled {
-    $paths = @(
-        "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
-        "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
-        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
-    )
-    foreach ($p in $paths) { if (Test-Path $p) { return $p } }
-    return $null
-}
-
-# ---- Hosts file helpers (v1.5) ----------------------------------------------
-function Backup-HostsFile {
-    if (-not (Test-Path $script:HostsFile)) { return $null }
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $dir = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
-    $file = Join-Path $dir "hosts-backup-$stamp.bak"
-    Copy-Item $script:HostsFile $file -Force
-    Write-Log "Hosts backup saved: $file" 'OK'
-    return $file
-}
-
-function Get-HostsCurrentDomains {
-    if (-not (Test-Path $script:HostsFile)) { return @() }
-    $lines = Get-Content $script:HostsFile -ErrorAction SilentlyContinue
-    $inBlock = $false
-    $domains = @()
-    foreach ($line in $lines) {
-        if ($line -eq $script:HostsSentinelStart) { $inBlock = $true; continue }
-        if ($line -eq $script:HostsSentinelEnd)   { $inBlock = $false; continue }
-        if ($inBlock -and $line -match '^\s*0\.0\.0\.0\s+(\S+)') {
-            $domains += $Matches[1]
-        }
-    }
-    return $domains
-}
-
-function Set-HostsBlockDomains {
-    param([string[]]$Domains)
-    [void](Backup-HostsFile)
-
-    # Read all lines, strip out our existing sentinel block (if any)
-    $lines = if (Test-Path $script:HostsFile) { Get-Content $script:HostsFile } else { @() }
-    $kept = New-Object System.Collections.ArrayList
-    $skipping = $false
-    foreach ($line in $lines) {
-        if ($line -eq $script:HostsSentinelStart) { $skipping = $true; continue }
-        if ($line -eq $script:HostsSentinelEnd)   { $skipping = $false; continue }
-        if (-not $skipping) { [void]$kept.Add($line) }
-    }
-
-    # Trim trailing blank lines from existing content for tidiness
-    while ($kept.Count -gt 0 -and [string]::IsNullOrWhiteSpace($kept[$kept.Count - 1])) {
-        $kept.RemoveAt($kept.Count - 1)
-    }
-
-    if ($Domains -and $Domains.Count -gt 0) {
-        [void]$kept.Add('')
-        [void]$kept.Add($script:HostsSentinelStart)
-        [void]$kept.Add("# Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by Brave Free Origin. Remove via the GUI.")
-        foreach ($d in ($Domains | Sort-Object -Unique)) {
-            [void]$kept.Add("0.0.0.0 $d")
-        }
-        [void]$kept.Add($script:HostsSentinelEnd)
-    }
-
-    # ASCII encoding - matches what Windows expects for hosts. Some AVs flag UTF-16 hosts.
-    Set-Content -Path $script:HostsFile -Value $kept -Encoding ASCII -Force
-
-    # Flush DNS so the change takes effect immediately for new connections
-    & ipconfig.exe /flushdns | Out-Null
-    Write-Log "Hosts block written: $($Domains.Count) domain(s). DNS cache flushed." 'OK'
-}
-
-function Clear-HostsBlock {
-    Set-HostsBlockDomains -Domains @()
-    Write-Log 'Hosts sentinel block removed.' 'OK'
-}
-# -----------------------------------------------------------------------------
-
-function Get-BraveVersion {
-    $exe = Test-BraveInstalled
-    if ($exe) {
-        try { return (Get-Item $exe).VersionInfo.FileVersion } catch { return 'unknown' }
-    }
-    return 'not installed'
-}
-
-function Show-TextReport {
-    param(
-        [string]$Title,
-        [string]$Text,
-        [string]$DefaultFileName = 'brave-free-origin-report.txt'
-    )
-
-    $rf = New-Object System.Windows.Forms.Form
-    $rf.Text = $Title
-    $rf.Size = New-Object System.Drawing.Size(760, 560)
-    $rf.StartPosition = 'CenterParent'
-    $rf.MinimumSize = New-Object System.Drawing.Size(620, 420)
-
-    $buttons = New-Object System.Windows.Forms.Panel
-    $buttons.Dock = 'Bottom'
-    $buttons.Height = 44
-    $rf.Controls.Add($buttons)
-
-    $tb = New-Object System.Windows.Forms.TextBox
-    $tb.Multiline = $true
-    $tb.ReadOnly = $true
-    $tb.ScrollBars = 'Both'
-    $tb.WordWrap = $false
-    $tb.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $tb.Dock = 'Fill'
-    $tb.Text = $Text
-    $rf.Controls.Add($tb)
-
-    $copy = New-Object System.Windows.Forms.Button
-    $copy.Text = T 'report.copy'
-    $copy.Size = New-Object System.Drawing.Size(90, 28)
-    $copy.Location = New-Object System.Drawing.Point(10, 8)
-    $copy.Add_Click({
-        # Clipboard.SetText throws on an empty string.
-        if ($tb.Text) { [System.Windows.Forms.Clipboard]::SetText($tb.Text) }
-    })
-    $buttons.Controls.Add($copy)
-
-    $save = New-Object System.Windows.Forms.Button
-    $save.Text = T 'report.save'
-    $save.Size = New-Object System.Drawing.Size(110, 28)
-    $save.Location = New-Object System.Drawing.Point(110, 8)
-    $save.Add_Click({
-        $sfd = New-Object System.Windows.Forms.SaveFileDialog
-        $sfd.Filter = '{0} (*.txt)|*.txt' -f (T 'dialog.filter.textReport')
-        $sfd.FileName = $DefaultFileName
-        $sfd.InitialDirectory = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
-        if (-not (Test-Path $sfd.InitialDirectory)) { New-Item -ItemType Directory -Path $sfd.InitialDirectory | Out-Null }
-        if ($sfd.ShowDialog() -eq 'OK') {
-            Set-Content -Path $sfd.FileName -Value $tb.Text -Encoding UTF8
-            Write-Log "Report saved: $($sfd.FileName)" 'OK'
-        }
-    })
-    $buttons.Controls.Add($save)
-
-    $close = New-Object System.Windows.Forms.Button
-    $close.Text = T 'report.close'
-    $close.Size = New-Object System.Drawing.Size(90, 28)
-    $close.Location = New-Object System.Drawing.Point(230, 8)
-    $close.Add_Click({ $rf.Close() })
-    $buttons.Controls.Add($close)
-
-    $buttons.BringToFront()
-    [void]$rf.ShowDialog()
-}
-
-# ---- ComboBox id plumbing ---------------------------------------------------
-# Combo Items hold translated labels; the stable id lives in a parallel array
-# and is linked by SelectedIndex. That is the one binding WinForms guarantees
-# for a non-data-bound ComboBox, and it survives re-translation intact.
-function Get-ComboId {
-    param($Combo, $Ids)
-    if (-not $Combo -or -not $Ids) { return $null }
-    $i = $Combo.SelectedIndex
-    if ($i -lt 0 -or $i -ge @($Ids).Count) { return $null }
-    return @($Ids)[$i]
-}
-
-function Set-ComboId {
-    param($Combo, $Ids, [string]$Id)
-    if (-not $Combo -or -not $Ids -or -not $Id) { return $false }
-    $arr = @($Ids)
-    for ($i = 0; $i -lt $arr.Count; $i++) {
-        if ($arr[$i] -eq $Id) { $Combo.SelectedIndex = $i; return $true }
-    }
-    return $false
-}
-
-# Relabelling is Items.Clear() + refill, which drives SelectedIndex to -1 and
-# back. Both transitions raise SelectedIndexChanged, so the handlers are muted
-# for the duration and the previously selected stable id is restored exactly.
-function Set-ComboLabels {
-    param($Combo, $Ids, $LabelKeys)
-    if (-not $Combo) { return }
-    $keep = Get-ComboId -Combo $Combo -Ids $Ids
-    Push-SuppressSelectionEvents
-    try {
-        $Combo.BeginUpdate()
-        try {
-            $Combo.Items.Clear()
-            foreach ($k in @($LabelKeys)) { [void]$Combo.Items.Add((T $k)) }
-        } finally {
-            $Combo.EndUpdate()
-        }
-        if (-not (Set-ComboId -Combo $Combo -Ids $Ids -Id $keep)) {
-            if ($Combo.Items.Count -gt 0) { $Combo.SelectedIndex = 0 }
-        }
-    } finally {
-        Pop-SuppressSelectionEvents
-    }
-}
-
-# One place that knows how to move a choice policy to another option: it keeps
-# the picker, the in-memory ApplyValue and therefore every downstream write
-# (apply / preview / verify / export) in agreement, without depending on the
-# ComboBox event firing - which is muted during import and load-state.
-function Set-PolicyChoiceId {
-    param($Policy, [string]$ChoiceId)
-    if (-not $Policy -or -not $Policy.Choices -or [string]::IsNullOrWhiteSpace($ChoiceId)) { return $false }
-    if (-not $Policy.Choices.Contains($ChoiceId)) { return $false }
-    $Policy.ApplyValue = $Policy.Choices[$ChoiceId]
-    $combo = $script:PolicyCombos[$Policy.Name]
-    if ($combo) {
-        [void](Set-ComboId -Combo $combo -Ids $script:PolicyChoiceIds[$Policy.Name] -Id $ChoiceId)
-    }
-    return $true
-}
-
-function Get-RegistryValueState {
-    param([string]$Path, [string]$Name)
-    if (-not (Test-Path $Path)) {
-        return [pscustomobject]@{ Exists = $false; Value = $null }
-    }
-    try {
-        $props = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
-        return [pscustomobject]@{ Exists = $true; Value = $props.PSObject.Properties[$Name].Value }
-    } catch {
-        return [pscustomobject]@{ Exists = $false; Value = $null }
-    }
-}
-
-function Get-RegistryNumberedValues {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { return @() }
-    $props = Get-ItemProperty -Path $Path
-    $items = @()
-    foreach ($p in $props.PSObject.Properties) {
-        if ($p.Name -match '^\d+$') {
-            $items += [pscustomobject]@{ Index = [int]$p.Name; Value = $p.Value }
-        }
-    }
-    return @($items | Sort-Object Index | ForEach-Object { $_.Value })
-}
-
-function Get-SelectedHostsDomains {
-    $domains = @()
-    if ($script:HostsCheckBoxes) {
-        foreach ($cb in $script:HostsCheckBoxes) {
-            if ($cb.Checked) { $domains += $cb.Tag.Domains }
-        }
-    }
-    return @($domains | Sort-Object -Unique)
-}
-
-function Get-DesiredSearchOverride {
-    $desired = [ordered]@{}
-    if (-not $script:ChkSearchOverride.Checked) { return $desired }
-
-    $engineId = Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds
-    $eng = $script:SearchEngines[$engineId]
-    $url = $eng.URL
-    $sug = $eng.Suggest
-    # ProviderName, not the translated label: this string is written to the
-    # registry and shown by Brave itself.
-    $name = $eng.ProviderName
-    $keyword = $eng.Keyword
-
-    if ($eng.IsCustom) {
-        $url = $script:TxtCustomSearchUrl.Text.Trim()
-        if ([string]::IsNullOrWhiteSpace($url)) { throw 'Custom search URL is empty.' }
-        if ($url -notmatch '\{searchTerms\}') { throw 'Custom search URL must contain {searchTerms}.' }
-        $name = 'Custom Search'
-    }
-
-    $desired['DefaultSearchProviderEnabled'] = @{ Type='DWORD'; Value=1 }
-    $desired['DefaultSearchProviderName'] = @{ Type='STRING'; Value=$name }
-    $desired['DefaultSearchProviderKeyword'] = @{ Type='STRING'; Value=$keyword }
-    $desired['DefaultSearchProviderSearchURL'] = @{ Type='STRING'; Value=$url }
-    if ($sug) { $desired['DefaultSearchProviderSuggestURL'] = @{ Type='STRING'; Value=$sug } }
-    return $desired
-}
-
-function Get-DesiredNtpOverride {
-    $desired = [ordered]@{}
-    if (-not $script:ChkNtpOverride.Checked) { return $desired }
-
-    $engineId = Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds
-    $engineHome = if ($script:SearchEngines[$engineId].IsCustom) { '' } else { $script:SearchEngines[$engineId].Home }
-    $url = Resolve-Destination -DestinationId (Get-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds) -CustomUrl $script:TxtNtpCustomUrl.Text -SearchEngineHome $engineHome
-    if ([string]::IsNullOrWhiteSpace($url)) { throw 'New tab override has no resolvable URL.' }
-    $desired['NewTabPageLocation'] = @{ Type='STRING'; Value=$url }
-    return $desired
-}
-
-function Get-DesiredStartupOverride {
-    if (-not $script:ChkStartupOverride.Checked) {
-        return [pscustomobject]@{ Enabled = $false; Code = $null; Urls = @() }
-    }
-
-    $modeId = Get-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds
-    $mode = $script:StartupModes[$modeId]
-    $urls = @()
-    if ($mode.UsesURL) {
-        $urls = if ($mode.FixedURL) { @($mode.FixedURL) }
-                else { @($script:TxtStartupUrl.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-        if ($urls.Count -eq 0) { throw 'Startup override has no URL.' }
-    }
-    return [pscustomobject]@{ Enabled = $true; Code = $mode.Code; Urls = $urls }
-}
-
-function Add-RegistryPlanLines {
-    param(
-        [System.Text.StringBuilder]$Report,
-        [string]$Path,
-        [System.Collections.IDictionary]$Desired,
-        [string[]]$Names,
-        [string]$Title
-    )
-
-    [void]$Report.AppendLine("  -- $Title")
-    $changes = 0
-    foreach ($name in $Names) {
-        $state = Get-RegistryValueState -Path $Path -Name $name
-        if ($Desired.Contains($name)) {
-            $target = $Desired[$name].Value
-            if (-not $state.Exists) {
-                [void]$Report.AppendLine("     ADD    $name = $target")
-                $changes++
-            } elseif ("$($state.Value)" -eq "$target") {
-                [void]$Report.AppendLine("     KEEP   $name = $target")
-            } else {
-                [void]$Report.AppendLine("     CHANGE $name : $($state.Value) -> $target")
-                $changes++
-            }
-        } elseif ($state.Exists) {
-            [void]$Report.AppendLine("     CLEAR  $name (currently $($state.Value))")
-            $changes++
-        }
-    }
-    if ($changes -eq 0) { [void]$Report.AppendLine('     No write needed.') }
-}
-
-function New-HostsPlanReport {
-    $desired = @(Get-SelectedHostsDomains)
-    $current = @(Get-HostsCurrentDomains)
-    $toAdd = @($desired | Where-Object { $current -notcontains $_ })
-    $toKeep = @($desired | Where-Object { $current -contains $_ })
-    $toRemove = @($current | Where-Object { $desired -notcontains $_ })
-
-    $report = New-Object System.Text.StringBuilder
-    [void]$report.AppendLine('Brave Free Origin hosts preview')
-    [void]$report.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-    [void]$report.AppendLine("File: $($script:HostsFile)")
-    [void]$report.AppendLine('')
-    [void]$report.AppendLine("Selected groups: $(@($script:HostsCheckBoxes | Where-Object { $_.Checked }).Count)")
-    [void]$report.AppendLine("Current managed domains: $($current.Count)")
-    [void]$report.AppendLine("Desired managed domains: $($desired.Count)")
-    [void]$report.AppendLine('')
-    [void]$report.AppendLine("Add: $($toAdd.Count)")
-    foreach ($d in $toAdd) { [void]$report.AppendLine("  + $d") }
-    [void]$report.AppendLine("Keep: $($toKeep.Count)")
-    foreach ($d in $toKeep) { [void]$report.AppendLine("  = $d") }
-    [void]$report.AppendLine("Remove from managed block: $($toRemove.Count)")
-    foreach ($d in $toRemove) { [void]$report.AppendLine("  - $d") }
-    [void]$report.AppendLine('')
-    [void]$report.AppendLine('No other hosts entries are touched. The GUI only replaces the Brave-Free-Origin sentinel block.')
-    return $report.ToString()
-}
-
-function New-ApplyPlanReport {
-    $report = New-Object System.Text.StringBuilder
-    $modeKey = if ([string]::IsNullOrWhiteSpace($script:ActiveProfile)) { 'Custom' } else { $script:ActiveProfile }
-    $modeLabel = Get-PresetNameEn $modeKey
-
-    [void]$report.AppendLine('Brave Free Origin apply preview')
-    [void]$report.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-    [void]$report.AppendLine("Mode: $modeLabel")
-    [void]$report.AppendLine("Target channel(s): $($script:TargetChannels -join ', ')")
-    [void]$report.AppendLine("Backup before apply: $($chkBackup.Checked)")
-    [void]$report.AppendLine('')
-    [void]$report.AppendLine('This is a dry run. Nothing has been written.')
-    [void]$report.AppendLine('')
-
-    foreach ($channel in $script:TargetChannels) {
-        $path = $script:Channels[$channel].Path
-        [void]$report.AppendLine("=== $channel  ($path) ===")
-        $adds = 0; $changes = 0; $clears = 0; $keeps = 0
-
-        foreach ($cb in $script:CheckBoxes) {
-            $p = $cb.Tag.Policy
-            $state = Get-RegistryValueState -Path $path -Name $p.Name
-            if ($cb.Checked) {
-                if (-not $state.Exists) {
-                    [void]$report.AppendLine("  ADD    $($p.Name) = $($p.ApplyValue)")
-                    $adds++
-                } elseif ("$($state.Value)" -eq "$($p.ApplyValue)") {
-                    [void]$report.AppendLine("  KEEP   $($p.Name) = $($p.ApplyValue)")
-                    $keeps++
-                } else {
-                    [void]$report.AppendLine("  CHANGE $($p.Name) : $($state.Value) -> $($p.ApplyValue)")
-                    $changes++
-                }
-            } elseif ($state.Exists) {
-                [void]$report.AppendLine("  CLEAR  $($p.Name) (currently $($state.Value))")
-                $clears++
-            }
-        }
-        [void]$report.AppendLine("  Summary: $adds add, $changes change, $clears clear, $keeps already correct")
-        [void]$report.AppendLine('')
-
-        try {
-            $searchDesired = Get-DesiredSearchOverride
-            Add-RegistryPlanLines -Report $report -Path $path -Desired $searchDesired -Names @(
-                'DefaultSearchProviderEnabled',
-                'DefaultSearchProviderName',
-                'DefaultSearchProviderKeyword',
-                'DefaultSearchProviderSearchURL',
-                'DefaultSearchProviderSuggestURL'
-            ) -Title 'Search override'
-        } catch {
-            [void]$report.AppendLine("  -- Search override")
-            [void]$report.AppendLine("     ERROR: $_")
-        }
-        [void]$report.AppendLine('')
-
-        try {
-            $ntpDesired = Get-DesiredNtpOverride
-            Add-RegistryPlanLines -Report $report -Path $path -Desired $ntpDesired -Names @('NewTabPageLocation') -Title 'New tab override'
-        } catch {
-            [void]$report.AppendLine("  -- New tab override")
-            [void]$report.AppendLine("     ERROR: $_")
-        }
-        [void]$report.AppendLine('')
-
-        try {
-            $startup = Get-DesiredStartupOverride
-            [void]$report.AppendLine('  -- Startup override')
-            $curStartup = Get-RegistryValueState -Path $path -Name 'RestoreOnStartup'
-            $urlPath = Join-Path $path 'RestoreOnStartupURLs'
-            $curUrls = @(Get-RegistryNumberedValues -Path $urlPath)
-            if ($startup.Enabled) {
-                if (-not $curStartup.Exists) {
-                    [void]$report.AppendLine("     ADD    RestoreOnStartup = $($startup.Code)")
-                } elseif ("$($curStartup.Value)" -eq "$($startup.Code)") {
-                    [void]$report.AppendLine("     KEEP   RestoreOnStartup = $($startup.Code)")
-                } else {
-                    [void]$report.AppendLine("     CHANGE RestoreOnStartup : $($curStartup.Value) -> $($startup.Code)")
-                }
-                if ($startup.Urls.Count -gt 0) {
-                    [void]$report.AppendLine("     REPLACE RestoreOnStartupURLs with $($startup.Urls.Count) URL(s): $($startup.Urls -join ', ')")
-                } elseif ($curUrls.Count -gt 0) {
-                    [void]$report.AppendLine('     CLEAR  RestoreOnStartupURLs')
-                } else {
-                    [void]$report.AppendLine('     No startup URL list needed.')
-                }
-            } else {
-                if ($curStartup.Exists) { [void]$report.AppendLine("     CLEAR  RestoreOnStartup (currently $($curStartup.Value))") }
-                if ($curUrls.Count -gt 0) { [void]$report.AppendLine("     CLEAR  RestoreOnStartupURLs ($($curUrls.Count) URL(s))") }
-                if (-not $curStartup.Exists -and $curUrls.Count -eq 0) { [void]$report.AppendLine('     No write needed.') }
-            }
-        } catch {
-            [void]$report.AppendLine('  -- Startup override')
-            [void]$report.AppendLine("     ERROR: $_")
-        }
-        [void]$report.AppendLine('')
-    }
-
-    [void]$report.AppendLine('=== Scheduled tasks ===')
-    foreach ($cb in $script:TaskCheckBoxes) {
-        $t = $cb.Tag
-        $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
-        if (-not $task) {
-            [void]$report.AppendLine("  MISSING $($t.Name) - skipped")
-        } elseif ($cb.Checked) {
-            if ($task.State -eq 'Disabled') { [void]$report.AppendLine("  KEEP    $($t.Name) disabled") }
-            else { [void]$report.AppendLine("  DISABLE $($t.Name) (currently $($task.State))") }
-        } else {
-            if ($task.State -eq 'Disabled') { [void]$report.AppendLine("  ENABLE  $($t.Name)") }
-            else { [void]$report.AppendLine("  KEEP    $($t.Name) enabled/current state $($task.State)") }
-        }
-    }
-    [void]$report.AppendLine('')
-
-    [void]$report.AppendLine('=== Services ===')
-    foreach ($cb in $script:ServiceCheckBoxes) {
-        $s = $cb.Tag
-        $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            [void]$report.AppendLine("  MISSING $($s.Name) - skipped")
-        } elseif ($cb.Checked) {
-            if ($svc.StartType -eq 'Disabled') { [void]$report.AppendLine("  KEEP    $($s.Name) disabled") }
-            else { [void]$report.AppendLine("  DISABLE $($s.Name) (currently $($svc.StartType), $($svc.Status))") }
-        } else {
-            if ($svc.StartType -eq 'Disabled') { [void]$report.AppendLine("  RESET   $($s.Name) startup type to Manual") }
-            else { [void]$report.AppendLine("  KEEP    $($s.Name) startup type $($svc.StartType)") }
-        }
-    }
-    [void]$report.AppendLine('')
-
-    [void]$report.AppendLine('=== Hosts blocklist ===')
-    [void]$report.AppendLine('Main Apply does not edit hosts. Use Preview hosts / Apply hosts blocks inside the Hosts tab.')
-    [void]$report.AppendLine("Selected hosts domains right now: $(@(Get-SelectedHostsDomains).Count)")
-
-    return $report.ToString()
-}
-
-function Invoke-FullRestore {
-    param([bool]$Backup)
-
-    if ($Backup) { [void](Export-Backup) }
-
-    foreach ($channel in $script:TargetChannels) {
-        $path = $script:Channels[$channel].Path
-        try {
-            if (Test-Path $path) {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                Write-Log "Removed policy key for $channel ($path)" 'OK'
-            } else {
-                Write-Log "$channel had no policy key - skipped." 'INFO'
-            }
-        } catch {
-            Write-Log "Full restore policy remove [$channel]: $_" 'ERR'
-        }
-    }
-
-    $currentHosts = @(Get-HostsCurrentDomains)
-    if ($currentHosts.Count -gt 0) {
-        try { Clear-HostsBlock } catch { Write-Log "Full restore hosts clear: $_" 'ERR' }
-    } else {
-        Write-Log 'No Brave-Free-Origin hosts block present.' 'INFO'
-    }
-
-    foreach ($t in $script:ScheduledTasks) {
-        try {
-            $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
-            if ($task -and $task.State -eq 'Disabled') {
-                Enable-ScheduledTask -TaskName $t.Name -ErrorAction Stop | Out-Null
-                Write-Log "ENABLED task $($t.Name)" 'OK'
-            }
-        } catch {
-            Write-Log "Full restore task $($t.Name): $_" 'WARN'
-        }
-    }
-
-    foreach ($s in $script:Services) {
-        try {
-            $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
-            if ($svc -and $svc.StartType -eq 'Disabled') {
-                Set-Service -Name $s.Name -StartupType Manual -ErrorAction Stop
-                Write-Log "RESET service $($s.Name) to Manual" 'OK'
-            }
-        } catch {
-            Write-Log "Full restore service $($s.Name): $_" 'WARN'
-        }
-    }
-
-    Push-SuppressSelectionEvents
-    try {
-        foreach ($cb in $script:CheckBoxes)        { $cb.Checked = $false }
-        foreach ($cb in $script:TaskCheckBoxes)    { $cb.Checked = $false }
-        foreach ($cb in $script:ServiceCheckBoxes) { $cb.Checked = $false }
-        foreach ($cb in $script:HostsCheckBoxes)   { $cb.Checked = $false }
-        if ($script:ChkSearchOverride)  { $script:ChkSearchOverride.Checked = $false }
-        if ($script:ChkNtpOverride)     { $script:ChkNtpOverride.Checked = $false }
-        if ($script:ChkStartupOverride) { $script:ChkStartupOverride.Checked = $false }
-    } finally {
-        Pop-SuppressSelectionEvents
-    }
-    $script:ActiveProfile = 'None'
-    Update-OverrideControlStates
-    Update-SelectionSummary
-    Update-ConfigurationFilter
-    Write-Log 'Full restore completed. Restart Brave to see stock behavior.' 'DONE'
-}
-
 function Get-ScriptletDefaultRoot {
-    $channel = if ($script:TargetChannels -and $script:TargetChannels.Count -gt 0) { $script:TargetChannels[0] } else { 'Stable' }
-    if ($script:ScriptletUserDataRoots.Contains($channel)) { return $script:ScriptletUserDataRoots[$channel] }
-    return $script:ScriptletUserDataRoots['Stable']
+    return $script:BraveInstalls[(Get-PrimaryChannel)].UserDataRoot
+}
+
+# Brave's filter-list files are LF text. Rewriting them line by line with the
+# .NET default would convert every line to CRLF on Windows, so the original
+# newline style and trailing newline are kept, and a file is only written when a
+# rule actually changed.
+function Read-ListFileLines {
+    param([string]$Path)
+    $text = [System.IO.File]::ReadAllText($Path)
+    $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $lines = [regex]::Split($text, "
+|
+")
+    $trailing = $text.EndsWith("`n")
+    if ($trailing -and $lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
+        $lines = if ($lines.Count -gt 1) { $lines[0..($lines.Count - 2)] } else { @() }
+    }
+    return [pscustomobject]@{ Lines = [string[]]$lines; Newline = $newline; TrailingNewline = $trailing }
+}
+
+function Write-ListFileLines {
+    param([string]$Path, $Data, [string[]]$Lines)
+    $text = $Lines -join $Data.Newline
+    if ($Data.TrailingNewline) { $text += $Data.Newline }
+    [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Get-ScriptletComponentInfo {
@@ -2222,30 +2963,6 @@ function Get-ScriptletListFiles {
     return @($files | Sort-Object FullName)
 }
 
-function Get-ScriptletRules {
-    param(
-        [string]$Root,
-        [System.Collections.IList]$Warnings = $null
-    )
-
-    $records = New-Object System.Collections.Generic.List[object]
-    $files = Get-ScriptletListFiles -Root $Root -Warnings $Warnings
-    foreach ($file in $files) {
-        try {
-            $lineNo = 0
-            foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
-                $lineNo++
-                $record = ConvertTo-ScriptletRecord -File $file.FullName -Root $Root -Line $line -LineNumber $lineNo
-                if ($record) { [void]$records.Add($record) }
-            }
-        } catch {
-            $warning = "Scriptlet scan failed $($file.FullName): $_"
-            if ($Warnings) { [void]$Warnings.Add($warning) } else { Write-Log $warning 'WARN' }
-        }
-    }
-    return @($records.ToArray())
-}
-
 function Backup-ScriptletFile {
     param([string]$File)
 
@@ -2260,21 +2977,13 @@ function Backup-ScriptletFile {
 
 function Test-ScriptletAdvancedWriteAllowed {
     if (-not $script:ChkScriptletAdvanced -or -not $script:ChkScriptletAdvanced.Checked) {
-        [System.Windows.Forms.MessageBox]::Show(
-            (T 'msg.scriptlet.locked'),
-            (T 'msg.title.scriptlet'),
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.locked') -Title (T 'msg.title.scriptlet') -Buttons 'OK' -Icon 'Warning')
         return $false
     }
 
     $braveProcesses = @(Get-Process -Name brave -ErrorAction SilentlyContinue)
     if ($braveProcesses.Count -gt 0) {
-        $ans = [System.Windows.Forms.MessageBox]::Show(
-            (T 'msg.scriptlet.braveRunning' @($braveProcesses.Count)),
-            (T 'msg.title.scriptlet'),
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        $ans = Show-Message -Text (T 'msg.scriptlet.braveRunning' @($braveProcesses.Count)) -Title (T 'msg.title.scriptlet') -Buttons 'YesNo' -Icon 'Warning'
         if ($ans -ne 'Yes') { return $false }
     }
 
@@ -2290,13 +2999,14 @@ function Set-ScriptletRuleState {
 
     if (-not $Records -or $Records.Count -eq 0) { return 0 }
     $changed = 0
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $byFile = $Records | Group-Object File
 
     foreach ($group in $byFile) {
         $file = $group.Name
         [void](Backup-ScriptletFile -File $file)
-        $lines = [System.IO.File]::ReadAllLines($file)
+        $data = Read-ListFileLines -Path $file
+        $lines = $data.Lines
+        $before = $changed
 
         if ($AffectDuplicates) {
             $wanted = @{}
@@ -2332,7 +3042,7 @@ function Set-ScriptletRuleState {
             }
         }
 
-        [System.IO.File]::WriteAllLines($file, [string[]]$lines, $utf8NoBom)
+        if ($changed -gt $before) { Write-ListFileLines -Path $file -Data $data -Lines $lines }
     }
 
     return $changed
@@ -2378,7 +3088,7 @@ function Export-ScriptletDisabledPreferences {
             }
         )
     }
-    $payload | ConvertTo-Json -Depth 5 | Set-Content -Path $File -Encoding UTF8
+    [System.IO.File]::WriteAllText($File, ($payload | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
     return $disabled.Count
 }
 
@@ -2386,7 +3096,7 @@ function Import-ScriptletPreferencesAndReapply {
     param([string]$PrefsFile, [string]$Root)
 
     if (-not (Test-Path $PrefsFile)) { throw "Preference file not found: $PrefsFile" }
-    $prefs = Get-Content $PrefsFile -Raw | ConvertFrom-Json
+    $prefs = [System.IO.File]::ReadAllText($PrefsFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
     if (-not $prefs.disabledRules) { throw 'Preference file has no disabledRules array.' }
 
     $wanted = @{}
@@ -2396,9 +3106,9 @@ function Import-ScriptletPreferencesAndReapply {
     if ($wanted.Count -eq 0) { return 0 }
 
     $changed = 0
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     foreach ($file in (Get-ScriptletListFiles -Root $Root)) {
-        $lines = [System.IO.File]::ReadAllLines($file.FullName)
+        $data = Read-ListFileLines -Path $file.FullName
+        $lines = $data.Lines
         $fileChanged = $false
         for ($i = 0; $i -lt $lines.Length; $i++) {
             $original = Get-ScriptletRuleFromLine -Line $lines[$i]
@@ -2412,7 +3122,7 @@ function Import-ScriptletPreferencesAndReapply {
             $changed++
         }
         if ($fileChanged) {
-            [System.IO.File]::WriteAllLines($file.FullName, [string[]]$lines, $utf8NoBom)
+            Write-ListFileLines -Path $file.FullName -Data $data -Lines $lines
         }
     }
     return $changed
@@ -2502,7 +3212,7 @@ function Set-ScriptletUiBusy {
     }
 
     if ($script:LblScriptletStatus -and $Message) { $script:LblScriptletStatus.Text = $Message }
-    if ($form) { $form.UseWaitCursor = $Busy }
+    if ($script:Form) { $script:Form.UseWaitCursor = $Busy }
     [System.Windows.Forms.Application]::DoEvents()
 }
 
@@ -2803,11 +3513,7 @@ function Complete-ScriptletScan {
         $script:LblScriptletStatus.Text += (T 'scriptlet.scanDone' @($elapsed))
     }
     if ($script:ScriptletRules.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show(
-            (T 'msg.scriptlet.noRules' @($root)),
-            (T 'msg.title.scriptlet'),
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.noRules' @($root)) -Title (T 'msg.title.scriptlet') -Buttons 'OK' -Icon 'Information')
     }
 }
 
@@ -2881,11 +3587,7 @@ function Invoke-ScriptletScan {
         if ($files.Count -eq 0) {
             Set-ScriptletUiBusy $false
             if ($script:ScriptletProgress) { $script:ScriptletProgress.Value = 0 }
-            [System.Windows.Forms.MessageBox]::Show(
-                (T 'msg.scriptlet.noFiles' @($root)),
-                (T 'msg.title.scriptlet'),
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            [void](Show-Message -Text (T 'msg.scriptlet.noFiles' @($root)) -Title (T 'msg.title.scriptlet') -Buttons 'OK' -Icon 'Information')
             return
         }
 
@@ -2929,1175 +3631,1410 @@ function Invoke-ScriptletScan {
         $script:ScriptletRules = @()
         Update-ScriptletListView
         Write-Log "Scriptlet scan failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show(
-            (T 'msg.scriptlet.scanFailed' @("$_")),
-            (T 'msg.title.scriptlet'),
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.scanFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Buttons 'OK' -Icon 'Error')
+    }
+}
+
+
+#endregion
+
+#region UI: shell ---------------------------------------------------------------
+# Layout rules: every control is docked or lives in a Table/FlowLayoutPanel, and
+# nothing is placed by absolute coordinates. Absolute positions break as soon as
+# a translation is longer, the window is small, or the layout is mirrored for a
+# right-to-left language.
+function New-Rgb { param([int]$R, [int]$G, [int]$B) return [System.Drawing.Color]::FromArgb($R, $G, $B) }
+$script:Clr = @{
+    Graphite = (New-Rgb 20 24 31);   Graphite2 = (New-Rgb 36 42 52);  GraphiteLine = (New-Rgb 62 70 84)
+    Ink      = (New-Rgb 31 35 40);   Slate     = (New-Rgb 87 96 106); Mist = (New-Rgb 101 109 118)
+    Fog      = (New-Rgb 244 245 247); Line     = (New-Rgb 228 231 235); LineStrong = (New-Rgb 208 213 219)
+    White    = [System.Drawing.Color]::White
+    Ember    = (New-Rgb 201 63 23);  EmberDark = (New-Rgb 168 50 16); EmberSoft = (New-Rgb 253 236 229)
+    Green    = (New-Rgb 26 127 75);  Blue = (New-Rgb 9 105 218);      Amber = (New-Rgb 154 103 0)
+    Red      = (New-Rgb 207 34 46);  RedSoft = (New-Rgb 255 241 242); AmberSoft = (New-Rgb 255 248 230)
+    Selection = (New-Rgb 236 242 251); OnDark = (New-Rgb 226 230 235); OnDarkMuted = (New-Rgb 176 184 194)
+}
+
+function New-Ctl {
+    param([string]$Type, [hashtable]$Props = @{}, $Parent = $null)
+    $c = New-Object ("System.Windows.Forms.$Type")
+    foreach ($k in $Props.Keys) { $c.$k = $Props[$k] }
+    if ($Parent) { [void]$Parent.Controls.Add($c) }
+    return $c
+}
+
+function New-BfoButton {
+    param([string]$Key, [ValidateSet('Default', 'Primary', 'Danger', 'Ghost')][string]$Style = 'Default', [int]$MinWidth = 0)
+    $b = New-Object System.Windows.Forms.Button
+    $b.AutoSize = $true
+    $b.AutoSizeMode = 'GrowAndShrink'
+    $b.MinimumSize = New-Object System.Drawing.Size($MinWidth, 34)
+    $b.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
+    $b.FlatStyle = 'Flat'
+    $b.UseVisualStyleBackColor = $false
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.FlatAppearance.BorderSize = 1
+    switch ($Style) {
+        'Primary' {
+            $b.BackColor = $script:Clr.Ember; $b.ForeColor = $script:Clr.White
+            $b.FlatAppearance.BorderColor = $script:Clr.Ember; $b.FlatAppearance.MouseOverBackColor = $script:Clr.EmberDark
+            [void](Set-LocFont $b -Size 9.5 -Semibold)
+        }
+        'Danger' {
+            $b.BackColor = $script:Clr.White; $b.ForeColor = $script:Clr.Red
+            $b.FlatAppearance.BorderColor = (New-Rgb 240 190 195); $b.FlatAppearance.MouseOverBackColor = $script:Clr.RedSoft
+            [void](Set-LocFont $b -Size 9)
+        }
+        'Ghost' {
+            $b.BackColor = $script:Clr.White; $b.ForeColor = $script:Clr.Ink
+            $b.FlatAppearance.BorderColor = $script:Clr.White; $b.FlatAppearance.MouseOverBackColor = $script:Clr.Fog
+            [void](Set-LocFont $b -Size 9)
+        }
+        default {
+            $b.BackColor = $script:Clr.White; $b.ForeColor = $script:Clr.Ink
+            $b.FlatAppearance.BorderColor = $script:Clr.LineStrong; $b.FlatAppearance.MouseOverBackColor = $script:Clr.Fog
+            [void](Set-LocFont $b -Size 9)
+        }
+    }
+    if ($Key) { [void](Set-Loc $b $Key) }
+    return $b
+}
+
+$script:ToolTip = New-Object System.Windows.Forms.ToolTip
+$script:ToolTip.AutoPopDelay = 30000
+$script:ToolTip.InitialDelay = 350
+$script:ToolTip.ReshowDelay  = 200
+
+# ---- Window -------------------------------------------------------------------
+function New-MainForm {
+    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    try { $wa = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea } catch { }
+    $w = [Math]::Min(1180, $wa.Width - 32)
+    $h = [Math]::Min(800, $wa.Height - 32)
+    $form = New-Object System.Windows.Forms.Form
+    $form.SuspendLayout()
+    $form.Size = New-Object System.Drawing.Size($w, $h)
+    # The old fixed minimum (1080x860) did not fit small screens at all.
+    $form.MinimumSize = New-Object System.Drawing.Size([Math]::Min(940, $w), [Math]::Min(600, $h))
+    $form.StartPosition = 'CenterScreen'
+    $form.Font = Get-BfoUiFont -Size 9
+    $form.BackColor = $script:Clr.Fog
+    $form.KeyPreview = $true
+    # The window / taskbar icon is the same mark. Icon.FromHandle does not own the handle; one small icon lives as long as the window.
+    $logo = Get-BfoLogoBitmap
+    if ($logo) { try { $form.Icon = [System.Drawing.Icon]::FromHandle($logo.GetHicon()) } catch { Write-Log "Window icon not set: $($_.Exception.Message)" 'WARN' } }
+    [void](Set-Loc $form 'app.title' -FormatArgs @($script:AppVersion))
+    return $form
+}
+
+# ---- Header: brand, language, preset strip -----------------------------------
+function New-HeaderPanel {
+    $hdr = New-Ctl 'Panel' @{ Dock = 'Top'; BackColor = $script:Clr.Graphite; Padding = (New-Object System.Windows.Forms.Padding(16, 10, 16, 6)); Height = 160 }
+
+    $table = New-Ctl 'TableLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; ColumnCount = 3; RowCount = 4; BackColor = $script:Clr.Graphite } $hdr
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+    foreach ($i in 0..2) { [void]$table.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize'))) }
+    # Row 3 (version note) stays collapsed until Update-BraveInfo has something to say;
+    # an invisible control in an AutoSize row still reserves the row's space.
+    [void]$table.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Absolute', 0)))
+    $script:HeaderTable = $table
+    $script:HeaderPanel = $hdr
+    $table.Add_SizeChanged({ $script:HeaderPanel.Height = $script:HeaderTable.Height + $script:HeaderPanel.Padding.Vertical })
+
+    # Row 0, left - brand mark + title/subtitle
+    $brand = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'LeftToRight'; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0)) }
+    $logo = Get-BfoLogoBitmap
+    if ($logo) {
+        $mark = New-Ctl 'PictureBox' @{ Image = $logo; SizeMode = 'Zoom'; Size = (New-Object System.Drawing.Size(48, 48)); BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 10, 0)) } $brand
+        $mark.RightToLeft = 'No'
+    } else {
+        # Only if the embedded picture could not be decoded: a plain lettered tile keeps the layout identical.
+        $mark = New-Ctl 'Label' @{ Text = 'B'; AutoSize = $false; Size = (New-Object System.Drawing.Size(36, 36)); BackColor = $script:Clr.Ember; ForeColor = $script:Clr.White; TextAlign = 'MiddleCenter'; Margin = (New-Object System.Windows.Forms.Padding(0, 2, 10, 0)) } $brand
+        $mark.RightToLeft = 'No'
+        [void](Set-LocFont $mark -Size 15 -Semibold)
+    }
+    $titles = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'TopDown'; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0)) } $brand
+    $title = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.White; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0)) } $titles
+    [void](Set-Loc $title 'app.name'); [void](Set-LocFont $title -Size 15 -Semibold)
+    $sub = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.OnDarkMuted; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(1, 0, 0, 0)) } $titles
+    [void](Set-Loc $sub 'header.subtitle'); [void](Set-LocFont $sub -Size 8.5)
+    $table.Controls.Add($brand, 0, 0)
+
+    # Row 0, right - language picker and, underneath, which Brave this PC has
+    $rightStack = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'TopDown'; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0)); Anchor = 'Right' }
+    $right = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'LeftToRight'; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0)) } $rightStack
+    $lblLang = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.OnDarkMuted; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0, 6, 6, 0)) } $right
+    [void](Set-Loc $lblLang 'header.language'); [void](Set-LocFont $lblLang -Size 8.5)
+    $script:LanguageCombo = New-Ctl 'ComboBox' @{ DropDownStyle = 'DropDownList'; Width = 170; FlatStyle = 'Flat'; Margin = (New-Object System.Windows.Forms.Padding(0, 2, 0, 0)) } $right
+    $script:LblLocaleNote = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = (New-Rgb 255 212 153); BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(8, 6, 0, 0)); Text = '' } $right
+    [void](Set-LocFont $script:LblLocaleNote -Size 8)
+    $btnHelp = New-Ctl 'Button' @{ Text = '?'; Size = (New-Object System.Drawing.Size(30, 26)); FlatStyle = 'Flat'; BackColor = $script:Clr.Graphite2; ForeColor = $script:Clr.OnDark; Cursor = [System.Windows.Forms.Cursors]::Hand; Margin = (New-Object System.Windows.Forms.Padding(8, 2, 0, 0)); UseVisualStyleBackColor = $false } $right
+    $btnHelp.FlatAppearance.BorderColor = $script:Clr.GraphiteLine
+    $btnHelp.RightToLeft = 'No'
+    [void](Set-LocTooltip $btnHelp 'header.help')
+    $btnHelp.Add_Click({ Invoke-Guarded 'Help' { Show-HelpDialog } })
+    $script:LblBrave = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.OnDarkMuted; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0, 6, 0, 0)); Anchor = 'Right' } $rightStack
+    [void](Set-LocFont $script:LblBrave -Size 8.5)
+    $table.Controls.Add($rightStack, 2, 0)
+
+    # Row 1 - preset strip (segmented buttons that wrap on narrow windows)
+    $script:PresetFlow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Fill'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $true; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0, 8, 0, 0)) }
+    $table.Controls.Add($script:PresetFlow, 0, 1)
+    $table.SetColumnSpan($script:PresetFlow, 3)
+    $script:PresetButtons = @{}
+    foreach ($key in $script:PresetKeys) {
+        $b = New-Ctl 'Button' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; FlatStyle = 'Flat'; Cursor = [System.Windows.Forms.Cursors]::Hand; UseVisualStyleBackColor = $false
+            Margin = (New-Object System.Windows.Forms.Padding(0, 3, 8, 3)); Padding = (New-Object System.Windows.Forms.Padding(8, 0, 8, 0)); MinimumSize = (New-Object System.Drawing.Size(96, 30)); Tag = $key } $script:PresetFlow
+        $b.FlatAppearance.BorderSize = 1
+        [void](Set-Loc $b "preset.$key.name")
+        [void](Set-LocTooltip $b "preset.$key.description")
+        $b.Add_Click({ $k = $this.Tag; Invoke-Guarded 'Preset' { Invoke-PresetClick $k } })
+        $script:PresetButtons[$key] = $b
+    }
+
+    # Row 2 - what the selected mode does (fixed two-line height: text wraps, the layout never jumps)
+    $script:LblModeInfo = New-Ctl 'Label' @{ Dock = 'Fill'; AutoSize = $false; Height = 38; ForeColor = $script:Clr.OnDark; BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0, 4, 0, 0)) }
+    [void](Set-LocFont $script:LblModeInfo -Size 8.5)
+    $table.Controls.Add($script:LblModeInfo, 0, 2)
+    $table.SetColumnSpan($script:LblModeInfo, 3)
+
+    # Row 3 - shown only when the installed Brave is much newer or older than the
+    # version this list of settings was checked against.
+    $script:LblCompat = New-Ctl 'Label' @{ Dock = 'Fill'; AutoSize = $false; Height = 36; ForeColor = (New-Rgb 255 212 153); BackColor = $script:Clr.Graphite; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 2)); Visible = $false }
+    [void](Set-LocFont $script:LblCompat -Size 8.5)
+    $table.Controls.Add($script:LblCompat, 0, 3)
+    $table.SetColumnSpan($script:LblCompat, 3)
+    return $hdr
+}
+
+# Highlights the active preset (the old UI never showed which mode was in effect).
+function Update-PresetStrip {
+    foreach ($key in $script:PresetKeys) {
+        $b = $script:PresetButtons[$key]
+        $on = ($script:ActiveProfile -eq $key)
+        if ($on) {
+            $b.BackColor = $script:Clr.Ember; $b.ForeColor = $script:Clr.White
+            $b.FlatAppearance.BorderColor = $script:Clr.Ember; $b.FlatAppearance.MouseOverBackColor = $script:Clr.EmberDark
+            $b.Font = Get-BfoUiFont -Size 9.5 -Semibold
+        } else {
+            $b.BackColor = $script:Clr.Graphite2; $b.ForeColor = $script:Clr.OnDark
+            $b.FlatAppearance.BorderColor = $script:Clr.GraphiteLine; $b.FlatAppearance.MouseOverBackColor = $script:Clr.GraphiteLine
+            $b.Font = Get-BfoUiFont -Size 9.5
+        }
+    }
+}
+
+# ---- Sidebar ------------------------------------------------------------------
+function New-Sidebar {
+    $side = New-Ctl 'Panel' @{ Dock = 'Left'; Width = 226; BackColor = $script:Clr.Fog; Padding = (New-Object System.Windows.Forms.Padding(8, 8, 0, 0)) }
+    $tv = New-Ctl 'TreeView' @{ Dock = 'Fill'; BorderStyle = 'None'; BackColor = $script:Clr.Fog; ShowLines = $false; ShowRootLines = $false; ShowPlusMinus = $false
+        FullRowSelect = $true; HideSelection = $false; ItemHeight = 30; Indent = 4; Scrollable = $true; ShowNodeToolTips = $true } $side
+    $tv.Font = Get-BfoUiFont -Size 9
+    $script:Nav = $tv
+    # Group headings are labels, not destinations: never let them take the selection.
+    $tv.Add_BeforeSelect({ if ($_.Node.Tag -is [string] -and $_.Node.Tag.StartsWith('group:')) { $_.Cancel = $true } })
+    $tv.Add_BeforeCollapse({ $_.Cancel = $true })
+    $tv.Add_AfterSelect({ $target = $_.Node.Tag; Invoke-Guarded 'Navigate' { Show-Page $target } })
+    return $side
+}
+
+# ---- Bottom: action bar + status strip ------------------------------------------
+function New-ActionBar {
+    $bar = New-Ctl 'Panel' @{ Dock = 'Bottom'; Height = 58; BackColor = $script:Clr.White; Padding = (New-Object System.Windows.Forms.Padding(12, 11, 12, 11)) }
+    [void](New-Ctl 'Panel' @{ Dock = 'Top'; Height = 1; BackColor = $script:Clr.Line } $bar)
+
+    $right = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Right'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'LeftToRight'; BackColor = $script:Clr.White } $bar
+    $script:LblPending = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.Ink; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 8, 14, 0)) } $right
+    [void](Set-LocFont $script:LblPending -Size 9.5 -Semibold)
+    $script:BtnPreview = New-BfoButton 'action.preview' 'Default' 120
+    $script:BtnPreview.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
+    $script:BtnApply = New-BfoButton 'action.apply' 'Primary' 150
+    $script:BtnApply.Margin = New-Object System.Windows.Forms.Padding(0)
+    $right.Controls.AddRange([System.Windows.Forms.Control[]]@($script:LblPending, $script:BtnPreview, $script:BtnApply))
+
+    $left = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Left'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'LeftToRight'; BackColor = $script:Clr.White } $bar
+    $script:BtnTools = New-BfoButton 'tools.button' 'Default' 90
+    $script:BtnTools.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 0)
+    $script:BtnRestore = New-BfoButton 'action.fullRestore' 'Danger' 120
+    $script:BtnRestore.Margin = New-Object System.Windows.Forms.Padding(0, 0, 12, 0)
+    $script:ChkBackup = New-Ctl 'CheckBox' @{ AutoSize = $true; Checked = $true; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 8, 0, 0)) }
+    [void](Set-Loc $script:ChkBackup 'action.backup'); [void](Set-LocFont $script:ChkBackup -Size 9)
+    $left.Controls.AddRange([System.Windows.Forms.Control[]]@($script:BtnTools, $script:BtnRestore, $script:ChkBackup))
+    return $bar
+}
+
+function New-StatusStrip {
+    $status = New-Ctl 'Panel' @{ Dock = 'Bottom'; Height = 26; BackColor = (New-Rgb 236 238 241) }
+    $script:BtnLogToggle = New-Ctl 'Button' @{ Dock = 'Right'; AutoSize = $true; FlatStyle = 'Flat'; BackColor = (New-Rgb 236 238 241); ForeColor = $script:Clr.Slate; Cursor = [System.Windows.Forms.Cursors]::Hand; UseVisualStyleBackColor = $false; Padding = (New-Object System.Windows.Forms.Padding(6, 0, 6, 0)) } $status
+    $script:BtnLogToggle.FlatAppearance.BorderSize = 0
+    [void](Set-Loc $script:BtnLogToggle 'status.showLog'); [void](Set-LocFont $script:BtnLogToggle -Size 8.5)
+    $script:StatusLabel = New-Ctl 'Label' @{ Dock = 'Fill'; TextAlign = 'MiddleLeft'; ForeColor = $script:Clr.Slate; Padding = (New-Object System.Windows.Forms.Padding(12, 0, 0, 0)); AutoEllipsis = $true } $status
+    [void](Set-LocFont $script:StatusLabel -Size 8.5)
+    $script:StatusLabel.BringToFront()
+    return $status
+}
+
+function New-LogPanel {
+    $panel = New-Ctl 'Panel' @{ Dock = 'Bottom'; Height = 150; Visible = $false; BackColor = (New-Rgb 18 18 18) }
+    $script:LogBox = New-Ctl 'TextBox' @{ Dock = 'Fill'; Multiline = $true; ScrollBars = 'Vertical'; ReadOnly = $true; BorderStyle = 'None'
+        BackColor = (New-Rgb 18 18 18); ForeColor = [System.Drawing.Color]::LightGreen; WordWrap = $true } $panel
+    $script:LogBox.Font = Get-BfoUiFont -Size 8.5 -Mono
+    return $panel
+}
+#endregion
+
+#region UI: brand mark ---------------------------------------------------------
+# The Brave Free Origin mark (transparent PNG, 96 px) is embedded as base64 so the
+# app stays a single file: the header and the window icon work even when only
+# Brave-Free-Origin.ps1 was copied. Pure ASCII, like the rest of the file.
+$script:LogoPngBase64 = -join @(
+    'iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAMAAADVRocKAAABgFBMVEXhZx8VN1wsa5tQco9ai6vY29pJXXHziiJvkKWPoKqgpqtg'
+    'dYooT27clV51j6S1Ow8Yamzg3tpnn6RVZHS1VimVs8fXsJTozKrLdE1qbq+zaUpldotbXmTRk26wy9W0ydSTprMiIniQm6c6hLOj'
+    'tczYrpKdtscA//8mPT1YandYmMM7UW3CPRR4fvndso3TmXXr5NToyLDm2bGqxdS0dlfqrqQhZKd///+kXV2/fz+enX6KrsfdoHpo'
+    'ERH/f3+4jnCSws/FfmO4k3d2p8H//38AAP/t8/DvxIwA/wA9Tmefi3f//wCDa4uBf4SedGJ+scl/uNRzgH4AAAAtZpP+/v4ZRm/G'
+    'SBLQVRUnWYcoSWz8/PswVHPvdyf0hyd/f3+6RBMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACvetg9AAAAYHRSTlP+/vzs8SHo/ppZIKDy'
+    '9Gn+A/wQpP5f+fz7B/VjDJ0r/fgDmf0qYfgBBGX2qv4DnG1PWBxaqhsEAgoEGpMIAwL/l7dwowIBnJgBW5YC/6pyXxJ5AP4H/v7+'
+    '/vv++/7+Av6XeY4zAAAM8ElEQVR42u1Zh3LjOBIlCZBiVs6WLMuSPQ6T887mdDmBYBIl8f//4l6DctqzvZ6t2au6q0HZFCWR/dCv'
+    '+zWakCZ+56F9BvgM8L8D8PgT2z1++9/1QIqF+ymtSuEuxPYawLHkrUunPsFoHXe5vAbwWEyZLRqfDmAobG5WLiiAlnAiLn+Sn4wh'
+    'MMLcawAuATjik4VhIbqnvFvZ0yqPnMjgsnF83124fPvAFJWSHwKgdQmwBUCET4b33bZnC/HmQXLZii432BWAxJkbkQt790bB8vD1'
+    'gRTSvT9YsgEHDLYQjyUu1MC/I4TJAGBXmLfftXXnEQtN8euRaiCFDANZRJZd7UDYDJiMXLiXpC8Yjwxmu0J23ftTtAsHFB98LBoA'
+    'CEGXsKMsItTW3cTusSijmXE+M7d3svRYmJi/YYQCQCEAGmIMNDGNjIhgD+TteYEgiznLCcGoNHQ7BAzYZJ+ZpIVQDLWhCCPDFtJT'
+    'LszFG3nbrJQPrmcVWRZFiJVb6fOuAMCixAllEoI89Q1SGcsoDM6tYZAmJgyVSPiQMVfpxbzNhUdiTvYj5JDDIwZXKU0Z/J4iCgAw'
+    'yCshjm+y36IEg72pl+cFrmi4zgITXPwHTVCssg9KFvwQ5Yd0sCdAGuOmSS4ove3dIBiJzw37QIh/WUVunSBTkbEn4sCm0N1EQE1j'
+    'ZB9Tn3Ju/HWOnNbw6VRlhwzVd0Aw59djLSVy2Bam6zJmXSSo+UIQgLx22fbFXPyDV/YXZF8xREpuCC+rEDIKYcS+3TFS3TgEhxG3'
+    '2RwUtcSj4VsSss1sHnFx7TKK7gejmmPXJCWAp21VixpT5iPw7NnMVwgGSa4qOxLUmF0G5FzNfovptK2p9ApcyLqS1ha67u0b8YEm'
+    'Tfaz/aYiiplDVYugZ2kXdANvzmJywsgIgeAp3W3oK45zHwBb0pdstRsuwhHnBaqLSQL5Iyx9y3FbpOzvc+VJqGqFJk6QUpJlBaHv'
+    'HxECYZx+MEUD7IQsy3U9tpwLLuZORYnD4jguUDskVSfTJlJwY1Yc7YMCiIrUy/cAIBkWn4Wl+Dc4j4kidQZLY1bEse8VuV2lE9TC'
+    'yeEQcF7OWB7HtFLJl6enJF9QVMx4puwjwi85k0JrgE/miC+tIia7zMi4ERPKIf9h6lhx3nalVdithorA2Me1IuSObHk5l047xwfT'
+    'U0yf5mVAW5RHmCzsdzmSr4FS4eKtjVzMYh8uGtC1YcQZXY6M9cCktLKqJUDdygGA5cP9iTyAH44nuxTdKIpxw6FBSQIuPClRMiJX'
+    '7GmYloccYg48KXykkY/JHwKBnDj9AKtb8gDGt5IAIhQTxP5AAQzfCMFPyX4WZ/zwsMqiuLClQ6i20sFWTK24KCJuOj7FLcZUjNOI'
+    'CIsOuS1bYgeAfPmSAN5/JX7cVgAA/eH0UNk3VJEGOUbMmj8j9SLQ1FBCQ60pwE7GvJdHRZznBIDLdwimUADvv/ryBRhRHkC/7/fe'
+    'txVF04r+2MCLAZgsjo6aM4bPCta6EFqLEJQC+BGLEQsSjBHFBRUOhwAoi8xeMFmaZ2fmkyB4grvaBQF0iZ8ijlQSxRkz2BFX+UiZ'
+    's71qfluMhFPEBQNXvOInjysAKa2jn59MgiBYb4Jnz4KNFgSTyR+eeQzdIYoy4lvpP+Kn4CVTPKGoXzS/SG5SikfazMAVsqiCyOg+'
+    'vsA0nvWD9VrDnwbbONL5JlhOhfja5SrAKkcRV5/SxMA8oT+yK1WQXctb4G27AP/ElUppvNJ90KP7NNCUUY3Gunqhs2D5GqU8IwDE'
+    'jcobcjzz46zwgG2GrAJALRnnhRcu4IVPZYFkRn4rqBDcD5J0ZzpV9jH9yp+g95zWqezaLXE1+6ljMzamtasKcptgLS905twiJ1RF'
+    'oiPi+DyA3U1to7xI1utEw+kmQCi0NQCwTmUX18dZznjYDVHKjQypvXcRZKwIBTSQgyPGIGLSc0WWLSZavUzI+EZLybpW19bpurYh'
+    'ppJEe0IND9FJlR4lk0WUexF0NYYYrz1COVauHNTBEZjJIpwhT1vLQQlLHTqs00RLNHUgd8AbMINlqCjKVaUmCznFmZL00c1nNBla'
+    'FGSFUCiPdb3Iwkm6Dmq1GiaLyZdpSrMmlBJe1IinSZjhruLSPpRaoDGQ1fyvAKjHmY69Mz/PK1fIG8R+mda0lCjRynpZAiYp1Ugp'
+    'KqkWaE+sPNeV3cq23/ZCksDejYfAt6DoLHT33K7dhpJz5UsMV4q5tk4oBmlaUp6mpSILb/GSJulG6/k7gAIiirhnd929PafNLp5n'
+    'dh5sJVoe3aeLQREskyM4LfqUoIAok/VmU6tt0nRDA/GgYACgWajrMSrPC7q1KMa7Z8BLihoQGhm/HLE6HjU7KlnScg3zNWW8RifI'
+    'Jwr6Wmse6bq/o1SvXsHs4tatBNfDAlXkhUWFiVQ9d55QdJGedeJ8N2oKAZDrFGPQa+5TiiNirKAIFpa9uArBNYDtrgvtoommuWBi'
+    '7SVUnJC4KGdIX2pohFUDWfiHmpuzauZ6YYULed3YLzxwt67tta08viTJn06QmuCiviaT2rpyQNOAVtskSDCMfvOK1Dy3zk4ct7W9'
+    'dbcFZQ3mdbosZxa9hhPkPJgAQZQ0a0UTuYKZb0CSpvTc3yfzaDEoQ/zcarvXW9brFLlo0p2TdvtPLx1G9v3nqrol9TqSctTROgRA'
+    'c0/TzghHig5BNGk2utXt4t4TNFCucytFj9ATmugSuuILyqe8PXZUGU3TpI7i0O8FpC6Kr9YJev3aOlElitYIx6M7/PY73O6g/HnX'
+    'tiWuAIboctyhp1vm36wzb4y1eIkI0zKgysSm1w/KtcqgEqcbAkiqVSJYwvNx+8yypRXbrT0vPB7euePl6bTSwgnri4NloNaByhBC'
+    'HFAugaIUJQjBgNZS5UHPaZiWZ1IYC9++e0sNzcKJ4+gWkrhxkvv4YFQVhAsAuEH2aypdyTNVMOABmko/C/cw7TzvOidC3hbkLXpU'
+    'yQp+FCJM8iQ3hHjdSUEBrNASQHTXqhiQopFTEDKSCevE4LkCOEaP6qCn4JJdbBbdKNcy9BhjPsPThikAIMVETTBdU5A1VYRqlYrJ'
+    '/q7WrWk8FWaeYXHljLMcBy+88uFGDMYn0smR0Z4ckweTlCZJQUaepqSyoB/gDz7AI/Ud9AGoiQLAczHTc0eOwztioMqr9Hlz3+qi'
+    'yQUAlTliJ62TnVrQGXzT638TdAKsEfTdOiVf0jUBRGHo7zd5Ln/xBH3Dg9YWTba1WnGmPAhAglatveegY9Mf1dX4pl+rUehRpNTi'
+    'qTwo5oyvVhaasaF798YsxNZEY+AzTwfAq8GgSpP6eVLv9PvNVRMQo+aq3+93CADZRDEOCCCfI3is2Ld3a/HtAAdQM1WWo5nuS/H3'
+    '/oAWYC0BQyWpFwidDg79Xo/WfHhFLgT974XpF46NarcPFd8HgP5FnzVnOW/i6adlPuukBHCerrEeK4BV0FsBAKLGEkdBJhdNcwih'
+    'PWP+rMl0+2K1vxOArVb7MZ+9pIiPkCtrwqiXdRT+1Wo1GuFAdSkpqT8igAE9enZtlu8jBvGDAFDhc52qrlpu0M6BqbIzaK56nbLT'
+    '6a2aA2qUIDUNhTWFkLusQP1tPhhglrPmEStc8UolKvJUK5Pzzmg06vX7vdFoUJ6rUkq1PEEOuQXHw7c++wgPkHG8mIslZk7mUS8q'
+    'F9ToD9AX0Uqt6pG2lHY0WzX5hQePfh1gNdN1Tsu3HA06pDWtRCp1VpejU0/X1CeBpMFI0mLGc/0IX1j6wwBWWMj1s3Zbft8LkqrL'
+    'Leud5oX9ZqcsqRFAUxb0nkrWxnrjqW8fDHDE5i21b2BOEpXxSKfOqN8j673+qExUMQV5k+e0Kyrc0P84AAgN7w7G1j9fdyAzWpQT'
+    '+DAKoITBiBp6Cm+SDF48xnNGAyVM3/84D3T/R6zcYczEq6RUaya6XtShXg+SoEaSUhcZhEdc2oQz848EUB5gs01n5otRmdJDQlKe'
+    'n0Ne0HRJ7YRWDtJkZC6KOETxlL8RIEQLIJbQFjXYl627RgCJ1iuxlJk7gOJhALToWzuAv+CdAhBPB8tRXUVaIainnLQe9EfLY2gM'
+    'AI+AcwVw/+9o9mUMaHvIAUUoNE+cp8h8apKUA0R+XVs6S9odLGI8qj8QQAps7epYVBm39NzCwBMhthqtsTQnHZAP5uvKfnnemZjy'
+    'pO15aJRZGxfiBQ/ikJtleTd+yLjpgaXfNrDpVAwnkDTYoQjgr/N0aFn+rVfrZ3d6sMVyQ48HGDgUxe4Fwy+s6XI0oCKNPyjhaddS'
+    'DzKXQ11b3dm+0wNQefdwhTs3X6FGaN+Zf36BRvnucWM/+OE/Nb6jKbwqy+/k7s1v+TVWbu8c2N36Cnsfo5EUr999ff+Vv/3n3q9p'
+    'i+ad+B1/T5Z3/fLxyX6w3m7F59/0PwP83wH8GxBXyTmZI1jjAAAAAElFTkSuQmCC'
+)
+$script:LogoBitmap = $null
+$script:LogoStream = $null
+
+function Get-BfoLogoBitmap {
+    if ($script:LogoBitmap) { return $script:LogoBitmap }
+    try {
+        # A Bitmap loaded from a stream needs that stream for its whole lifetime, so keep it.
+        $script:LogoStream = New-Object System.IO.MemoryStream(, [System.Convert]::FromBase64String($script:LogoPngBase64))
+        $script:LogoBitmap = New-Object System.Drawing.Bitmap($script:LogoStream)
+    } catch {
+        Write-Log "The brand mark could not be decoded: $($_.Exception.Message)" 'WARN'
+        $script:LogoBitmap = $null
+    }
+    return $script:LogoBitmap
+}
+#endregion
+
+
+#region UI: settings grids --------------------------------------------------------
+# One DataGridView per page instead of hundreds of loose controls: it builds in
+# tens of milliseconds, scrolls, wraps text at any width and mirrors for RTL.
+$script:ColCheck = 0; $script:ColSetting = 1; $script:ColWhat = 2; $script:ColRisk = 3
+$script:ColState = 4; $script:ColPolicy = 5; $script:ColValue = 6
+$script:Grids = @{}
+$script:GridsDirty = @{}
+$script:ShowTechnical = $true
+
+function Get-ItemText {
+    param($Item, [ValidateSet('title', 'description')][string]$Part)
+    switch ($Item.Kind) {
+        'Policy'  { return T "policy.$($Item.Id).$Part" }
+        'Task'    { return T "task.$($Item.Id).$Part" }
+        'Service' { return T "service.$($Item.Id).$Part" }
+        'Host'    { if ($Part -eq 'title') { return T "hosts.$($Item.Id).name" } else { return T "hosts.$($Item.Id).description" } }
+    }
+    return $Item.Id
+}
+
+function Get-ItemRisk {
+    param($Item)
+    switch ($Item.Kind) {
+        'Policy'  { return $Item.Def.Risk }
+        'Task'    { return 'high' }
+        'Service' { return 'high' }
+        'Host'    { return $Item.Def.Risk }
+    }
+    return 'low'
+}
+
+function Get-ItemTechnical {
+    param($Item)
+    switch ($Item.Kind) {
+        'Policy'  { if ($Item.Def.Choices) { return $Item.Id } else { return $Item.Id } }
+        'Task'    { return $Item.Def.Pattern }
+        'Service' { return $Item.Def.Name }
+        'Host'    { return ($Item.Def.Domains -join ', ') }
+    }
+    return ''
+}
+
+function Get-ItemTooltip {
+    param($Item)
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add((Get-ItemText $Item 'title'))
+    [void]$lines.Add('')
+    [void]$lines.Add((Get-ItemText $Item 'description'))
+    [void]$lines.Add('')
+    switch ($Item.Kind) {
+        'Policy' {
+            [void]$lines.Add((T "tip.ticked.$($Item.Def.Kind)"))
+            [void]$lines.Add((T 'tip.unticked'))
+            if ($Item.Def.Lock) { [void]$lines.Add((T 'tip.lock')) }
+            [void]$lines.Add('')
+            [void]$lines.Add((T 'tip.risk' @((T "risk.$($Item.Def.Risk)"))))
+            [void]$lines.Add((T 'tip.policy' @($Item.Id, $Item.Value, $Item.Def.Type)))
+        }
+        'Task'    { [void]$lines.Add((T 'tip.updater')); [void]$lines.Add((T 'tip.pattern' @($Item.Def.Pattern))) }
+        'Service' { [void]$lines.Add((T 'tip.updater')); [void]$lines.Add((T 'tip.service' @($Item.Def.Name))) }
+        'Host'    { [void]$lines.Add((T 'tip.hosts')); [void]$lines.Add((T 'tip.domains' @(($Item.Def.Domains -join ', ')))) }
+    }
+    return ($lines -join "`r`n")
+}
+
+# ---- Grid factory --------------------------------------------------------------
+function New-SettingsGrid {
+    $g = New-Object System.Windows.Forms.DataGridView
+    # DoubleBuffered is protected; without it scrolling a styled grid flickers.
+    $prop = [System.Windows.Forms.DataGridView].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+    if ($prop) { $prop.SetValue($g, $true, $null) }
+    $g.Dock = 'Fill'
+    $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false; $g.AllowUserToResizeRows = $false; $g.AllowUserToOrderColumns = $false
+    $g.RowHeadersVisible = $false
+    $g.SelectionMode = 'FullRowSelect'; $g.MultiSelect = $false
+    $g.BackgroundColor = $script:Clr.White; $g.BorderStyle = 'None'
+    $g.CellBorderStyle = 'SingleHorizontal'; $g.GridColor = (New-Rgb 236 238 242)
+    $g.EnableHeadersVisualStyles = $false
+    $g.ColumnHeadersHeightSizeMode = 'DisableResizing'; $g.ColumnHeadersHeight = 30
+    $g.ColumnHeadersBorderStyle = 'Single'
+    $hs = $g.ColumnHeadersDefaultCellStyle
+    $hs.BackColor = $script:Clr.Fog; $hs.ForeColor = $script:Clr.Slate; $hs.SelectionBackColor = $script:Clr.Fog; $hs.SelectionForeColor = $script:Clr.Slate
+    $hs.Padding = New-Object System.Windows.Forms.Padding(4, 0, 4, 0)
+    $ds = $g.DefaultCellStyle
+    $ds.BackColor = $script:Clr.White; $ds.ForeColor = $script:Clr.Ink
+    $ds.SelectionBackColor = $script:Clr.Selection; $ds.SelectionForeColor = $script:Clr.Ink
+    $ds.Padding = New-Object System.Windows.Forms.Padding(4, 6, 4, 6)
+    $ds.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+    $g.EditMode = 'EditProgrammatically'
+    $g.AutoSizeRowsMode = 'None'
+    $g.RowTemplate.Height = 46
+    $g.ShowCellToolTips = $true
+    $g.ScrollBars = 'Vertical'
+    $g.TabStop = $true
+
+    $cCheck = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+    $cCheck.Width = 40; $cCheck.Resizable = 'False'; $cCheck.Name = 'check'
+    $cCheck.DefaultCellStyle.Alignment = 'MiddleCenter'
+    $cSetting = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $cSetting.Name = 'setting'; $cSetting.AutoSizeMode = 'Fill'; $cSetting.FillWeight = 30; $cSetting.MinimumWidth = 170
+    $cWhat = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $cWhat.Name = 'what'; $cWhat.AutoSizeMode = 'Fill'; $cWhat.FillWeight = 55; $cWhat.MinimumWidth = 220
+    $cRisk = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $cRisk.Name = 'risk'; $cRisk.Width = 66; $cRisk.Resizable = 'False'
+    $cState = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $cState.Name = 'state'; $cState.Width = 100; $cState.Resizable = 'False'
+    $cPolicy = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $cPolicy.Name = 'policy'; $cPolicy.AutoSizeMode = 'Fill'; $cPolicy.FillWeight = 45; $cPolicy.MinimumWidth = 170
+    $cValue = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $cValue.Name = 'value'; $cValue.Width = 86
+    foreach ($c in @($cCheck, $cSetting, $cWhat, $cRisk, $cState, $cPolicy, $cValue)) {
+        $c.SortMode = 'NotSortable'
+        if ($c.Name -ne 'check') { $c.ReadOnly = $true }
+    }
+    $g.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@($cCheck, $cSetting, $cWhat, $cRisk, $cState, $cPolicy, $cValue))
+    Set-GridFonts $g
+    Update-GridHeaders $g
+
+    # Click on the tick or on the setting name toggles the row; the description
+    # column is read-only text so selecting and reading never changes anything.
+    $g.Add_CellClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $item = $s.Rows[$e.RowIndex].Tag
+        if (-not $item) { return }
+        Invoke-Guarded 'Toggle' {
+            if ($e.ColumnIndex -eq $script:ColCheck -or $e.ColumnIndex -eq $script:ColSetting) { Toggle-Item $item }
+            elseif ($e.ColumnIndex -eq $script:ColValue -and $item.Def.Choices) {
+                $s.CurrentCell = $s.Rows[$e.RowIndex].Cells[$script:ColValue]
+                [void]$s.BeginEdit($true)
+                if ($s.EditingControl -is [System.Windows.Forms.ComboBox]) { $s.EditingControl.DroppedDown = $true }
+            }
+        }
+    })
+    $g.Add_CurrentCellDirtyStateChanged({ param($s, $e) if ($s.IsCurrentCellDirty) { [void]$s.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) } })
+    $g.Add_CellValueChanged({
+        param($s, $e)
+        if ($script:SuppressSelectionEvents -or $e.RowIndex -lt 0 -or $e.ColumnIndex -ne $script:ColValue) { return }
+        $item = $s.Rows[$e.RowIndex].Tag
+        if (-not $item -or -not $item.Def.Choices) { return }
+        Invoke-Guarded 'Choice' {
+            $label = "$($s.Rows[$e.RowIndex].Cells[$script:ColValue].Value)"
+            foreach ($cid in $item.Def.Choices.Keys) {
+                if ((T "policy.$($item.Id).choice.$cid") -eq $label) { Set-ItemChoice $item $cid; break }
+            }
+            Set-CustomMode
+            Update-Chrome
+        }
+    })
+    $g.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Space -and $s.CurrentRow -and -not $s.IsCurrentCellInEditMode) {
+            $item = $s.CurrentRow.Tag
+            if ($item) { Invoke-Guarded 'Toggle' { Toggle-Item $item }; $e.Handled = $true; $e.SuppressKeyPress = $true }
+        }
+    })
+    $g.Add_Resize({ param($s, $e) $script:GridsDirty[$s.Name] = $true; Start-RowHeightTimer })
+    return $g
+}
+
+function Set-GridFonts {
+    param($Grid)
+    $Grid.Font = Get-BfoUiFont -Size 9
+    $Grid.DefaultCellStyle.Font = Get-BfoUiFont -Size 9
+    $Grid.ColumnHeadersDefaultCellStyle.Font = Get-BfoUiFont -Size 8.5 -Semibold
+    $Grid.Columns['setting'].DefaultCellStyle.Font = Get-BfoUiFont -Size 9.5 -Semibold
+    $Grid.Columns['what'].DefaultCellStyle.ForeColor = $script:Clr.Slate
+    $Grid.Columns['policy'].DefaultCellStyle.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $Grid.Columns['policy'].DefaultCellStyle.ForeColor = $script:Clr.Slate
+    $Grid.Columns['value'].DefaultCellStyle.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $Grid.Columns['value'].DefaultCellStyle.ForeColor = $script:Clr.Slate
+}
+
+function Update-GridHeaders {
+    param($Grid)
+    $Grid.Columns['check'].HeaderText   = ''
+    $Grid.Columns['setting'].HeaderText = T 'grid.col.setting'
+    $Grid.Columns['what'].HeaderText    = T 'grid.col.what'
+    $Grid.Columns['risk'].HeaderText    = T 'grid.col.risk'
+    $Grid.Columns['state'].HeaderText   = T 'grid.col.status'
+    # The column holds a policy name, a domain or a task / service name depending on the page.
+    $technicalKey = switch ($Grid.Name) { 'hosts' { 'grid.col.domains' } 'updater' { 'grid.col.name' } default { 'grid.col.policy' } }
+    $Grid.Columns['policy'].HeaderText  = T $technicalKey
+    $Grid.Columns['value'].HeaderText   = T 'grid.col.value'
+    $Grid.Columns['policy'].Visible = $script:ShowTechnical
+    $Grid.Columns['value'].Visible  = $script:ShowTechnical
+}
+
+# ---- Rows ------------------------------------------------------------------------
+function Add-ItemRow {
+    param($Grid, $Item)
+    $idx = $Grid.Rows.Add($false, '', '', '', '', '', '')
+    $row = $Grid.Rows[$idx]
+    $row.Tag = $Item
+    $Item.Row = $row
+    if ($Item.Kind -eq 'Policy' -and $Item.Def.Choices) {
+        $combo = New-Object System.Windows.Forms.DataGridViewComboBoxCell
+        $combo.FlatStyle = 'Flat'
+        $combo.DropDownWidth = 200
+        $row.Cells[$script:ColValue] = $combo
+    }
+    Update-ItemTexts $Item
+    Update-ItemView $Item
+}
+
+# Text that depends on the language. Also refills a choice combo's items.
+function Update-ItemTexts {
+    param($Item)
+    $row = $Item.Row
+    if (-not $row) { return }
+    $row.Cells[$script:ColSetting].Value = Get-ItemText $Item 'title'
+    $row.Cells[$script:ColWhat].Value    = Get-ItemText $Item 'description'
+    $risk = Get-ItemRisk $Item
+    $row.Cells[$script:ColRisk].Value    = T "risk.$risk"
+    $row.Cells[$script:ColRisk].Style.ForeColor = switch ($risk) { 'high' { $script:Clr.Red } 'medium' { $script:Clr.Amber } default { $script:Clr.Green } }
+    $row.Cells[$script:ColPolicy].Value  = Get-ItemTechnical $Item
+    $tip = Get-ItemTooltip $Item
+    $row.Cells[$script:ColSetting].ToolTipText = $tip
+    $row.Cells[$script:ColWhat].ToolTipText    = $tip
+    $row.Cells[$script:ColPolicy].ToolTipText  = $tip
+    $row.Cells[$script:ColState].ToolTipText   = (T 'tip.status')
+    if ($Item.Kind -eq 'Policy' -and $Item.Def.Choices) {
+        $cell = $row.Cells[$script:ColValue]
+        Push-SuppressSelectionEvents
+        try {
+            $cell.Items.Clear()
+            foreach ($cid in $Item.Def.Choices.Keys) { [void]$cell.Items.Add((T "policy.$($Item.Id).choice.$cid")) }
+            $cell.Value = T "policy.$($Item.Id).choice.$(Get-ItemChoiceId $Item)"
+        } finally { Pop-SuppressSelectionEvents }
+    }
+}
+
+# State-dependent cells: the tick, the status word and its colour, the value.
+function Update-ItemView {
+    param($Item)
+    $row = $Item.Row
+    if (-not $row) { return }
+    $row.Cells[$script:ColCheck].Value = [bool]$Item.Checked
+    $state = Get-ItemState $Item
+    $Item.Status = $state
+    $cell = $row.Cells[$script:ColState]
+    $cell.Value = T "state.$state"
+    switch ($state) {
+        { $_ -in 'active', 'blocked' }                       { $cell.Style.ForeColor = $script:Clr.Green; $cell.Style.Font = Get-BfoUiFont -Size 9; break }
+        { $_ -in 'willApply', 'willChange', 'willEnable', 'willBlock' } { $cell.Style.ForeColor = $script:Clr.Blue;  $cell.Style.Font = Get-BfoUiFont -Size 9 -Semibold; break }
+        { $_ -in 'willRemove', 'willDisable', 'willUnblock' } { $cell.Style.ForeColor = $script:Clr.Red;   $cell.Style.Font = Get-BfoUiFont -Size 9 -Semibold; break }
+        'disabled'                                           { $cell.Style.ForeColor = $script:Clr.Amber;  $cell.Style.Font = Get-BfoUiFont -Size 9; break }
+        default                                              { $cell.Style.ForeColor = $script:Clr.Mist;   $cell.Style.Font = Get-BfoUiFont -Size 9 }
+    }
+    if ($Item.Kind -eq 'Policy') {
+        if ($Item.Def.Choices) {
+            Push-SuppressSelectionEvents
+            try { $row.Cells[$script:ColValue].Value = T "policy.$($Item.Id).choice.$(Get-ItemChoiceId $Item)" }
+            finally { Pop-SuppressSelectionEvents }
+        } else {
+            $row.Cells[$script:ColValue].Value = "= $($Item.Value)"
+        }
+    }
+}
+
+function Update-AllItemViews {
+    foreach ($item in $script:Items) { Update-ItemView $item }
+}
+
+function Toggle-Item {
+    param($Item)
+    if (($Item.Kind -eq 'Task' -or $Item.Kind -eq 'Service') -and -not $Item.Loaded) { Import-CurrentSystemState }
+    if ($Item.Kind -eq 'Task' -or $Item.Kind -eq 'Service') {
+        if ($Item.Detail -eq 0) { Write-Log (T 'log.updater.missing') 'INFO'; return }
+    }
+    Set-ItemChecked $Item (-not $Item.Checked)
+    if ($Item.Kind -eq 'Policy') { Set-CustomMode }
+    Update-Chrome
+}
+
+# ---- Row heights -------------------------------------------------------------------
+# Wrapped descriptions need taller rows; the height depends on the column width
+# and the language, so it is recomputed when a grid is shown after a change and
+# (throttled) while the window is resized.
+$script:RowHeightTimer = $null
+function Start-RowHeightTimer {
+    if (-not $script:RowHeightTimer) {
+        $script:RowHeightTimer = New-Object System.Windows.Forms.Timer
+        $script:RowHeightTimer.Interval = 120
+        $script:RowHeightTimer.Add_Tick({
+            $script:RowHeightTimer.Stop()
+            Invoke-Guarded 'Layout' { Update-VisibleGridLayout }
+        })
+    }
+    $script:RowHeightTimer.Stop(); $script:RowHeightTimer.Start()
+}
+
+function Update-GridRowHeights {
+    param($Grid)
+    if (-not $Grid -or -not $Grid.Visible -or $Grid.Width -lt 200) { return }
+    $Grid.SuspendLayout()
+    try {
+        $Grid.AutoResizeRows([System.Windows.Forms.DataGridViewAutoSizeRowsMode]::AllCellsExceptHeaders)
+        foreach ($r in $Grid.Rows) { if ($r.Visible -and $r.Height -lt 44) { $r.Height = 44 } }
+    } finally { $Grid.ResumeLayout() }
+    $script:GridsDirty[$Grid.Name] = $false
+}
+
+function Update-VisibleGridLayout {
+    $g = $script:CurrentGrid
+    if ($g -and $script:GridsDirty[$g.Name]) { Update-GridRowHeights $g }
+}
+
+# Very narrow windows: drop the technical columns so the description keeps its room.
+function Update-GridColumnVisibility {
+    $available = if ($script:PageHost) { $script:PageHost.ClientSize.Width } else { 1000 }
+    foreach ($g in $script:Grids.Values) {
+        $wide = ($available -ge 900)
+        $show = $script:ShowTechnical -and $wide
+        $g.Columns['policy'].Visible = $show
+        $g.Columns['value'].Visible  = $show
+    }
+}
+
+# ---- Filter -------------------------------------------------------------------------
+# One search over every row of every page (name, description, category), plus
+# "selected only". Purely presentational: it hides rows, it never changes a tick.
+$script:FilterText = ''
+$script:FilterSelectedOnly = $false
+function Test-ItemMatchesFilter {
+    param($Item, [string[]]$Terms)
+    if ($script:FilterSelectedOnly -and -not $Item.Checked) { return $false }
+    if ($Terms.Count -eq 0) { return $true }
+    $hay = ('{0} {1} {2} {3} {4}' -f $Item.Id, (Get-ItemText $Item 'title'), (Get-ItemText $Item 'description'), (Get-ItemTechnical $Item), (Get-PageTitle $Item.Page)).ToLowerInvariant()
+    foreach ($t in $Terms) { if (-not $hay.Contains($t)) { return $false } }
+    return $true
+}
+
+function Update-Filter {
+    $terms = @($script:FilterText.Trim().ToLowerInvariant() -split '\s+' | Where-Object { $_ })
+    $filtering = ($terms.Count -gt 0 -or $script:FilterSelectedOnly)
+    $script:PageMatchCounts = @{}
+    $shown = 0; $total = 0
+    foreach ($g in $script:Grids.Values) {
+        $g.SuspendLayout()
+        try { $g.CurrentCell = $null } catch { }
+        foreach ($row in $g.Rows) {
+            $item = $row.Tag
+            if (-not $item) { continue }
+            $total++
+            $match = Test-ItemMatchesFilter $item $terms
+            if ($row.Visible -ne $match) { $row.Visible = $match }
+            if ($match) {
+                $shown++
+                $script:PageMatchCounts[$item.Page] = 1 + [int]$script:PageMatchCounts[$item.Page]
+            }
+        }
+        $g.ResumeLayout()
+        $script:GridsDirty[$g.Name] = $true
+    }
+    $script:Filtering = $filtering
+    if ($script:LblFilterCount) {
+        $script:LblFilterCount.Text = if ($filtering) { if ($shown -eq 0) { T 'filter.noMatches' } else { T 'filter.matches' @($shown, $total) } } else { '' }
+    }
+    Update-NavCounts
+    Update-VisibleGridLayout
+    # Jump to the first page with a hit, but never away from a page that already has one.
+    if ($filtering -and $shown -gt 0 -and $script:CurrentPageId -and -not $script:PageMatchCounts[$script:CurrentPageId]) {
+        foreach ($p in $script:PageOrder) { if ($script:PageMatchCounts[$p.Id]) { Select-NavPage $p.Id; break } }
+    }
+}
+
+$script:FilterTimer = $null
+function Start-FilterDebounce {
+    if (-not $script:FilterTimer) {
+        $script:FilterTimer = New-Object System.Windows.Forms.Timer
+        $script:FilterTimer.Interval = 200
+        $script:FilterTimer.Add_Tick({ $script:FilterTimer.Stop(); Invoke-Guarded 'Filter' { Update-Filter } })
+    }
+    $script:FilterTimer.Stop(); $script:FilterTimer.Start()
+}
+#endregion
+
+
+#region UI: content frame, navigation, pages ----------------------------------------
+$script:PageOrder = @()
+foreach ($id in $script:PolicyPageOrder) { $script:PageOrder += @{ Id = $id; Group = 'settings'; Kind = 'grid' } }
+$script:PageOrder += @(
+    @{ Id = 'updater';    Group = 'advanced'; Kind = 'updater' }
+    @{ Id = 'hosts';      Group = 'advanced'; Kind = 'hosts' }
+    @{ Id = 'overrides';  Group = 'advanced'; Kind = 'overrides' }
+    @{ Id = 'scriptlets'; Group = 'advanced'; Kind = 'scriptlets' }
+)
+$script:PagePanels = @{}
+$script:PageMatchCounts = @{}
+$script:CurrentPageId = $null
+$script:CurrentGrid = $null
+$script:Filtering = $false
+$script:NavNodes = @{}
+
+function Get-PageTitle { param([string]$PageId) return (T "page.$PageId.title") }
+function Get-PageIntro { param([string]$PageId) return (T "page.$PageId.intro") }
+
+# ---- Top of the content area: page title, one-line help, search, bulk links ------
+function New-ContentTop {
+    $top = New-Ctl 'Panel' @{ Dock = 'Top'; BackColor = $script:Clr.White; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; Padding = (New-Object System.Windows.Forms.Padding(18, 12, 16, 6)) }
+    $table = New-Ctl 'TableLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; ColumnCount = 2; RowCount = 2; BackColor = $script:Clr.White } $top
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$table.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+    [void]$table.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
+    [void]$table.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('AutoSize')))
+
+    $script:LblPageTitle = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.Ink; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 2)) }
+    [void](Set-LocFont $script:LblPageTitle -Size 12 -Semibold)
+    $table.Controls.Add($script:LblPageTitle, 0, 0)
+
+    $script:LblPageIntro = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(760, 0)); ForeColor = $script:Clr.Slate; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(1, 0, 12, 0)) }
+    [void](Set-LocFont $script:LblPageIntro -Size 8.5)
+    $table.Controls.Add($script:LblPageIntro, 0, 1)
+
+    $searchBox = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0)) }
+    $script:TxtFilter = New-Ctl 'TextBox' @{ Width = 250; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 4, 0)) } $searchBox
+    $script:TxtFilter.Add_TextChanged({
+        $script:FilterText = $script:TxtFilter.Text
+        $script:LblFilterHint.Visible = ($script:TxtFilter.Text.Length -eq 0 -and -not $script:TxtFilter.Focused)
+        Start-FilterDebounce
+    })
+    [void](Set-LocTooltip $script:TxtFilter 'filter.help')
+    # A native TextBox has no placeholder, so a label laid over it says what the box is for until the user focuses or types in it.
+    $script:LblFilterHint = New-Ctl 'Label' @{ Dock = 'Fill'; AutoSize = $false; TextAlign = 'MiddleLeft'; ForeColor = $script:Clr.Mist; BackColor = $script:Clr.White; Cursor = [System.Windows.Forms.Cursors]::IBeam } $script:TxtFilter
+    [void](Set-Loc $script:LblFilterHint 'filter.placeholder'); [void](Set-LocFont $script:LblFilterHint -Size 9)
+    $script:LblFilterHint.Add_Click({ $script:TxtFilter.Focus() })
+    $script:TxtFilter.Add_GotFocus({ $script:LblFilterHint.Visible = $false })
+    $script:TxtFilter.Add_LostFocus({ $script:LblFilterHint.Visible = ($script:TxtFilter.Text.Length -eq 0) })
+    $script:FilterBoxPanel = $searchBox
+    $btnClear = New-Ctl 'Button' @{ Text = 'x'; Size = (New-Object System.Drawing.Size(26, 24)); FlatStyle = 'Flat'; BackColor = $script:Clr.White; ForeColor = $script:Clr.Slate; Cursor = [System.Windows.Forms.Cursors]::Hand; UseVisualStyleBackColor = $false; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 0)) } $searchBox
+    $btnClear.FlatAppearance.BorderColor = $script:Clr.LineStrong
+    $btnClear.RightToLeft = 'No'
+    [void](Set-LocTooltip $btnClear 'filter.clear')
+    $btnClear.Add_Click({ Clear-Filter })
+    $table.Controls.Add($searchBox, 1, 0)
+
+    $opts = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 4, 0, 0)); Anchor = 'Right' }
+    $script:ChkSelectedOnly = New-Ctl 'CheckBox' @{ AutoSize = $true; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 10, 0)) } $opts
+    [void](Set-Loc $script:ChkSelectedOnly 'filter.selectedOnly'); [void](Set-LocFont $script:ChkSelectedOnly -Size 8.5)
+    $script:ChkSelectedOnly.Add_CheckedChanged({ $script:FilterSelectedOnly = $script:ChkSelectedOnly.Checked; Invoke-Guarded 'Filter' { Update-Filter } })
+    $script:LblFilterCount = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.Slate; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 2, 0, 0)) } $opts
+    [void](Set-LocFont $script:LblFilterCount -Size 8.5)
+    $table.Controls.Add($opts, 1, 1)
+    $script:FilterOptsPanel = $opts
+
+    # Bulk links + technical-details switch, only meaningful on list pages.
+    $script:BulkBar = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $true; BackColor = $script:Clr.White; Padding = (New-Object System.Windows.Forms.Padding(18, 2, 16, 6)) }
+    $script:LinkSelectAll = New-Ctl 'LinkLabel' @{ AutoSize = $true; BackColor = $script:Clr.White; LinkColor = $script:Clr.Ember; ActiveLinkColor = $script:Clr.EmberDark; Margin = (New-Object System.Windows.Forms.Padding(1, 0, 14, 0)) } $script:BulkBar
+    [void](Set-Loc $script:LinkSelectAll 'policyTab.selectAll'); [void](Set-LocFont $script:LinkSelectAll -Size 8.5)
+    $script:LinkSelectAll.Add_LinkClicked({ Invoke-Guarded 'Select all' { Set-PageChecks $true } })
+    $script:LinkSelectNone = New-Ctl 'LinkLabel' @{ AutoSize = $true; BackColor = $script:Clr.White; LinkColor = $script:Clr.Ember; ActiveLinkColor = $script:Clr.EmberDark; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 24, 0)) } $script:BulkBar
+    [void](Set-Loc $script:LinkSelectNone 'policyTab.selectNone'); [void](Set-LocFont $script:LinkSelectNone -Size 8.5)
+    $script:LinkSelectNone.Add_LinkClicked({ Invoke-Guarded 'Select none' { Set-PageChecks $false } })
+    $script:ChkTechnical = New-Ctl 'CheckBox' @{ AutoSize = $true; Checked = $script:ShowTechnical; BackColor = $script:Clr.White; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 0)) } $script:BulkBar
+    [void](Set-Loc $script:ChkTechnical 'filter.technical'); [void](Set-LocFont $script:ChkTechnical -Size 8.5)
+    $script:ChkTechnical.Add_CheckedChanged({
+        $script:ShowTechnical = $script:ChkTechnical.Checked
+        Set-BfoSetting 'showTechnical' $script:ShowTechnical
+        Update-GridColumnVisibility
+        foreach ($k in @($script:GridsDirty.Keys)) { $script:GridsDirty[$k] = $true }
+        Start-RowHeightTimer
+    })
+    return @($top, $script:BulkBar)
+}
+
+# Select all / none acts on what the user can see, so it composes with the filter.
+function Set-PageChecks {
+    param([bool]$Checked)
+    $grid = $script:CurrentGrid
+    if (-not $grid) { return }
+    Push-SuppressSelectionEvents
+    try {
+        foreach ($row in $grid.Rows) {
+            if ($row.Visible -and $row.Tag -and $row.Tag.Kind -eq 'Policy') { Set-ItemChecked $row.Tag $Checked }
+        }
+    } finally { Pop-SuppressSelectionEvents }
+    Set-CustomMode
+    Update-Chrome
+}
+
+function Clear-Filter {
+    $script:TxtFilter.Text = ''
+    $script:ChkSelectedOnly.Checked = $false
+    $script:FilterText = ''
+    $script:FilterSelectedOnly = $false
+    Update-Filter
+}
+
+# ---- Sidebar -----------------------------------------------------------------------
+function Build-Nav {
+    $tv = $script:Nav
+    $tv.BeginUpdate()
+    $tv.Nodes.Clear()
+    $script:NavNodes = @{}
+    $groups = [ordered]@{ settings = 'nav.group.settings'; advanced = 'nav.group.advanced' }
+    foreach ($g in $groups.Keys) {
+        $parent = $tv.Nodes.Add((T $groups[$g]).ToUpperInvariant())
+        $parent.Tag = "group:$g"
+        $parent.NodeFont = Get-BfoUiFont -Size 8 -Semibold
+        $parent.ForeColor = $script:Clr.Mist
+        foreach ($p in ($script:PageOrder | Where-Object { $_.Group -eq $g })) {
+            $node = $parent.Nodes.Add($p.Id)
+            $node.Tag = $p.Id
+            $node.NodeFont = Get-BfoUiFont -Size 9
+            $script:NavNodes[$p.Id] = $node
+        }
+    }
+    $tv.ExpandAll()
+    $tv.EndUpdate()
+    Update-NavCounts
+}
+
+function Get-NavCountText {
+    param([string]$PageId)
+    if ($script:Filtering) { return ('({0})' -f [int]$script:PageMatchCounts[$PageId]) }
+    $pageItems = @($script:Items | Where-Object { $_.Page -eq $PageId })
+    switch ($PageId) {
+        'updater'    { return '' }
+        'overrides'  { $n = 0; foreach ($k in 'Search', 'Ntp', 'Startup') { if ($script:Overrides[$k].Enabled) { $n++ } }; return ('{0}/3' -f $n) }
+        'scriptlets' { return '' }
+    }
+    if ($pageItems.Count -eq 0) { return '' }
+    return ('{0}/{1}' -f @($pageItems | Where-Object { $_.Checked }).Count, $pageItems.Count)
+}
+
+function Update-NavCounts {
+    if (-not $script:Nav) { return }
+    foreach ($id in $script:NavNodes.Keys) {
+        $node = $script:NavNodes[$id]
+        $count = Get-NavCountText $id
+        $text = Get-PageTitle $id
+        if ($count) { $text = "$text   $count" }
+        if ($node.Text -ne $text) { $node.Text = $text }
+        $node.ForeColor = if ($script:Filtering -and -not $script:PageMatchCounts[$id]) { $script:Clr.Mist } else { $script:Clr.Ink }
+    }
+}
+
+function Select-NavPage {
+    param([string]$PageId)
+    if ($script:NavNodes.ContainsKey($PageId)) { $script:Nav.SelectedNode = $script:NavNodes[$PageId] }
+}
+
+function Show-Page {
+    param([string]$PageId)
+    if (-not $PageId -or -not $script:PagePanels.ContainsKey($PageId)) { return }
+    if ($PageId -eq 'scriptlets' -and -not $script:ScriptletsBuilt) { Build-ScriptletsPage }
+    $script:CurrentPageId = $PageId
+    foreach ($id in @($script:PagePanels.Keys)) { $script:PagePanels[$id].Visible = ($id -eq $PageId) }
+    $script:LblPageTitle.Text = Get-PageTitle $PageId
+    $script:LblPageIntro.Text = Get-PageIntro $PageId
+    $isGrid = $script:Grids.ContainsKey($PageId)
+    # The search and "Ticked only" cover every list page; the two form-style pages are not indexed, so the controls would do nothing there.
+    $hasFilter = ($PageId -ne 'overrides' -and $PageId -ne 'scriptlets')
+    $script:FilterBoxPanel.Visible  = $hasFilter
+    $script:FilterOptsPanel.Visible = $hasFilter
+    $script:BulkBar.Visible = $isGrid -or $PageId -eq 'updater' -or $PageId -eq 'hosts'
+    $isPolicyPage = ($script:PolicyPageOrder -contains $PageId)
+    $script:LinkSelectAll.Visible = $isPolicyPage
+    $script:LinkSelectNone.Visible = $isPolicyPage
+    $script:CurrentGrid = if ($isGrid) { $script:Grids[$PageId] } else { $null }
+    if ($isGrid) { $script:GridsDirty[$PageId] = $true; Start-RowHeightTimer }
+    if ($PageId -eq 'updater' -and -not $script:UpdaterLoaded) { Invoke-Guarded 'Read updater state' { Load-UpdaterState } }
+}
+
+# ---- Policy pages -----------------------------------------------------------------------
+function New-GridPage {
+    param([string]$PageId)
+    $panel = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White; Visible = $false }
+    $g = New-SettingsGrid
+    $g.Name = $PageId
+    $panel.Controls.Add($g)
+    $script:Grids[$PageId] = $g
+    $g.SuspendLayout()
+    foreach ($item in ($script:Items | Where-Object { $_.Page -eq $PageId })) { Add-ItemRow -Grid $g -Item $item }
+    $g.ResumeLayout()
+    return $panel
+}
+#endregion
+
+
+#region UI: combo helpers ---------------------------------------------------------------
+# Combo items hold translated labels; the stable id lives in a parallel array and
+# is linked by SelectedIndex - the one binding WinForms guarantees for a
+# non-data-bound ComboBox, and one that survives re-translation intact.
+function Get-ComboId {
+    param($Combo, $Ids)
+    if (-not $Combo -or -not $Ids) { return $null }
+    $i = $Combo.SelectedIndex
+    if ($i -lt 0 -or $i -ge @($Ids).Count) { return $null }
+    return @($Ids)[$i]
+}
+
+function Set-ComboId {
+    param($Combo, $Ids, [string]$Id)
+    if (-not $Combo -or -not $Ids -or -not $Id) { return $false }
+    $arr = @($Ids)
+    for ($i = 0; $i -lt $arr.Count; $i++) {
+        if ($arr[$i] -eq $Id) { $Combo.SelectedIndex = $i; return $true }
+    }
+    return $false
+}
+
+# Relabelling is Items.Clear() + refill, which drives SelectedIndex to -1 and back;
+# both transitions raise SelectedIndexChanged, so handlers are muted meanwhile and
+# the previously selected id is restored exactly.
+function Set-ComboLabels {
+    param($Combo, $Ids, $LabelKeys)
+    if (-not $Combo) { return }
+    $keep = Get-ComboId -Combo $Combo -Ids $Ids
+    Push-SuppressSelectionEvents
+    try {
+        $Combo.BeginUpdate()
+        try {
+            $Combo.Items.Clear()
+            foreach ($k in @($LabelKeys)) { [void]$Combo.Items.Add((T $k)) }
+        } finally { $Combo.EndUpdate() }
+        if (-not (Set-ComboId -Combo $Combo -Ids $Ids -Id $keep)) {
+            if ($Combo.Items.Count -gt 0) { $Combo.SelectedIndex = 0 }
+        }
+    } finally { Pop-SuppressSelectionEvents }
+}
+#endregion
+
+#region UI: updater page ------------------------------------------------------------------
+$script:UpdaterLoaded = $false
+
+function New-UpdaterPage {
+    $panel = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White; Visible = $false }
+    $g = New-SettingsGrid
+    $g.Name = 'updater'
+    Update-GridHeaders $g
+    $script:Grids['updater'] = $g
+
+    $warn = New-Ctl 'Panel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; BackColor = $script:Clr.RedSoft; Padding = (New-Object System.Windows.Forms.Padding(18, 10, 16, 10)) }
+    $wt = New-Ctl 'TableLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; ColumnCount = 2; RowCount = 1; BackColor = $script:Clr.RedSoft } $warn
+    [void]$wt.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$wt.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+    $lbl = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(720, 0)); ForeColor = (New-Rgb 130 20 30); BackColor = $script:Clr.RedSoft; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 12, 0)) }
+    [void](Set-Loc $lbl 'updater.warning'); [void](Set-LocFont $lbl -Size 9)
+    $wt.Controls.Add($lbl, 0, 0)
+    $btns = New-Ctl 'FlowLayoutPanel' @{ AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; FlowDirection = 'TopDown'; BackColor = $script:Clr.RedSoft }
+    $bCheck = New-BfoButton 'updater.checkNow' 'Default' 150
+    $bCheck.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    $bCheck.Add_Click({ Invoke-Guarded 'Check for updates' { [void](Open-InBrave 'brave://settings/help') } })
+    $bScan = New-BfoButton 'updater.rescan' 'Default' 150
+    $bScan.Margin = New-Object System.Windows.Forms.Padding(0)
+    $bScan.Add_Click({ Invoke-Guarded 'Read updater state' { Load-UpdaterState -Refresh } })
+    $btns.Controls.AddRange([System.Windows.Forms.Control[]]@($bCheck, $bScan))
+    $wt.Controls.Add($btns, 1, 0)
+
+    $panel.Controls.Add($g)
+    $panel.Controls.Add($warn)
+    $g.BringToFront()
+    $g.SuspendLayout()
+    foreach ($item in ($script:Items | Where-Object { $_.Page -eq 'updater' })) { Add-ItemRow -Grid $g -Item $item }
+    $g.ResumeLayout()
+    return $panel
+}
+
+function Load-UpdaterState {
+    param([switch]$Refresh)
+    $script:Form.UseWaitCursor = $true
+    Write-Log (T 'log.updater.reading') 'INFO'
+    [System.Windows.Forms.Application]::DoEvents()
+    try {
+        Import-CurrentSystemState -Refresh:$Refresh
+        $script:UpdaterLoaded = $true
+    } finally { $script:Form.UseWaitCursor = $false }
+    Update-AllItemViews
+    Update-Chrome
+}
+#endregion
+
+#region UI: hosts page ----------------------------------------------------------------------
+function New-HostsPage {
+    $panel = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White; Visible = $false }
+    $g = New-SettingsGrid
+    $g.Name = 'hosts'
+    Update-GridHeaders $g
+    $script:Grids['hosts'] = $g
+
+    $warn = New-Ctl 'Panel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; BackColor = $script:Clr.AmberSoft; Padding = (New-Object System.Windows.Forms.Padding(18, 8, 16, 8)) }
+    $wl = New-Ctl 'Label' @{ Dock = 'Top'; AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(900, 0)); ForeColor = (New-Rgb 110 72 0); BackColor = $script:Clr.AmberSoft } $warn
+    [void](Set-Loc $wl 'hostsTab.warn'); [void](Set-LocFont $wl -Size 8.5)
+
+    $bar = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Bottom'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $true; BackColor = $script:Clr.White; Padding = (New-Object System.Windows.Forms.Padding(14, 8, 14, 8)) }
+    $script:BtnHostsApply = New-BfoButton 'hostsTab.apply' 'Primary' 150
+    $script:BtnHostsApply.Margin = New-Object System.Windows.Forms.Padding(4, 3, 8, 3)
+    $bRemove  = New-BfoButton 'hostsTab.remove' 'Danger' 130;  $bRemove.Margin  = New-Object System.Windows.Forms.Padding(4, 3, 8, 3)
+    $bLoad    = New-BfoButton 'hostsTab.load' 'Default' 130;   $bLoad.Margin    = New-Object System.Windows.Forms.Padding(4, 3, 8, 3)
+    $bPreview = New-BfoButton 'hostsTab.preview' 'Default' 120; $bPreview.Margin = New-Object System.Windows.Forms.Padding(4, 3, 8, 3)
+    $bOpen    = New-BfoButton 'hostsTab.open' 'Default' 120;    $bOpen.Margin    = New-Object System.Windows.Forms.Padding(4, 3, 8, 3)
+    $bar.Controls.AddRange([System.Windows.Forms.Control[]]@($script:BtnHostsApply, $bRemove, $bLoad, $bPreview, $bOpen))
+
+    $script:BtnHostsApply.Add_Click({ Invoke-Guarded 'Apply hosts blocks' { Invoke-HostsApply } })
+    $bRemove.Add_Click({ Invoke-Guarded 'Remove hosts block' { Invoke-HostsRemove } })
+    $bLoad.Add_Click({
+        Invoke-Guarded 'Read hosts file' {
+            Import-CurrentHostsState; Update-HostsCache; Update-AllItemViews; Update-Chrome
+            Write-Log ("Hosts state loaded: {0} domain(s) currently blocked." -f $script:HostsCurrent.Count)
+        }
+    })
+    $bPreview.Add_Click({ Invoke-Guarded 'Preview hosts' { Update-HostsCache; Show-TextReport -Title (T 'report.hostsTitle') -Text (New-HostsPlanReport) -DefaultFileName ("brave-free-origin-hosts-preview-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss')) } })
+    $bOpen.Add_Click({ Invoke-Guarded 'Open hosts file' { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:HostsFile) } })
+
+    $panel.Controls.Add($g)
+    $panel.Controls.Add($bar)
+    $panel.Controls.Add($warn)
+    $g.BringToFront()
+    $g.SuspendLayout()
+    foreach ($item in ($script:Items | Where-Object { $_.Page -eq 'hosts' })) { Add-ItemRow -Grid $g -Item $item }
+    $g.ResumeLayout()
+    return $panel
+}
+
+function Invoke-HostsApply {
+    $domains = @(Get-SelectedHostsDomains)
+    if ($domains.Count -eq 0) {
+        if ((Show-Message -Text (T 'msg.hosts.noGroups') -Title (T 'msg.title.hosts') -Buttons 'YesNo' -Icon 'Question') -ne 'Yes') { return }
+    } else {
+        if ((Show-Message -Text (T 'msg.hosts.confirmApply' @($domains.Count, $script:HostsFile)) -Title (T 'msg.title.hosts') -Buttons 'YesNo' -Icon 'Question') -ne 'Yes') { return }
+    }
+    try {
+        Set-HostsManagedDomains -Domains $domains
+        Update-HostsCache; Update-AllItemViews; Update-Chrome
+        [void](Show-Message -Text (T 'msg.hosts.applied' @($domains.Count)) -Title (T 'msg.title.done'))
+    } catch {
+        Write-Log "Hosts apply failed: $_" 'ERR'
+        [void](Show-Message -Text (T 'msg.failed' @("$($_.Exception.Message)")) -Title (T 'msg.title.error') -Icon 'Error')
+    }
+}
+
+function Invoke-HostsRemove {
+    if ((Show-Message -Text (T 'msg.hosts.confirmRemove') -Title (T 'msg.title.hosts') -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
+    try {
+        Set-HostsManagedDomains -Domains @()
+        foreach ($item in $script:Items) { if ($item.Kind -eq 'Host') { Set-ItemChecked $item $false } }
+        Update-HostsCache; Update-AllItemViews; Update-Chrome
+        [void](Show-Message -Text (T 'msg.hosts.removed') -Title (T 'msg.title.done'))
+    } catch {
+        Write-Log "Hosts remove failed: $_" 'ERR'
+        [void](Show-Message -Text (T 'msg.failed' @("$($_.Exception.Message)")) -Title (T 'msg.title.error') -Icon 'Error')
     }
 }
 #endregion
 
-#region GUI Build -------------------------------------------------------------
-$form = New-Object System.Windows.Forms.Form
-$form.Size = New-Object System.Drawing.Size(1180, 940)
-$form.StartPosition = 'CenterScreen'
-$form.MinimumSize = New-Object System.Drawing.Size(1080, 860)
-$form.Font = Get-BfoUiFont -Size 9
+#region UI: search engine, new tab and startup page -----------------------------------------
+function New-OverridesPage {
+    $panel = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White; Visible = $false; AutoScroll = $true }
+    $flow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; FlowDirection = 'TopDown'; WrapContents = $false; BackColor = $script:Clr.White; Padding = (New-Object System.Windows.Forms.Padding(14, 6, 14, 14)) } $panel
 
-# Tooltip provider is script-scoped so Set-LocTooltip can reach it.
-$script:ToolTip = New-Object System.Windows.Forms.ToolTip
-$script:ToolTip.AutoPopDelay = 30000
-$script:ToolTip.InitialDelay = 300
-$script:ToolTip.ReshowDelay  = 300
-
-[void](Set-Loc $form 'app.title' -FormatArgs @($script:AppVersion))
-$form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
-
-$braveVer = Get-BraveVersion
-$script:ActiveProfile = 'Custom'
-$script:MinimalPolicies = @(
-    'HardwareAccelerationModeEnabled',
-    'BraveRewardsDisabled','BraveWalletDisabled','BraveVPNDisabled',
-    'BraveAIChatEnabled','PasswordManagerEnabled'
-)
-$script:OriginPolicies = @(
-    'HardwareAccelerationModeEnabled',
-    'BraveAIChatEnabled',
-    'BraveNewsDisabled',
-    'BraveP3AEnabled',
-    'BravePlaylistEnabled',
-    'BraveRewardsDisabled',
-    'BraveSpeedreaderEnabled',
-    'BraveStatsPingEnabled',
-    'BraveTalkDisabled',
-    'BraveVPNDisabled',
-    'BraveWalletDisabled',
-    'BraveWaybackMachineEnabled',
-    'BraveWebDiscoveryEnabled',
-    'MetricsReportingEnabled',
-    'TorDisabled',
-    # Shields / privacy-engine policies - keeping ad-block ON is a *performance* win
-    # (fewer requests, less DOM, less JS). It's also Brave's identity. Origin Mode
-    # and everything that derives from it (Privacy + Boost) now enforces these.
-    'DefaultBraveAdblockSetting',
-    'DefaultBraveFingerprintingV2Setting',
-    'DefaultBraveReferrersSetting',
-    'BraveTrackingQueryParametersFilteringEnabled',
-    'BraveDeAmpEnabled',
-    'BraveDebouncingEnabled'
-)
-$script:PerformancePolicies = @(
-    $script:OriginPolicies +
-    @(
-        'BackgroundModeEnabled',
-        'BrowserLabsEnabled',
-        'CloudPrintSubmitEnabled',
-        'DiskCacheSize',
-        'HardwareAccelerationModeEnabled',
-        'HighEfficiencyModeEnabled',
-        'HomepageIsNewTabPage',
-        'HomepageLocation',
-        'IPFSEnabled',
-        'LiveCaptionEnabled',
-        'MediaRouterEnabled',
-        'NetworkPredictionOptions',
-        'NewTabPageLocation',
-        'NTPCustomBackgroundEnabled',
-        'PromotionalTabsEnabled',
-        'QuicAllowed',
-        'ReadingListEnabled',
-        'RestoreOnStartup',
-        'WebRtcEventLogCollectionAllowed',
-        'WebTorrentDisabled',
-        'WelcomePageOnOSUpgradeEnabled'
-    )
-) | Select-Object -Unique
-$script:MaxPrivacyPolicies = @(
-    foreach ($cat in $script:Policies.Keys) {
-        foreach ($policy in $script:Policies[$cat]) {
-            if ($policy.MaxPrivacy) { $policy.Name }
-        }
+    function New-Section {
+        param([string]$TitleKey)
+        $box = New-Object System.Windows.Forms.GroupBox
+        $box.AutoSize = $true; $box.AutoSizeMode = 'GrowAndShrink'
+        $box.Width = 860; $box.MinimumSize = New-Object System.Drawing.Size(860, 0)
+        $box.Margin = New-Object System.Windows.Forms.Padding(4, 4, 4, 10)
+        $box.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 10)
+        [void](Set-Loc $box $TitleKey); [void](Set-LocFont $box -Size 9 -Semibold)
+        $t = New-Object System.Windows.Forms.TableLayoutPanel
+        $t.Dock = 'Top'; $t.AutoSize = $true; $t.AutoSizeMode = 'GrowAndShrink'; $t.ColumnCount = 4
+        [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+        [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+        [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+        [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+        $box.Controls.Add($t)
+        return @{ Box = $box; Table = $t }
     }
-) | Select-Object -Unique
-$script:MaxPerformancePolicies = @(
-    $script:MaxPrivacyPolicies +
-    $script:PerformancePolicies +
-    @(
-        'BookmarkBarEnabled',
-        'PromptForDownloadLocation',
-        'ShowHomeButton',
-        'SpellcheckEnabled'
-    )
-) | Select-Object -Unique
-# Preset ids are stable and language independent; the labels come from the
-# string catalog under preset.<Id>.name / .description / .risk.
-$script:PresetKeys = @('Minimal','Recommended','Origin','Performance','MaxPerformance','MaxPrivacy','None','CurrentState','Custom')
+    function Add-Lbl { param($Table, [string]$Key, [int]$Col, [int]$Row)
+        $l = New-Object System.Windows.Forms.Label; $l.AutoSize = $true; $l.Margin = New-Object System.Windows.Forms.Padding(0, 6, 8, 0)
+        [void](Set-Loc $l $Key); [void](Set-LocFont $l -Size 9)
+        $Table.Controls.Add($l, $Col, $Row); return $l }
 
-function Get-PresetName        { param([string]$Key) if ($script:PresetKeys -contains $Key) { T "preset.$Key.name" }        else { $Key } }
-function Get-PresetDescription { param([string]$Key) if ($script:PresetKeys -contains $Key) { T "preset.$Key.description" } else { '' } }
-function Get-PresetRisk        { param([string]$Key) if ($script:PresetKeys -contains $Key) { T "preset.$Key.risk" }        else { '' } }
+    # -- search engine
+    $s = New-Section 'searchTab.secSearch'
+    $script:ChkSearchOverride = New-Object System.Windows.Forms.CheckBox
+    $script:ChkSearchOverride.AutoSize = $true; $script:ChkSearchOverride.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 6)
+    [void](Set-Loc $script:ChkSearchOverride 'searchTab.chkSearch'); [void](Set-LocFont $script:ChkSearchOverride -Size 9)
+    $s.Table.Controls.Add($script:ChkSearchOverride, 0, 0); $s.Table.SetColumnSpan($script:ChkSearchOverride, 4)
+    [void](Add-Lbl $s.Table 'searchTab.engineLabel' 0 1)
+    $script:CmbSearchEngine = New-Object System.Windows.Forms.ComboBox
+    $script:CmbSearchEngine.DropDownStyle = 'DropDownList'; $script:CmbSearchEngine.Width = 200; $script:CmbSearchEngine.Margin = New-Object System.Windows.Forms.Padding(0, 2, 16, 0)
+    $s.Table.Controls.Add($script:CmbSearchEngine, 1, 1)
+    [void](Add-Lbl $s.Table 'searchTab.customLabel' 2 1)
+    $script:TxtCustomSearchUrl = New-Object System.Windows.Forms.TextBox
+    $script:TxtCustomSearchUrl.Dock = 'Fill'; $script:TxtCustomSearchUrl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0); $script:TxtCustomSearchUrl.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $s.Table.Controls.Add($script:TxtCustomSearchUrl, 3, 1)
+    $help = New-Object System.Windows.Forms.Label; $help.AutoSize = $true; $help.ForeColor = $script:Clr.Slate; $help.MaximumSize = New-Object System.Drawing.Size(800, 0); $help.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+    [void](Set-Loc $help 'searchTab.searchHelp'); [void](Set-LocFont $help -Size 8.5)
+    $s.Table.Controls.Add($help, 0, 2); $s.Table.SetColumnSpan($help, 4)
+    $flow.Controls.Add($s.Box)
 
-# Reports and the log stay English so a translated install still produces
-# bug reports the maintainer can read.
-function Get-PresetNameEn {
-    param([string]$Key)
-    $k = "preset.$Key.name"
-    if ($script:EnglishStrings.ContainsKey($k)) { return $script:EnglishStrings[$k] }
-    return $Key
+    # -- new tab page
+    $n = New-Section 'searchTab.secNtp'
+    $script:ChkNtpOverride = New-Object System.Windows.Forms.CheckBox
+    $script:ChkNtpOverride.AutoSize = $true; $script:ChkNtpOverride.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 6)
+    [void](Set-Loc $script:ChkNtpOverride 'searchTab.chkNtp'); [void](Set-LocFont $script:ChkNtpOverride -Size 9)
+    $n.Table.Controls.Add($script:ChkNtpOverride, 0, 0); $n.Table.SetColumnSpan($script:ChkNtpOverride, 4)
+    [void](Add-Lbl $n.Table 'searchTab.ntpOpenLabel' 0 1)
+    $script:CmbNtpDest = New-Object System.Windows.Forms.ComboBox
+    $script:CmbNtpDest.DropDownStyle = 'DropDownList'; $script:CmbNtpDest.Width = 300; $script:CmbNtpDest.Margin = New-Object System.Windows.Forms.Padding(0, 2, 16, 0)
+    $n.Table.Controls.Add($script:CmbNtpDest, 1, 1)
+    [void](Add-Lbl $n.Table 'searchTab.ntpCustomLabel' 2 1)
+    $script:TxtNtpCustomUrl = New-Object System.Windows.Forms.TextBox
+    $script:TxtNtpCustomUrl.Dock = 'Fill'; $script:TxtNtpCustomUrl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0); $script:TxtNtpCustomUrl.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $n.Table.Controls.Add($script:TxtNtpCustomUrl, 3, 1)
+    $flow.Controls.Add($n.Box)
+
+    # -- startup
+    $st = New-Section 'searchTab.secStartup'
+    $script:ChkStartupOverride = New-Object System.Windows.Forms.CheckBox
+    $script:ChkStartupOverride.AutoSize = $true; $script:ChkStartupOverride.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 6)
+    [void](Set-Loc $script:ChkStartupOverride 'searchTab.chkStartup'); [void](Set-LocFont $script:ChkStartupOverride -Size 9)
+    $st.Table.Controls.Add($script:ChkStartupOverride, 0, 0); $st.Table.SetColumnSpan($script:ChkStartupOverride, 4)
+    [void](Add-Lbl $st.Table 'searchTab.modeLabel' 0 1)
+    $script:CmbStartupMode = New-Object System.Windows.Forms.ComboBox
+    $script:CmbStartupMode.DropDownStyle = 'DropDownList'; $script:CmbStartupMode.Width = 300; $script:CmbStartupMode.Margin = New-Object System.Windows.Forms.Padding(0, 2, 16, 0)
+    $st.Table.Controls.Add($script:CmbStartupMode, 1, 1)
+    [void](Add-Lbl $st.Table 'searchTab.urlLabel' 2 1)
+    $script:TxtStartupUrl = New-Object System.Windows.Forms.TextBox
+    $script:TxtStartupUrl.Dock = 'Fill'; $script:TxtStartupUrl.Margin = New-Object System.Windows.Forms.Padding(0, 2, 0, 0); $script:TxtStartupUrl.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $st.Table.Controls.Add($script:TxtStartupUrl, 3, 1)
+    $sh = New-Object System.Windows.Forms.Label; $sh.AutoSize = $true; $sh.ForeColor = $script:Clr.Slate; $sh.MaximumSize = New-Object System.Drawing.Size(800, 0); $sh.Margin = New-Object System.Windows.Forms.Padding(0, 6, 0, 0)
+    [void](Set-Loc $sh 'searchTab.startupHelp'); [void](Set-LocFont $sh -Size 8.5)
+    $st.Table.Controls.Add($sh, 0, 2); $st.Table.SetColumnSpan($sh, 4)
+    $flow.Controls.Add($st.Box)
+
+    $note = New-Object System.Windows.Forms.Label
+    $note.AutoSize = $true; $note.MaximumSize = New-Object System.Drawing.Size(860, 0); $note.ForeColor = (New-Rgb 120 60 30); $note.Margin = New-Object System.Windows.Forms.Padding(6, 0, 0, 12)
+    [void](Set-Loc $note 'searchTab.conflictNote'); [void](Set-LocFont $note -Size 8.5)
+    $flow.Controls.Add($note)
+
+    # -- extensions / shortcuts (these open Brave; nothing is force-installed)
+    $ex = New-Section 'ext.section'
+    $intro = New-Object System.Windows.Forms.Label; $intro.AutoSize = $true; $intro.MaximumSize = New-Object System.Drawing.Size(800, 0); $intro.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    [void](Set-Loc $intro 'ext.intro'); [void](Set-LocFont $intro -Size 8.5)
+    $ex.Table.Controls.Add($intro, 0, 0); $ex.Table.SetColumnSpan($intro, 4)
+    $warn = New-Object System.Windows.Forms.Label; $warn.AutoSize = $true; $warn.MaximumSize = New-Object System.Drawing.Size(800, 0); $warn.ForeColor = (New-Rgb 130 70 20); $warn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 8)
+    [void](Set-Loc $warn 'ext.warn'); [void](Set-LocFont $warn -Size 8.5)
+    $ex.Table.Controls.Add($warn, 0, 1); $ex.Table.SetColumnSpan($warn, 4)
+    $row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.AutoSize = $true; $row.WrapContents = $true; $row.Margin = New-Object System.Windows.Forms.Padding(0)
+    $bUbo = New-BfoButton 'ext.uboLite' 'Default' 200
+    $bUbo.Add_Click({ Invoke-Guarded 'Open uBlock Origin Lite' { [void](Open-InBrave 'https://chromewebstore.google.com/detail/ublock-origin-lite/ddkjiahejlhfcafbddmgiahcphecmpfh') } })
+    $bShields = New-BfoButton 'ext.shields' 'Default' 200
+    $bShields.Add_Click({ Invoke-Guarded 'Open Shields settings' { [void](Open-InBrave 'brave://settings/shields') } })
+    $bBit = New-BfoButton 'ext.bitwarden' 'Default' 200
+    $bBit.Add_Click({ Invoke-Guarded 'Open Bitwarden' { [void](Open-InBrave 'https://chromewebstore.google.com/detail/bitwarden-password-manage/nngceckbapebfimnlniiiahkandclblb') } })
+    $row.Controls.AddRange([System.Windows.Forms.Control[]]@($bUbo, $bShields, $bBit))
+    $ex.Table.Controls.Add($row, 0, 2); $ex.Table.SetColumnSpan($row, 4)
+    $flow.Controls.Add($ex.Box)
+
+    # combo contents + wiring
+    Set-ComboLabels -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds -LabelKeys $script:SearchEngineLabelKeys
+    Set-ComboLabels -Combo $script:CmbNtpDest      -Ids $script:DestinationIds  -LabelKeys $script:DestinationLabelKeys
+    Set-ComboLabels -Combo $script:CmbStartupMode  -Ids $script:StartupModeIds  -LabelKeys $script:StartupModeLabelKeys
+
+    $script:ChkSearchOverride.Add_CheckedChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Search.Enabled = $script:ChkSearchOverride.Checked; Update-OverrideControlStates; Update-Chrome } })
+    $script:CmbSearchEngine.Add_SelectedIndexChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Search.EngineId = Get-ComboId $script:CmbSearchEngine $script:SearchEngineIds; Update-OverrideControlStates; Update-Chrome } })
+    $script:TxtCustomSearchUrl.Add_TextChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Search.CustomUrl = $script:TxtCustomSearchUrl.Text; Update-Chrome } })
+    $script:ChkNtpOverride.Add_CheckedChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Ntp.Enabled = $script:ChkNtpOverride.Checked; Update-OverrideControlStates; Update-Chrome } })
+    $script:CmbNtpDest.Add_SelectedIndexChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Ntp.DestinationId = Get-ComboId $script:CmbNtpDest $script:DestinationIds; Update-OverrideControlStates; Update-Chrome } })
+    $script:TxtNtpCustomUrl.Add_TextChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Ntp.CustomUrl = $script:TxtNtpCustomUrl.Text; Update-Chrome } })
+    $script:ChkStartupOverride.Add_CheckedChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Startup.Enabled = $script:ChkStartupOverride.Checked; Update-OverrideControlStates; Update-Chrome } })
+    $script:CmbStartupMode.Add_SelectedIndexChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Startup.ModeId = Get-ComboId $script:CmbStartupMode $script:StartupModeIds; Update-OverrideControlStates; Update-Chrome } })
+    $script:TxtStartupUrl.Add_TextChanged({ if (-not $script:SuppressSelectionEvents) { $script:Overrides.Startup.Urls = $script:TxtStartupUrl.Text; Update-Chrome } })
+    Sync-OverrideControls
+    return $panel
 }
 
-function Get-PresetPayload {
-    param([string]$Preset)
-
-    # Hosts groups: only auto-tick a group when the corresponding feature is
-    # ALSO disabled by policy in this preset. No orphan blocks.
-    $hostsAlwaysSafe   = @('p3a','variations','stats','webDiscovery')
-    $hostsRewards      = @('rewards')
-    $hostsNews         = @('news')
-    $hostsComponents   = @('components')
-
-    switch ($Preset) {
-        'Recommended' {
-            return @{
-                Policies = @(
-                    foreach ($cat in $script:Policies.Keys) {
-                        foreach ($policy in $script:Policies[$cat]) {
-                            if ($policy.Recommended) { $policy.Name }
-                        }
-                    }
-                )
-                Tasks    = @($script:ScheduledTasks.Name)
-                Services = @()
-                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews
-            }
-        }
-        'MaxPrivacy' {
-            return @{
-                Policies = @($script:MaxPrivacyPolicies)
-                Tasks    = @($script:ScheduledTasks.Name)
-                Services = @($script:Services.Name)
-                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews + $hostsComponents
-            }
-        }
-        'Minimal' {
-            return @{
-                Policies = @($script:MinimalPolicies)
-                Tasks    = @()
-                Services = @()
-                Hosts    = $hostsAlwaysSafe + $hostsRewards   # Quick disables Rewards, leaves News on
-            }
-        }
-        'Origin' {
-            return @{
-                Policies = @($script:OriginPolicies)
-                Tasks    = @()
-                Services = @()
-                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews   # Origin disables both
-            }
-        }
-        'Performance' {
-            return @{
-                Policies = @($script:PerformancePolicies)
-                Tasks    = @($script:ScheduledTasks.Name)
-                Services = @()
-                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews
-            }
-        }
-        'MaxPerformance' {
-            return @{
-                Policies = @($script:MaxPerformancePolicies)
-                Tasks    = @($script:ScheduledTasks.Name)
-                Services = @($script:Services.Name)
-                Hosts    = $hostsAlwaysSafe + $hostsRewards + $hostsNews + $hostsComponents
-            }
-        }
-        default {
-            return @{
-                Policies = @()
-                Tasks    = @()
-                Services = @()
-                Hosts    = @()
-            }
-        }
-    }
+# Custom-URL boxes are enabled purely as a function of the model: derived state,
+# safe to recompute at any time (after import, load, or a language switch).
+function Update-OverrideControlStates {
+    if (-not $script:TxtCustomSearchUrl) { return }
+    $script:TxtCustomSearchUrl.Enabled = ($script:Overrides.Search.Enabled -and $script:Overrides.Search.EngineId -eq 'custom')
+    $script:CmbSearchEngine.Enabled    = $script:Overrides.Search.Enabled
+    $script:TxtNtpCustomUrl.Enabled    = ($script:Overrides.Ntp.Enabled -and $script:Overrides.Ntp.DestinationId -eq 'custom')
+    $script:CmbNtpDest.Enabled         = $script:Overrides.Ntp.Enabled
+    $mode = $script:StartupModes[$script:Overrides.Startup.ModeId]
+    $script:TxtStartupUrl.Enabled      = ($script:Overrides.Startup.Enabled -and $mode -and $mode.UsesURL -and -not $mode.FixedURL)
+    $script:CmbStartupMode.Enabled     = $script:Overrides.Startup.Enabled
 }
 
-function Update-SelectionSummary {
-    if (-not $script:ModeLabel) { return }
-
-    $selectedPolicies = @($script:CheckBoxes | Where-Object { $_.Checked })
-    $selectedTasks = @($script:TaskCheckBoxes | Where-Object { $_.Checked })
-    $selectedServices = @($script:ServiceCheckBoxes | Where-Object { $_.Checked })
-    $modeKey = if ([string]::IsNullOrWhiteSpace($script:ActiveProfile)) { 'Custom' } else { $script:ActiveProfile }
-    $script:ModeLabel.Text       = T 'mode.label'    @((Get-PresetName $modeKey))
-    $script:SelectionLabel.Text  = T 'mode.policies' @($selectedPolicies.Count, $script:CheckBoxes.Count)
-    $script:SystemLabel.Text     = T 'mode.system'   @($selectedTasks.Count, $selectedServices.Count)
-    $script:RiskLabel.Text       = T 'mode.risk'     @((Get-PresetRisk $modeKey))
-    $script:ModeDescription.Text = Get-PresetDescription $modeKey
-}
-
-function Set-CustomMode {
-    if ($script:SuppressSelectionEvents) { return }
-    $script:ActiveProfile = 'Custom'
-    Update-SelectionSummary
-}
-
-function Apply-Preset {
-    param([string]$Preset)
-
-    $payload = Get-PresetPayload -Preset $Preset
-    # Suppressed for correctness (no "Custom" downgrade) and for speed: the
-    # per-checkbox handler re-runs the whole configuration filter, and there
-    # are ninety-odd checkboxes. One recompute at the end is enough.
+function Sync-OverrideControls {
+    if (-not $script:ChkSearchOverride) { return }
     Push-SuppressSelectionEvents
     try {
-        foreach ($cb in $script:CheckBoxes) {
-            $policyName = $cb.Tag.Policy.Name
-            $cb.Checked = $payload.Policies -contains $policyName
-        }
-        foreach ($cb in $script:TaskCheckBoxes) {
-            $cb.Checked = $payload.Tasks -contains $cb.Tag.Name
-        }
-        foreach ($cb in $script:ServiceCheckBoxes) {
-            $cb.Checked = $payload.Services -contains $cb.Tag.Name
-        }
-        # Hosts checkboxes (created later in the GUI; guard if not yet built)
-        if ($script:HostsCheckBoxes) {
-            foreach ($cb in $script:HostsCheckBoxes) {
-                $cb.Checked = $payload.Hosts -contains $cb.Tag.Id
-            }
-        }
-    } finally {
-        Pop-SuppressSelectionEvents
+        $script:ChkSearchOverride.Checked = [bool]$script:Overrides.Search.Enabled
+        [void](Set-ComboId $script:CmbSearchEngine $script:SearchEngineIds $script:Overrides.Search.EngineId)
+        $script:TxtCustomSearchUrl.Text = "$($script:Overrides.Search.CustomUrl)"
+        $script:ChkNtpOverride.Checked = [bool]$script:Overrides.Ntp.Enabled
+        [void](Set-ComboId $script:CmbNtpDest $script:DestinationIds $script:Overrides.Ntp.DestinationId)
+        $script:TxtNtpCustomUrl.Text = "$($script:Overrides.Ntp.CustomUrl)"
+        $script:ChkStartupOverride.Checked = [bool]$script:Overrides.Startup.Enabled
+        [void](Set-ComboId $script:CmbStartupMode $script:StartupModeIds $script:Overrides.Startup.ModeId)
+        $script:TxtStartupUrl.Text = "$($script:Overrides.Startup.Urls)"
+    } finally { Pop-SuppressSelectionEvents }
+    Update-OverrideControlStates
+}
+#endregion
+
+
+#region UI: scriptlets page (expert) ----------------------------------------------------
+# Optional expert tool: view Brave's built-in adblock scriptlet rules and comment
+# individual rules out. It is never touched by a preset or by Apply.
+$script:ScriptletsBuilt = $false
+$script:ScriptletsPanel = $null
+
+function New-ScriptletsPage {
+    # Only the empty container exists at startup; Build-ScriptletsPage fills it the
+    # first time the page is opened, so the list view costs nothing until needed.
+    $panel = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White; Visible = $false }
+    $script:ScriptletsPanel = $panel
+    return $panel
+}
+
+function New-ScriptletButton {
+    param([string]$Key, [int]$Width, [string]$Style = 'Default')
+    $b = New-BfoButton $Key $Style $Width
+    $b.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 6)
+    return $b
+}
+
+function Build-ScriptletsPage {
+    if ($script:ScriptletsBuilt) { return }
+    $panel = $script:ScriptletsPanel
+    $panel.SuspendLayout()
+    # The page keeps a usable minimum height and scrolls when the window is shorter.
+    $panel.AutoScroll = $true
+    $panel.AutoScrollMinSize = New-Object System.Drawing.Size(760, 520)
+    $t = New-Ctl 'TableLayoutPanel' @{ Dock = 'Fill'; ColumnCount = 1; RowCount = 6; BackColor = $script:Clr.White; Padding = (New-Object System.Windows.Forms.Padding(14, 4, 14, 8)) } $panel
+    [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    foreach ($h in 'AutoSize', 'AutoSize', 'AutoSize', 'Percent', 'AutoSize', 'AutoSize') {
+        if ($h -eq 'Percent') { [void]$t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle('Percent', 100))) }
+        else { [void]$t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle($h))) }
     }
-    $script:ActiveProfile = $Preset
-    Update-SelectionSummary
-    Update-ConfigurationFilter
-    Write-Log "Loaded mode: $(Get-PresetNameEn $Preset)"
-}
 
-# Header panel
-$header = New-Object System.Windows.Forms.Panel
-$header.Dock = 'Top'
-$header.Height = 112
-$header.BackColor = [System.Drawing.Color]::FromArgb(22, 27, 34)
+    # 0 - risk banner
+    $risk = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(1000, 0)); ForeColor = (New-Rgb 130 70 20); BackColor = $script:Clr.AmberSoft; Padding = (New-Object System.Windows.Forms.Padding(8, 6, 8, 6)); Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 8)); Dock = 'Fill' }
+    [void](Set-Loc $risk 'scriptlet.risk'); [void](Set-LocFont $risk -Size 8.5 -Semibold)
+    $t.Controls.Add($risk, 0, 0)
 
-$titleLabel = New-Object System.Windows.Forms.Label
-[void](Set-Loc $titleLabel 'app.name')
-$titleLabel.ForeColor = [System.Drawing.Color]::White
-[void](Set-LocFont $titleLabel -Size 18 -Semibold)
-$titleLabel.Location = New-Object System.Drawing.Point(18, 10)
-$titleLabel.AutoSize = $true
-$header.Controls.Add($titleLabel)
-
-$subLabel = New-Object System.Windows.Forms.Label
-[void](Set-Loc $subLabel 'header.subtitle')
-$subLabel.ForeColor = [System.Drawing.Color]::Gainsboro
-[void](Set-LocFont $subLabel -Size 9)
-$subLabel.Location = New-Object System.Drawing.Point(20, 43)
-$subLabel.Size = New-Object System.Drawing.Size(760, 18)
-$header.Controls.Add($subLabel)
-
-$metaLabel = New-Object System.Windows.Forms.Label
-[void](Set-Loc $metaLabel 'header.braveDetected' -FormatArgs @($braveVer))
-$metaLabel.ForeColor = [System.Drawing.Color]::LightSteelBlue
-[void](Set-LocFont $metaLabel -Size 8.5)
-$metaLabel.Location = New-Object System.Drawing.Point(20, 70)
-$metaLabel.Size = New-Object System.Drawing.Size(280, 18)
-$header.Controls.Add($metaLabel)
-
-# Channel selector (multi-channel support)
-$detectedChannels = Get-DetectedChannels
-$channelLabel = New-Object System.Windows.Forms.Label
-[void](Set-Loc $channelLabel 'header.targetChannel')
-$channelLabel.ForeColor = [System.Drawing.Color]::LightSteelBlue
-[void](Set-LocFont $channelLabel -Size 8.5)
-$channelLabel.Location = New-Object System.Drawing.Point(310, 70)
-$channelLabel.Size = New-Object System.Drawing.Size(95, 18)
-$header.Controls.Add($channelLabel)
-
-$script:ChannelCombo = New-Object System.Windows.Forms.ComboBox
-$script:ChannelCombo.Location = New-Object System.Drawing.Point(405, 67)
-$script:ChannelCombo.Size = New-Object System.Drawing.Size(220, 22)
-$script:ChannelCombo.DropDownStyle = 'DropDownList'
-$script:ChannelCombo.FlatStyle = 'Flat'
-# Channel ids run in parallel with the visible items; the label may be
-# translated, the id never is.
-$script:ChannelIds      = @()
-$script:ChannelLabelKeys = @()
-foreach ($name in $script:Channels.Keys) {
-    $script:ChannelIds += $name
-    if ($detectedChannels -contains $name) { $script:ChannelLabelKeys += 'channel.installed' }
-    else                                   { $script:ChannelLabelKeys += 'channel.notInstalled' }
-}
-if ($detectedChannels.Count -gt 1) {
-    $script:ChannelIds += '__ALL__'
-    $script:ChannelLabelKeys += 'header.allChannels'
-}
-Update-ChannelComboLabels
-$script:ChannelCombo.SelectedIndex = 0
-$header.Controls.Add($script:ChannelCombo)
-
-$script:TargetPathLabel = New-Object System.Windows.Forms.Label
-$script:TargetPathLabel.Text = "-> $($script:Channels['Stable'].Path)"
-$script:TargetPathLabel.ForeColor = [System.Drawing.Color]::Gray
-$script:TargetPathLabel.Font = New-Object System.Drawing.Font('Consolas', 8)
-$script:TargetPathLabel.Location = New-Object System.Drawing.Point(635, 70)
-$script:TargetPathLabel.Size = New-Object System.Drawing.Size(500, 18)
-$header.Controls.Add($script:TargetPathLabel)
-
-$script:ChannelCombo.Add_SelectedIndexChanged({
-    if ($script:SuppressSelectionEvents) { return }
-    $id = Get-ComboId -Combo $script:ChannelCombo -Ids $script:ChannelIds
-    if ($id -eq '__ALL__') {
-        $script:TargetChannels = Get-DetectedChannels
-        if ($script:TargetChannels.Count -eq 0) { $script:TargetChannels = @('Stable') }
-        $script:BravePolicyPath = $script:Channels[$script:TargetChannels[0]].Path
-        $script:TargetPathLabel.Text = T 'header.hives' @(($script:TargetChannels -join ', '), $script:TargetChannels.Count)
-    } elseif ($id) {
-        $script:TargetChannels = @($id)
-        $script:BravePolicyPath = $script:Channels[$id].Path
-        $script:TargetPathLabel.Text = "-> $($script:Channels[$id].Path)"
-    }
-    Write-Log "Target channel(s): $($script:TargetChannels -join ', ')"
-})
-
-# ---- Language picker --------------------------------------------------------
-$lblLanguage = New-Object System.Windows.Forms.Label
-$lblLanguage.ForeColor = [System.Drawing.Color]::LightSteelBlue
-[void](Set-LocFont $lblLanguage -Size 8.5)
-$lblLanguage.Location = New-Object System.Drawing.Point(880, 10)
-$lblLanguage.Size = New-Object System.Drawing.Size(70, 18)
-[void](Set-Loc $lblLanguage 'header.language')
-$header.Controls.Add($lblLanguage)
-
-$script:LocaleList = @(Get-AvailableLocales)
-$script:LanguageCombo = New-Object System.Windows.Forms.ComboBox
-$script:LanguageCombo.Location = New-Object System.Drawing.Point(950, 7)
-$script:LanguageCombo.Size = New-Object System.Drawing.Size(170, 22)
-$script:LanguageCombo.DropDownStyle = 'DropDownList'
-$script:LanguageCombo.FlatStyle = 'Flat'
-foreach ($loc in $script:LocaleList) { [void]$script:LanguageCombo.Items.Add($loc.Name) }
-$header.Controls.Add($script:LanguageCombo)
-
-$script:LblLocaleNote = New-Object System.Windows.Forms.Label
-$script:LblLocaleNote.ForeColor = [System.Drawing.Color]::FromArgb(255, 212, 153)
-[void](Set-LocFont $script:LblLocaleNote -Size 7.5)
-$script:LblLocaleNote.Location = New-Object System.Drawing.Point(950, 31)
-$script:LblLocaleNote.Size = New-Object System.Drawing.Size(200, 14)
-$script:LblLocaleNote.Text = ''
-$header.Controls.Add($script:LblLocaleNote)
-
-function Update-LocaleNote {
-    if (-not $script:LblLocaleNote) { return }
-    $entry = @($script:LocaleList | Where-Object { $_.Code -eq $script:CurrentLocale })
-    if ($entry.Count -gt 0 -and -not $entry[0].Reviewed -and $script:CurrentLocale -ne 'en-US') {
-        $script:LblLocaleNote.Text = T 'header.unreviewedLocale'
-    } else {
-        $script:LblLocaleNote.Text = ''
-    }
-}
-
-$script:LanguageCombo.Add_SelectedIndexChanged({
-    $i = $script:LanguageCombo.SelectedIndex
-    if ($i -lt 0 -or $i -ge $script:LocaleList.Count) { return }
-    $code = $script:LocaleList[$i].Code
-    if ($code -eq $script:CurrentLocale) { return }
-    [void](Set-BfoLocale -Code $code)
-    $form.Font = Get-BfoUiFont -Size 9
-    Update-UiLanguage
-    Update-LocaleNote
-    $settings = Get-BfoSettings -Path $BfoSettingsPath
-    $settings['language'] = $code
-    Save-BfoSettings -Path $BfoSettingsPath -Settings $settings
-    Write-Log "$(T 'msg.language.switched' @($script:LocaleList[$i].Name))" 'OK'
-})
-
-$originNote = New-Object System.Windows.Forms.Label
-[void](Set-Loc $originNote 'header.originNote')
-$originNote.ForeColor = [System.Drawing.Color]::FromArgb(255, 212, 153)
-[void](Set-LocFont $originNote -Size 8.5)
-$originNote.Location = New-Object System.Drawing.Point(20, 88)
-$originNote.Size = New-Object System.Drawing.Size(950, 18)
-$header.Controls.Add($originNote)
-
-$form.Controls.Add($header)
-
-# Mode deck
-$modePanel = New-Object System.Windows.Forms.Panel
-$modePanel.Location = New-Object System.Drawing.Point(10, 122)
-$modePanel.Size = New-Object System.Drawing.Size(1145, 126)
-$modePanel.Anchor = 'Top, Left, Right'
-$modePanel.BackColor = [System.Drawing.Color]::White
-$modePanel.BorderStyle = 'FixedSingle'
-$form.Controls.Add($modePanel)
-
-$modeIntro = New-Object System.Windows.Forms.Label
-[void](Set-Loc $modeIntro 'mode.intro')
-$modeIntro.Location = New-Object System.Drawing.Point(14, 10)
-$modeIntro.Size = New-Object System.Drawing.Size(620, 18)
-[void](Set-LocFont $modeIntro -Size 9 -Semibold)
-$modePanel.Controls.Add($modeIntro)
-
-# X positions are no longer hard-coded: Set-ModeButtonRow measures the
-# translated caption and re-flows the row, so a longer or shorter label in
-# another language cannot overlap its neighbour.
-$buttonSpecs = @(
-    @{Mode='Minimal';        Color=[System.Drawing.Color]::FromArgb(235, 236, 240)},
-    @{Mode='Recommended';    Color=[System.Drawing.Color]::FromArgb(220, 238, 222)},
-    @{Mode='Origin';         Color=[System.Drawing.Color]::FromArgb(250, 232, 210)},
-    @{Mode='Performance';    Color=[System.Drawing.Color]::FromArgb(218, 231, 248)},
-    @{Mode='MaxPerformance'; Color=[System.Drawing.Color]::FromArgb(255, 224, 224)},
-    @{Mode='MaxPrivacy';     Color=[System.Drawing.Color]::FromArgb(229, 220, 240)},
-    @{Mode='None';           Color=[System.Drawing.Color]::FromArgb(241, 241, 241)}
-)
-$script:ModeButtons = @()
-foreach ($spec in $buttonSpecs) {
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Size = New-Object System.Drawing.Size(104, 30)
-    $btn.Location = New-Object System.Drawing.Point(14, 34)
-    $btn.BackColor = $spec.Color
-    $btn.Tag = $spec.Mode
-    $btn.Add_Click({ Apply-Preset $this.Tag })
-    [void](Set-Loc $btn ("preset.{0}.name" -f $spec.Mode))
-    [void](Set-LocTooltip $btn ("preset.{0}.description" -f $spec.Mode))
-    $modePanel.Controls.Add($btn)
-    $script:ModeButtons += $btn
-}
-Set-ModeButtonRow
-
-$script:ModeLabel = New-Object System.Windows.Forms.Label
-$script:ModeLabel.Location = New-Object System.Drawing.Point(14, 78)
-$script:ModeLabel.Size = New-Object System.Drawing.Size(170, 18)
-[void](Set-LocFont $script:ModeLabel -Size 9 -Semibold)
-$modePanel.Controls.Add($script:ModeLabel)
-
-$script:SelectionLabel = New-Object System.Windows.Forms.Label
-$script:SelectionLabel.Location = New-Object System.Drawing.Point(190, 78)
-$script:SelectionLabel.Size = New-Object System.Drawing.Size(150, 18)
-$modePanel.Controls.Add($script:SelectionLabel)
-
-$script:SystemLabel = New-Object System.Windows.Forms.Label
-$script:SystemLabel.Location = New-Object System.Drawing.Point(346, 78)
-$script:SystemLabel.Size = New-Object System.Drawing.Size(190, 18)
-$modePanel.Controls.Add($script:SystemLabel)
-
-$script:RiskLabel = New-Object System.Windows.Forms.Label
-$script:RiskLabel.Location = New-Object System.Drawing.Point(542, 78)
-$script:RiskLabel.Size = New-Object System.Drawing.Size(130, 18)
-[void](Set-LocFont $script:RiskLabel -Size 9 -Semibold)
-$modePanel.Controls.Add($script:RiskLabel)
-
-$script:ModeDescription = New-Object System.Windows.Forms.Label
-$script:ModeDescription.Location = New-Object System.Drawing.Point(678, 72)
-$script:ModeDescription.Size = New-Object System.Drawing.Size(440, 36)
-$script:ModeDescription.ForeColor = [System.Drawing.Color]::DimGray
-[void](Set-LocFont $script:ModeDescription -Size 8.5)
-$modePanel.Controls.Add($script:ModeDescription)
-
-# ---- Global configuration filter -------------------------------------------
-# Searches every policy, task, service and hosts group at once. The Scriptlets
-# tab keeps its own scanner - it handles thousands of rows and is already tuned.
-$filterPanel = New-Object System.Windows.Forms.Panel
-$filterPanel.Location = New-Object System.Drawing.Point(10, 252)
-$filterPanel.Size = New-Object System.Drawing.Size(1145, 32)
-$filterPanel.Anchor = 'Top, Left, Right'
-$form.Controls.Add($filterPanel)
-
-$lblFilter = New-Object System.Windows.Forms.Label
-$lblFilter.Location = New-Object System.Drawing.Point(4, 8)
-$lblFilter.AutoSize = $true
-[void](Set-LocFont $lblFilter -Size 9 -Semibold)
-[void](Set-Loc $lblFilter 'filter.label')
-$filterPanel.Controls.Add($lblFilter)
-
-$script:TxtConfigFilter = New-Object System.Windows.Forms.TextBox
-$script:TxtConfigFilter.Location = New-Object System.Drawing.Point(140, 5)
-$script:TxtConfigFilter.Size = New-Object System.Drawing.Size(430, 22)
-$script:TxtConfigFilter.Add_TextChanged({ Start-FilterDebounce })
-$filterPanel.Controls.Add($script:TxtConfigFilter)
-[void](Set-LocTooltip $script:TxtConfigFilter 'filter.placeholder')
-
-$script:ChkSelectedOnly = New-Object System.Windows.Forms.CheckBox
-$script:ChkSelectedOnly.Location = New-Object System.Drawing.Point(582, 6)
-$script:ChkSelectedOnly.Size = New-Object System.Drawing.Size(160, 20)
-$script:ChkSelectedOnly.Add_CheckedChanged({ Update-ConfigurationFilter })
-[void](Set-Loc $script:ChkSelectedOnly 'filter.selectedOnly')
-$filterPanel.Controls.Add($script:ChkSelectedOnly)
-
-$btnClearFilter = New-Object System.Windows.Forms.Button
-$btnClearFilter.Location = New-Object System.Drawing.Point(748, 4)
-$btnClearFilter.Size = New-Object System.Drawing.Size(80, 24)
-$btnClearFilter.Add_Click({ Clear-ConfigurationFilter })
-[void](Set-Loc $btnClearFilter 'filter.clear')
-$filterPanel.Controls.Add($btnClearFilter)
-
-$script:LblFilterCount = New-Object System.Windows.Forms.Label
-$script:LblFilterCount.Location = New-Object System.Drawing.Point(840, 8)
-$script:LblFilterCount.Size = New-Object System.Drawing.Size(300, 18)
-$script:LblFilterCount.ForeColor = [System.Drawing.Color]::DimGray
-$filterPanel.Controls.Add($script:LblFilterCount)
-
-# Tab control
-$tabs = New-Object System.Windows.Forms.TabControl
-$tabs.Location = New-Object System.Drawing.Point(10, 288)
-$tabs.Size = New-Object System.Drawing.Size(1145, 418)
-$tabs.Anchor = 'Top, Left, Right, Bottom'
-$script:Tabs = $tabs
-$form.Controls.Add($tabs)
-
-# Track every checkbox so we can iterate on apply/reset
-$script:CheckBoxes = @()
-# Maps a policy Name -> its value-picker ComboBox (only for policies that
-# define a Choices map, e.g. HardwareAccelerationModeEnabled). Used by
-# refresh/import so the picker reflects the real registry value.
-$script:PolicyCombos = @{}
-$script:PolicyChoiceIds = @{}
-$script:PolicyChoiceKeys = @{}
-$script:PolicyCheckBoxIndex = @{}
-
-foreach ($cat in $script:Policies.Keys) {
-    $tab = New-Object System.Windows.Forms.TabPage
-    # Tab caption is translated; $cat stays the stable category id and is what
-    # Select all / Select none and the filter index match on.
-    $tab.Name = "policyTab_$cat"
-    [void](Set-Loc $tab ("category.$cat"))
-    Set-FlowTabTitleKey $tab ("category.$cat")
-    $tab.AutoScroll = $true
-    $tab.BackColor = [System.Drawing.Color]::White
-
-    $selAll = New-Object System.Windows.Forms.LinkLabel
-    [void](Set-Loc $selAll 'policyTab.selectAll')
-    $selAll.Location = New-Object System.Drawing.Point(10, 8)
-    $selAll.AutoSize = $true
-    $selAll.Tag = $cat
-    $selAll.Add_LinkClicked({
-        $myCat = $this.Tag
-        Push-SuppressSelectionEvents
-        try {
-            foreach ($cb in $script:CheckBoxes) {
-                if ($cb.Tag.Category -eq $myCat) { $cb.Checked = $true }
-            }
-        } finally {
-            Pop-SuppressSelectionEvents
+    # 1 - folder row
+    $rootRow = New-Ctl 'TableLayoutPanel' @{ Dock = 'Fill'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; ColumnCount = 6; RowCount = 1; BackColor = $script:Clr.White }
+    [void]$rootRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize')))
+    [void]$rootRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    foreach ($i in 1..4) { [void]$rootRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('AutoSize'))) }
+    $lblRoot = New-Ctl 'Label' @{ AutoSize = $true; Margin = (New-Object System.Windows.Forms.Padding(0, 8, 8, 0)) }
+    [void](Set-Loc $lblRoot 'scriptlet.rootLabel'); [void](Set-LocFont $lblRoot -Size 9)
+    $rootRow.Controls.Add($lblRoot, 0, 0)
+    $script:TxtScriptletRoot = New-Ctl 'TextBox' @{ Dock = 'Fill'; Margin = (New-Object System.Windows.Forms.Padding(0, 4, 8, 0)); Text = (Get-ScriptletDefaultRoot) }
+    $script:TxtScriptletRoot.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $rootRow.Controls.Add($script:TxtScriptletRoot, 1, 0)
+    $bAuto = New-ScriptletButton 'scriptlet.autoPath' 80
+    $bAuto.Add_Click({ Invoke-Guarded 'Auto path' { $script:TxtScriptletRoot.Text = Get-ScriptletDefaultRoot; Write-Log "Scriptlet User Data path set to: $($script:TxtScriptletRoot.Text)" } })
+    $bBrowse = New-ScriptletButton 'scriptlet.browse' 80
+    $bBrowse.Add_Click({
+        Invoke-Guarded 'Browse' {
+            $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+            $dlg.Description = T 'dialog.browseUserData'
+            if (Test-Path -LiteralPath $script:TxtScriptletRoot.Text) { $dlg.SelectedPath = $script:TxtScriptletRoot.Text }
+            if ($dlg.ShowDialog() -eq 'OK') { $script:TxtScriptletRoot.Text = $dlg.SelectedPath; Write-Log "Scriptlet User Data path set manually: $($dlg.SelectedPath)" }
         }
-        $script:ActiveProfile = 'Custom'
-        Update-SelectionSummary
-        Update-ConfigurationFilter
     })
-    $tab.Controls.Add($selAll)
-
-    $selNone = New-Object System.Windows.Forms.LinkLabel
-    [void](Set-Loc $selNone 'policyTab.selectNone')
-    $selNone.Location = New-Object System.Drawing.Point(90, 8)
-    $selNone.AutoSize = $true
-    $selNone.Tag = $cat
-    $selNone.Add_LinkClicked({
-        $myCat = $this.Tag
-        Push-SuppressSelectionEvents
-        try {
-            foreach ($cb in $script:CheckBoxes) {
-                if ($cb.Tag.Category -eq $myCat) { $cb.Checked = $false }
-            }
-        } finally {
-            Pop-SuppressSelectionEvents
+    $script:BtnScriptletScan = New-ScriptletButton 'scriptlet.scan' 80 'Primary'
+    $script:BtnScriptletScan.Add_Click({ Invoke-Guarded 'Scan' { Invoke-ScriptletScan } })
+    $bOpen = New-ScriptletButton 'scriptlet.openFolder' 100
+    $bOpen.Add_Click({
+        Invoke-Guarded 'Open folder' {
+            if (Test-Path -LiteralPath $script:TxtScriptletRoot.Text) { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $script:TxtScriptletRoot.Text) }
+            else { [void](Show-Message -Text (T 'msg.scriptlet.folderMissing') -Title (T 'msg.title.scriptlet') -Icon 'Warning') }
         }
-        $script:ActiveProfile = 'Custom'
-        Update-SelectionSummary
-        Update-ConfigurationFilter
     })
-    $tab.Controls.Add($selNone)
+    $rootRow.Controls.Add($bAuto, 2, 0); $rootRow.Controls.Add($bBrowse, 3, 0); $rootRow.Controls.Add($script:BtnScriptletScan, 4, 0); $rootRow.Controls.Add($bOpen, 5, 0)
+    $t.Controls.Add($rootRow, 0, 1)
 
-    $y = 35
-    foreach ($p in $script:Policies[$cat]) {
-        $cb = New-Object System.Windows.Forms.CheckBox
-        # The caption is the raw registry value name. It is deliberately NOT
-        # translated: users cross-check it against brave://policy, and the
-        # Consolas face has no CJK coverage anyway. Only the description is
-        # localized.
-        if ($p.Choices) { $cb.Text = $p.Name } else { $cb.Text = "$($p.Name)    =>  $($p.ApplyValue)" }
-        $cb.Location = New-Object System.Drawing.Point(15, $y)
-        $cb.Size = New-Object System.Drawing.Size(($(if ($p.Choices) { 300 } else { 450 })), 20)
-        $cb.Font = New-Object System.Drawing.Font('Consolas', 9)
-        $cb.Tag = @{Policy = $p; Category = $cat}
-        $cb.Add_CheckedChanged({
-            if ($script:SuppressSelectionEvents) { return }
-            Set-CustomMode
-            Update-ConfigurationFilter
-        })
-        [void](Set-LocTooltip $cb ("policy.$($p.Name).description"))
-        $tab.Controls.Add($cb)
-        $script:CheckBoxes += $cb
-        $rowControls = @($cb)
-
-        # Value picker for choice-based policies. Selecting an item rewrites the
-        # policy's ApplyValue in place, so every downstream path (apply, verify,
-        # export) automatically uses the chosen value with no extra plumbing.
-        if ($p.Choices) {
-            $combo = New-Object System.Windows.Forms.ComboBox
-            $combo.DropDownStyle = 'DropDownList'
-            $combo.Location = New-Object System.Drawing.Point(320, ($y - 1))
-            $combo.Size = New-Object System.Drawing.Size(140, 22)
-            $combo.Font = New-Object System.Drawing.Font('Consolas', 9)
-            $choiceIds  = @($p.Choices.Keys)
-            $choiceKeys = @($choiceIds | ForEach-Object { "policy.$($p.Name).choice.$_" })
-            $script:PolicyChoiceIds[$p.Name] = $choiceIds
-            $script:PolicyChoiceKeys[$p.Name] = $choiceKeys
-            Set-ComboLabels -Combo $combo -Ids $choiceIds -LabelKeys $choiceKeys
-            $script:PolicyCombos[$p.Name] = $combo
-            # Preselect the id whose value matches the current ApplyValue.
-            foreach ($cid in $choiceIds) {
-                if ("$($p.Choices[$cid])" -eq "$($p.ApplyValue)") {
-                    [void](Set-PolicyChoiceId -Policy $p -ChoiceId $cid); break
-                }
-            }
-            if ($combo.SelectedIndex -lt 0) { $combo.SelectedIndex = 0 }
-            $combo.Tag = $p
-            # Gated: relabelling the picker for a new language clears and
-            # refills Items, which would otherwise land here with a transient
-            # SelectedIndex of -1 and then flip the profile to Custom.
-            $combo.Add_SelectedIndexChanged({
-                if ($script:SuppressSelectionEvents) { return }
-                $pol = $this.Tag
-                $cid = Get-ComboId -Combo $this -Ids $script:PolicyChoiceIds[$pol.Name]
-                if (-not $cid) { return }
-                # Set-PolicyChoiceId writes the picker back as well as the
-                # value. Assigning the index it already holds does not raise
-                # the event again, but muting makes that structural rather
-                # than a WinForms detail we are relying on.
-                Push-SuppressSelectionEvents
-                try { [void](Set-PolicyChoiceId -Policy $pol -ChoiceId $cid) }
-                finally { Pop-SuppressSelectionEvents }
-                Set-CustomMode
-            })
-            [void](Set-LocTooltip $combo ("policy.$($p.Name).description"))
-            $tab.Controls.Add($combo)
-            $rowControls += $combo
+    # 2 - search row
+    $searchRow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Fill'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $true; BackColor = $script:Clr.White }
+    $lblSearch = New-Ctl 'Label' @{ AutoSize = $true; Margin = (New-Object System.Windows.Forms.Padding(0, 8, 8, 0)) } $searchRow
+    [void](Set-Loc $lblSearch 'scriptlet.searchLabel'); [void](Set-LocFont $lblSearch -Size 9)
+    $script:TxtScriptletSearch = New-Ctl 'TextBox' @{ Width = 300; Margin = (New-Object System.Windows.Forms.Padding(0, 4, 8, 0)) } $searchRow
+    $script:TxtScriptletSearch.Font = Get-BfoUiFont -Size 8.5 -Mono
+    $script:TxtScriptletSearch.Add_TextChanged({ Start-ScriptletFilterDelay })
+    $script:TxtScriptletSearch.Add_KeyDown({
+        if ($_.KeyCode -eq 'Enter') {
+            if ($script:ScriptletFilterTimer) { $script:ScriptletFilterTimer.Stop() }
+            Update-ScriptletListView
+            $_.SuppressKeyPress = $true
         }
-
-        $desc = New-Object System.Windows.Forms.Label
-        $desc.Location = New-Object System.Drawing.Point(475, ($y + 2))
-        $desc.Size = New-Object System.Drawing.Size(630, (Get-PolicyDescHeight))
-        $desc.ForeColor = [System.Drawing.Color]::DimGray
-        $desc.Font = Get-BfoUiFont -Size (Get-PolicyDescFontSize)
-        [void](Set-Loc $desc ("policy.$($p.Name).description"))
-        $tab.Controls.Add($desc)
-        [void]$script:RowDescLabels.Add($desc)
-        $rowControls += $desc
-
-        $policyName = $p.Name
-        $categoryId = $cat
-        Register-FlowEntry -TabPage $tab -Kind 'Row' -Controls $rowControls -BaseTop $y `
-            -Height 28 -CjkExtra 8 -Group 'policies' -Id $policyName -Type 'Policy' -CategoryId $cat `
-            -SearchText ([scriptblock]::Create("@('$policyName', (T 'policy.$policyName.description'), (T 'category.$categoryId')) -join ' '")) `
-            -IsSelected ([scriptblock]::Create('$script:PolicyCheckBoxIndex[''' + $policyName + '''].Checked'))
-        $script:PolicyCheckBoxIndex[$policyName] = $cb
-
-        $y += 28
-    }
-    $tabs.TabPages.Add($tab)
-}
-
-# ---- System tab: scheduled tasks + services --------------------------------
-$sysTab = New-Object System.Windows.Forms.TabPage
-$sysTab.Name = 'sysTab'
-[void](Set-Loc $sysTab 'tab.system')
-Set-FlowTabTitleKey $sysTab 'tab.system'
-$sysTab.AutoScroll = $true
-$sysTab.BackColor = [System.Drawing.Color]::White
-
-$sysIntro = New-Object System.Windows.Forms.Label
-[void](Set-Loc $sysIntro 'system.intro')
-[void](Set-LocFont $sysIntro -Size 9)
-$sysIntro.Location = New-Object System.Drawing.Point(10, 8)
-$sysIntro.Size = New-Object System.Drawing.Size(1080, 30)
-$sysIntro.ForeColor = [System.Drawing.Color]::FromArgb(120, 50, 50)
-$sysTab.Controls.Add($sysIntro)
-
-$script:TaskCheckBoxes = @()
-$script:TaskCheckBoxIndex = @{}
-$script:ServiceCheckBoxIndex = @{}
-$y = 50
-$taskHdr = New-Object System.Windows.Forms.Label
-[void](Set-Loc $taskHdr 'system.tasksHdr')
-[void](Set-LocFont $taskHdr -Size 10 -Semibold)
-$taskHdr.Location = New-Object System.Drawing.Point(10, $y)
-$taskHdr.AutoSize = $true
-$sysTab.Controls.Add($taskHdr)
-Register-FlowEntry -TabPage $sysTab -Kind 'Header' -Controls @($taskHdr) -BaseTop $y -Height 28 -Group 'tasks'
-$y += 28
-foreach ($t in $script:ScheduledTasks) {
-    $cb = New-Object System.Windows.Forms.CheckBox
-    $cb.Text = $t.Name
-    $cb.Location = New-Object System.Drawing.Point(15, $y)
-    $cb.Size = New-Object System.Drawing.Size(450, 20)
-    $cb.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $cb.Tag = $t
-    $cb.Add_CheckedChanged({
-        if ($script:SuppressSelectionEvents) { return }
-        Set-CustomMode
-        Update-ConfigurationFilter
     })
-    [void](Set-LocTooltip $cb ("task.$($t.Name).description"))
-    $sysTab.Controls.Add($cb)
-    $script:TaskCheckBoxes += $cb
+    $script:BtnScriptletFilter = New-ScriptletButton 'scriptlet.filter' 70
+    $script:BtnScriptletFilter.Add_Click({ Invoke-Guarded 'Filter' { if ($script:ScriptletFilterTimer) { $script:ScriptletFilterTimer.Stop() }; Update-ScriptletListView } })
+    $searchRow.Controls.Add($script:BtnScriptletFilter)
+    $script:ChkScriptletDisabledOnly = New-Ctl 'CheckBox' @{ AutoSize = $true; Margin = (New-Object System.Windows.Forms.Padding(8, 6, 12, 0)) } $searchRow
+    [void](Set-Loc $script:ChkScriptletDisabledOnly 'scriptlet.disabledOnly'); [void](Set-LocFont $script:ChkScriptletDisabledOnly -Size 9)
+    $script:ChkScriptletDisabledOnly.Add_CheckedChanged({ Update-ScriptletListView })
+    $t.Controls.Add($searchRow, 0, 2)
 
-    $desc = New-Object System.Windows.Forms.Label
-    $desc.Location = New-Object System.Drawing.Point(475, ($y + 2))
-    $desc.Size = New-Object System.Drawing.Size(630, (Get-PolicyDescHeight))
-    $desc.ForeColor = [System.Drawing.Color]::DimGray
-    $desc.Font = Get-BfoUiFont -Size (Get-PolicyDescFontSize)
-    [void](Set-Loc $desc ("task.$($t.Name).description"))
-    $sysTab.Controls.Add($desc)
-    [void]$script:RowDescLabels.Add($desc)
+    $script:ScriptletFilterTimer = New-Object System.Windows.Forms.Timer
+    $script:ScriptletFilterTimer.Interval = 250
+    $script:ScriptletFilterTimer.Add_Tick({ $script:ScriptletFilterTimer.Stop(); Invoke-Guarded 'Filter' { Update-ScriptletListView } })
 
-    $taskName = $t.Name
-    Register-FlowEntry -TabPage $sysTab -Kind 'Row' -Controls @($cb, $desc) -BaseTop $y `
-        -Height 28 -CjkExtra 8 -Group 'tasks' -Id $taskName -Type 'ScheduledTask' `
-        -SearchText ([scriptblock]::Create("@('$taskName', (T 'task.$taskName.description'), (T 'system.tasksHdr')) -join ' '")) `
-        -IsSelected ([scriptblock]::Create('$script:TaskCheckBoxIndex[''' + $taskName + '''].Checked'))
-    $script:TaskCheckBoxIndex[$taskName] = $cb
-    $y += 28
-}
-
-$script:ServiceCheckBoxes = @()
-$y += 15
-$svcHdr = New-Object System.Windows.Forms.Label
-[void](Set-Loc $svcHdr 'system.svcHdr')
-[void](Set-LocFont $svcHdr -Size 10 -Semibold)
-$svcHdr.Location = New-Object System.Drawing.Point(10, $y)
-$svcHdr.AutoSize = $true
-$sysTab.Controls.Add($svcHdr)
-# BaseTop is 15px above the header so the visual gap re-flows with it.
-Register-FlowEntry -TabPage $sysTab -Kind 'Header' -Controls @($svcHdr) -BaseTop ($y - 15) -Height 43 -Group 'services'
-$y += 28
-foreach ($s in $script:Services) {
-    $cb = New-Object System.Windows.Forms.CheckBox
-    $cb.Text = $s.Name
-    $cb.Location = New-Object System.Drawing.Point(15, $y)
-    $cb.Size = New-Object System.Drawing.Size(450, 20)
-    $cb.Font = New-Object System.Drawing.Font('Consolas', 9)
-    $cb.Tag = $s
-    $cb.Add_CheckedChanged({
-        if ($script:SuppressSelectionEvents) { return }
-        Set-CustomMode
-        Update-ConfigurationFilter
+    # 3 - the list
+    $lv = New-Ctl 'ListView' @{ Dock = 'Fill'; View = 'Details'; FullRowSelect = $true; GridLines = $true; MultiSelect = $true; HideSelection = $false; CheckBoxes = $true; Margin = (New-Object System.Windows.Forms.Padding(0, 6, 0, 6)) }
+    $script:ScriptletList = $lv
+    $lv.Add_SizeChanged({ Resize-ScriptletColumns })
+    $lv.Add_ItemChecked({
+        param($sender, $e)
+        if (-not $script:SuppressScriptletStatusEvents) {
+            Set-ScriptletRecordChecked -Record $e.Item.Tag -Checked $e.Item.Checked
+            Update-ScriptletStatusText
+        }
     })
-    [void](Set-LocTooltip $cb ("service.$($s.Name).description"))
-    $sysTab.Controls.Add($cb)
-    $script:ServiceCheckBoxes += $cb
+    foreach ($col in @(@('scriptlet.col.pick', 96), @('scriptlet.col.domain', 190), @('scriptlet.col.scriptlet', 190), @('scriptlet.col.arguments', 260), @('scriptlet.col.source', 180), @('scriptlet.col.line', 55), @('scriptlet.col.rawRule', 520))) {
+        [void]$lv.Columns.Add((T $col[0]), $col[1])
+    }
+    $t.Controls.Add($lv, 0, 3)
 
-    $desc = New-Object System.Windows.Forms.Label
-    $desc.Location = New-Object System.Drawing.Point(475, ($y + 2))
-    $desc.Size = New-Object System.Drawing.Size(630, (Get-PolicyDescHeight))
-    $desc.ForeColor = [System.Drawing.Color]::DimGray
-    $desc.Font = Get-BfoUiFont -Size (Get-PolicyDescFontSize)
-    [void](Set-Loc $desc ("service.$($s.Name).description"))
-    $sysTab.Controls.Add($desc)
-    [void]$script:RowDescLabels.Add($desc)
+    # 4 - status + progress
+    $statusRow = New-Ctl 'TableLayoutPanel' @{ Dock = 'Fill'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; ColumnCount = 2; RowCount = 1; BackColor = $script:Clr.White }
+    [void]$statusRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$statusRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle('Absolute', 320)))
+    $script:LblScriptletStatus = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.Slate; Margin = (New-Object System.Windows.Forms.Padding(0, 2, 8, 0)); MaximumSize = (New-Object System.Drawing.Size(900, 0)) }
+    [void](Set-Loc $script:LblScriptletStatus 'scriptlet.statusIdle'); [void](Set-LocFont $script:LblScriptletStatus -Size 9)
+    $statusRow.Controls.Add($script:LblScriptletStatus, 0, 0)
+    $script:ScriptletProgress = New-Ctl 'ProgressBar' @{ Dock = 'Fill'; Minimum = 0; Maximum = 1000; Value = 0; Style = 'Continuous'; Margin = (New-Object System.Windows.Forms.Padding(0, 4, 0, 4)) }
+    $statusRow.Controls.Add($script:ScriptletProgress, 1, 0)
+    $t.Controls.Add($statusRow, 0, 4)
 
-    $svcName = $s.Name
-    Register-FlowEntry -TabPage $sysTab -Kind 'Row' -Controls @($cb, $desc) -BaseTop $y `
-        -Height 28 -CjkExtra 8 -Group 'services' -Id $svcName -Type 'Service' `
-        -SearchText ([scriptblock]::Create("@('$svcName', (T 'service.$svcName.description'), (T 'system.svcHdr')) -join ' '")) `
-        -IsSelected ([scriptblock]::Create('$script:ServiceCheckBoxIndex[''' + $svcName + '''].Checked'))
-    $script:ServiceCheckBoxIndex[$svcName] = $cb
-    $y += 28
+    # 5 - actions
+    $actions = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Fill'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $true; BackColor = $script:Clr.White }
+    $script:ChkScriptletAdvanced = New-Ctl 'CheckBox' @{ AutoSize = $true; ForeColor = (New-Rgb 150 60 60); Margin = (New-Object System.Windows.Forms.Padding(0, 6, 16, 0)) } $actions
+    [void](Set-Loc $script:ChkScriptletAdvanced 'scriptlet.advancedMode'); [void](Set-LocFont $script:ChkScriptletAdvanced -Size 9)
+    $script:ChkScriptletAffectDuplicates = New-Ctl 'CheckBox' @{ AutoSize = $true; Checked = $true; Margin = (New-Object System.Windows.Forms.Padding(0, 6, 12, 0)) } $actions
+    [void](Set-Loc $script:ChkScriptletAffectDuplicates 'scriptlet.affectDupes'); [void](Set-LocFont $script:ChkScriptletAffectDuplicates -Size 9)
+    [void](Set-LocTooltip $script:ChkScriptletAffectDuplicates 'scriptlet.tipAffectDupes')
+    $script:BtnScriptletCheckVisible = New-ScriptletButton 'scriptlet.checkFiltered' 120
+    $script:BtnScriptletCheckVisible.Add_Click({ Invoke-Guarded 'Check filtered' { Set-ScriptletVisibleChecks $true } })
+    [void](Set-LocTooltip $script:BtnScriptletCheckVisible 'scriptlet.tipCheckFiltered')
+    $script:BtnScriptletClearChecks = New-ScriptletButton 'scriptlet.clearChecks' 100
+    $script:BtnScriptletClearChecks.Add_Click({ Invoke-Guarded 'Clear checks' { Set-ScriptletVisibleChecks $false } })
+    $script:BtnScriptletDisable = New-ScriptletButton 'scriptlet.disableChecked' 120 'Danger'
+    $script:BtnScriptletDisable.Add_Click({ Invoke-Guarded 'Disable scriptlets' { Invoke-ScriptletDisable } })
+    $script:BtnScriptletEnable = New-ScriptletButton 'scriptlet.enableChecked' 120
+    $script:BtnScriptletEnable.Add_Click({ Invoke-Guarded 'Enable scriptlets' { Invoke-ScriptletEnable } })
+    $bDetails = New-ScriptletButton 'scriptlet.viewSelected' 110
+    $bDetails.Add_Click({ Invoke-Guarded 'View scriptlet' { Show-ScriptletDetails } })
+    $bBackup = New-ScriptletButton 'scriptlet.backupAll' 120
+    $bBackup.Add_Click({ Invoke-Guarded 'Backup scriptlets' { Invoke-ScriptletBackupAll } })
+    $bRestoreSel = New-ScriptletButton 'scriptlet.restoreSelected' 150
+    $bRestoreSel.Add_Click({ Invoke-Guarded 'Restore scriptlets' { Invoke-ScriptletRestoreSelected } })
+    $bRestoreAll = New-ScriptletButton 'scriptlet.restoreAll' 140
+    $bRestoreAll.Add_Click({ Invoke-Guarded 'Restore scriptlets' { Invoke-ScriptletRestoreAll } })
+    $bCsv = New-ScriptletButton 'scriptlet.exportCsv' 130
+    $bCsv.Add_Click({ Invoke-Guarded 'Export CSV' { Invoke-ScriptletExportCsv } })
+    $bExportPrefs = New-ScriptletButton 'scriptlet.exportPrefs' 140
+    $bExportPrefs.Add_Click({ Invoke-Guarded 'Export preferences' { Invoke-ScriptletExportPrefs } })
+    $script:BtnScriptletImportPrefs = New-ScriptletButton 'scriptlet.importPrefs' 160
+    $script:BtnScriptletImportPrefs.Add_Click({ Invoke-Guarded 'Import preferences' { Invoke-ScriptletImportPrefs } })
+    $actions.Controls.AddRange([System.Windows.Forms.Control[]]@($script:BtnScriptletCheckVisible, $script:BtnScriptletClearChecks, $script:BtnScriptletDisable, $script:BtnScriptletEnable, $bDetails, $bBackup, $bRestoreSel, $bRestoreAll, $bCsv, $bExportPrefs, $script:BtnScriptletImportPrefs))
+    $t.Controls.Add($actions, 0, 5)
+
+
+    $panel.ResumeLayout($true)
+    $script:ScriptletsBuilt = $true
+    Update-ScriptletLocalizedText
 }
 
-$tabs.TabPages.Add($sysTab)
-
-# ---- Hosts blocklist tab (v1.5) --------------------------------------------
-# Independent from the main Apply button - has its own Apply/Remove inside the tab.
-# Sentinel-tagged so revert is surgical. Auto-backs up hosts file before any write.
-$hostsTab = New-Object System.Windows.Forms.TabPage
-$hostsTab.Name = 'hostsTab'
-[void](Set-Loc $hostsTab 'tab.hosts')
-Set-FlowTabTitleKey $hostsTab 'tab.hosts'
-$hostsTab.AutoScroll = $true
-$hostsTab.BackColor = [System.Drawing.Color]::White
-
-$hostsIntro = New-Object System.Windows.Forms.Label
-[void](Set-Loc $hostsIntro 'hostsTab.intro')
-[void](Set-LocFont $hostsIntro -Size 9)
-$hostsIntro.Location = New-Object System.Drawing.Point(10, 8)
-$hostsIntro.Size = New-Object System.Drawing.Size(1100, 36)
-$hostsIntro.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 90)
-$hostsTab.Controls.Add($hostsIntro)
-
-$hostsWarn = New-Object System.Windows.Forms.Label
-[void](Set-Loc $hostsWarn 'hostsTab.warn')
-$hostsWarn.Location = New-Object System.Drawing.Point(10, 44)
-$hostsWarn.Size = New-Object System.Drawing.Size(1100, 18)
-$hostsWarn.ForeColor = [System.Drawing.Color]::FromArgb(160, 70, 30)
-[void](Set-LocFont $hostsWarn -Size 8.5 -Semibold)
-$hostsTab.Controls.Add($hostsWarn)
-
-$script:HostsCheckBoxes = @()
-$y = 70
-$script:HostsCheckBoxIndex = @{}
-foreach ($block in $script:HostsBlocks) {
-    $cb = New-Object System.Windows.Forms.CheckBox
-    $cb.Location = New-Object System.Drawing.Point(15, $y)
-    $cb.Size = New-Object System.Drawing.Size(360, 20)
-    [void](Set-LocFont $cb -Size 9)
-    $cb.Checked = [bool]$block.Recommended
-    $cb.Tag = $block
-    $cb.Add_CheckedChanged({
-        if ($script:SuppressSelectionEvents) { return }
-        Update-ConfigurationFilter
-    })
-    # ArgsScript re-evaluates the group name at switch time, so the domain
-    # count and the translated name stay in sync.
-    [void](Set-Loc $cb 'hostsTab.groupLabel' -ArgsScript ([scriptblock]::Create(
-        "@((T '$($block.NameKey)'), $($block.Domains.Count))")))
-    [void](Set-LocTooltip $cb $block.DescriptionKey)
-    $hostsTab.Controls.Add($cb)
-    $script:HostsCheckBoxes += $cb
-
-    $desc = New-Object System.Windows.Forms.Label
-    $desc.Location = New-Object System.Drawing.Point(385, ($y + 2))
-    # Same height rule as every other row description, so the initial build
-    # and a later language switch agree on the geometry.
-    $desc.Size = New-Object System.Drawing.Size(720, (Get-PolicyDescHeight))
-    $desc.ForeColor = [System.Drawing.Color]::DimGray
-    $desc.Font = Get-BfoUiFont -Size (Get-PolicyDescFontSize)
-    [void](Set-Loc $desc $block.DescriptionKey)
-    $hostsTab.Controls.Add($desc)
-    [void]$script:RowDescLabels.Add($desc)
-
-    $domLabel = New-Object System.Windows.Forms.Label
-    $domLabel.Text = ($block.Domains -join ', ')
-    $domLabel.Location = New-Object System.Drawing.Point(35, ($y + 22))
-    $domLabel.Size = New-Object System.Drawing.Size(340, 16)
-    $domLabel.ForeColor = [System.Drawing.Color]::FromArgb(80, 80, 80)
-    $domLabel.Font = New-Object System.Drawing.Font('Consolas', 8)
-    $hostsTab.Controls.Add($domLabel)
-
-    $blockId = $block.Id
-    $nameKey = $block.NameKey
-    $descKey = $block.DescriptionKey
-    $domainText = ($block.Domains -join ' ')
-    Register-FlowEntry -TabPage $hostsTab -Kind 'Row' -Controls @($cb, $desc, $domLabel) -BaseTop $y `
-        -Height 44 -CjkExtra 6 -Group 'hosts' -Id $blockId -Type 'HostBlock' `
-        -SearchText ([scriptblock]::Create("@('$blockId', (T '$nameKey'), (T '$descKey'), '$domainText') -join ' '")) `
-        -IsSelected ([scriptblock]::Create('$script:HostsCheckBoxIndex[''' + $blockId + '''].Checked'))
-    $script:HostsCheckBoxIndex[$blockId] = $cb
-
-    $y += 44
-}
-
-$btnApplyHosts = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnApplyHosts 'hostsTab.apply')
-$btnApplyHosts.Size = New-Object System.Drawing.Size(160, 30)
-$btnApplyHosts.Location = New-Object System.Drawing.Point(15, ($y + 10))
-$btnApplyHosts.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 63)
-$btnApplyHosts.ForeColor = [System.Drawing.Color]::White
-$btnApplyHosts.Add_Click({
-    $domains = @()
-    foreach ($cb in $script:HostsCheckBoxes) {
-        if ($cb.Checked) { $domains += $cb.Tag.Domains }
-    }
-    if ($domains.Count -eq 0) {
-        $ans = [System.Windows.Forms.MessageBox]::Show(
-            (T 'msg.hosts.noGroups'),
-            (T 'msg.title.hosts'), 'YesNo', 'Question')
-        if ($ans -ne 'Yes') { return }
-    } else {
-        $msg = T 'msg.hosts.confirmApply' @($domains.Count, $script:HostsFile)
-        $ans = [System.Windows.Forms.MessageBox]::Show($msg, (T 'msg.title.hosts'), 'YesNo', 'Question')
-        if ($ans -ne 'Yes') { return }
-    }
-    try {
-        Set-HostsBlockDomains -Domains $domains
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.hosts.applied' @($domains.Count)), (T 'msg.title.done'), 'OK', 'Information') | Out-Null
-    } catch {
-        Write-Log "Hosts apply failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.failed' @("$_")), (T 'msg.title.error'), 'OK', 'Error') | Out-Null
-    }
-})
-$hostsTab.Controls.Add($btnApplyHosts)
-
-$btnClearHosts = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnClearHosts 'hostsTab.remove')
-$btnClearHosts.Size = New-Object System.Drawing.Size(160, 30)
-$btnClearHosts.Location = New-Object System.Drawing.Point(185, ($y + 10))
-$btnClearHosts.Add_Click({
-    $ans = [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.hosts.confirmRemove'),
-        (T 'msg.title.hosts'), 'YesNo', 'Warning')
-    if ($ans -ne 'Yes') { return }
-    try {
-        Clear-HostsBlock
-        foreach ($cb in $script:HostsCheckBoxes) { $cb.Checked = $false }
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.hosts.removed'), (T 'msg.title.done'), 'OK', 'Information') | Out-Null
-    } catch {
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.failed' @("$_")), (T 'msg.title.error'), 'OK', 'Error') | Out-Null
-    }
-})
-$hostsTab.Controls.Add($btnClearHosts)
-
-$btnLoadHosts = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnLoadHosts 'hostsTab.load')
-$btnLoadHosts.Size = New-Object System.Drawing.Size(160, 30)
-$btnLoadHosts.Location = New-Object System.Drawing.Point(355, ($y + 10))
-$btnLoadHosts.Add_Click({
-    $current = Get-HostsCurrentDomains
-    foreach ($cb in $script:HostsCheckBoxes) {
-        $blockDomains = $cb.Tag.Domains
-        $allPresent = $true
-        foreach ($d in $blockDomains) { if ($current -notcontains $d) { $allPresent = $false; break } }
-        $cb.Checked = $allPresent
-    }
-    Write-Log "Hosts state loaded: $($current.Count) domain(s) currently blocked."
-})
-$hostsTab.Controls.Add($btnLoadHosts)
-
-$btnPreviewHosts = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnPreviewHosts 'hostsTab.preview')
-$btnPreviewHosts.Size = New-Object System.Drawing.Size(130, 30)
-$btnPreviewHosts.Location = New-Object System.Drawing.Point(525, ($y + 10))
-$btnPreviewHosts.Add_Click({
-    Show-TextReport -Title (T 'report.hostsTitle') -Text (New-HostsPlanReport) -DefaultFileName "brave-free-origin-hosts-preview-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
-})
-$hostsTab.Controls.Add($btnPreviewHosts)
-
-$btnOpenHosts = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnOpenHosts 'hostsTab.open')
-$btnOpenHosts.Size = New-Object System.Drawing.Size(140, 30)
-$btnOpenHosts.Location = New-Object System.Drawing.Point(665, ($y + 10))
-$btnOpenHosts.Add_Click({ Start-Process notepad.exe $script:HostsFile })
-$hostsTab.Controls.Add($btnOpenHosts)
-
-# The button strip flows after the group rows so filtering does not leave a
-# hole between the last visible group and the actions.
-Register-FlowEntry -TabPage $hostsTab -Kind 'Trailer' `
-    -Controls @($btnApplyHosts, $btnClearHosts, $btnLoadHosts, $btnPreviewHosts, $btnOpenHosts) `
-    -BaseTop $y -Height 50 -Group 'hosts'
-
-$tabs.TabPages.Add($hostsTab)
-
-# ---- Default scriptlets tab (v1.11) ----------------------------------------
-# Advanced, optional, and deliberately separate from presets/main Apply.
-# Scans Brave component filter lists, displays ##+js(...) rules, and can
-# comment/uncomment rules with a BFO marker after explicit user opt-in.
-$scriptletsTab = New-Object System.Windows.Forms.TabPage
-$scriptletsTab.Name = 'scriptletsTab'
-[void](Set-Loc $scriptletsTab 'tab.scriptlets')
-$scriptletsTab.AutoScroll = $true
-$scriptletsTab.BackColor = [System.Drawing.Color]::White
-
-$scriptletIntro = New-Object System.Windows.Forms.Label
-[void](Set-Loc $scriptletIntro 'scriptlet.intro')
-[void](Set-LocFont $scriptletIntro -Size 9)
-$scriptletIntro.Location = New-Object System.Drawing.Point(10, 8)
-$scriptletIntro.Size = New-Object System.Drawing.Size(1100, 34)
-$scriptletIntro.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 90)
-$scriptletsTab.Controls.Add($scriptletIntro)
-
-$scriptletRisk = New-Object System.Windows.Forms.Label
-[void](Set-Loc $scriptletRisk 'scriptlet.risk')
-$scriptletRisk.Location = New-Object System.Drawing.Point(10, 38)
-$scriptletRisk.Size = New-Object System.Drawing.Size(1100, 34)
-$scriptletRisk.ForeColor = [System.Drawing.Color]::FromArgb(160, 70, 30)
-[void](Set-LocFont $scriptletRisk -Size 8.5 -Semibold)
-$scriptletsTab.Controls.Add($scriptletRisk)
-
-$lblScriptletRoot = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblScriptletRoot 'scriptlet.rootLabel')
-[void](Set-LocFont $lblScriptletRoot -Size 9)
-$lblScriptletRoot.Location = New-Object System.Drawing.Point(10, 80)
-$lblScriptletRoot.Size = New-Object System.Drawing.Size(145, 18)
-$scriptletsTab.Controls.Add($lblScriptletRoot)
-
-$script:TxtScriptletRoot = New-Object System.Windows.Forms.TextBox
-$script:TxtScriptletRoot.Location = New-Object System.Drawing.Point(155, 76)
-$script:TxtScriptletRoot.Size = New-Object System.Drawing.Size(560, 22)
-$script:TxtScriptletRoot.Font = New-Object System.Drawing.Font('Consolas', 8.5)
-$script:TxtScriptletRoot.Text = Get-ScriptletDefaultRoot
-$scriptletsTab.Controls.Add($script:TxtScriptletRoot)
-
-$btnScriptletAutoRoot = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletAutoRoot 'scriptlet.autoPath')
-$btnScriptletAutoRoot.Size = New-Object System.Drawing.Size(85, 26)
-$btnScriptletAutoRoot.Location = New-Object System.Drawing.Point(725, 74)
-$btnScriptletAutoRoot.Add_Click({
-    $script:TxtScriptletRoot.Text = Get-ScriptletDefaultRoot
-    Write-Log "Scriptlet User Data path set to: $($script:TxtScriptletRoot.Text)"
-})
-$scriptletsTab.Controls.Add($btnScriptletAutoRoot)
-
-$btnScriptletBrowse = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletBrowse 'scriptlet.browse')
-$btnScriptletBrowse.Size = New-Object System.Drawing.Size(85, 26)
-$btnScriptletBrowse.Location = New-Object System.Drawing.Point(815, 74)
-$btnScriptletBrowse.Add_Click({
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = T 'dialog.browseUserData'
-    if (Test-Path $script:TxtScriptletRoot.Text) { $dlg.SelectedPath = $script:TxtScriptletRoot.Text }
-    if ($dlg.ShowDialog() -eq 'OK') {
-        $script:TxtScriptletRoot.Text = $dlg.SelectedPath
-        Write-Log "Scriptlet User Data path set manually: $($dlg.SelectedPath)"
-    }
-})
-$scriptletsTab.Controls.Add($btnScriptletBrowse)
-
-$script:BtnScriptletScan = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletScan 'scriptlet.scan')
-$script:BtnScriptletScan.Size = New-Object System.Drawing.Size(80, 26)
-$script:BtnScriptletScan.Location = New-Object System.Drawing.Point(905, 74)
-$script:BtnScriptletScan.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 63)
-$script:BtnScriptletScan.ForeColor = [System.Drawing.Color]::White
-$script:BtnScriptletScan.Add_Click({ Invoke-ScriptletScan })
-$scriptletsTab.Controls.Add($script:BtnScriptletScan)
-
-$btnScriptletOpenFolder = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletOpenFolder 'scriptlet.openFolder')
-$btnScriptletOpenFolder.Size = New-Object System.Drawing.Size(95, 26)
-$btnScriptletOpenFolder.Location = New-Object System.Drawing.Point(990, 74)
-$btnScriptletOpenFolder.Add_Click({
-    if (Test-Path $script:TxtScriptletRoot.Text) { Start-Process explorer.exe $script:TxtScriptletRoot.Text }
-    else { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.folderMissing'), (T 'msg.title.scriptlet'), 'OK', 'Warning') | Out-Null }
-})
-$scriptletsTab.Controls.Add($btnScriptletOpenFolder)
-
-$lblScriptletSearch = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblScriptletSearch 'scriptlet.searchLabel')
-[void](Set-LocFont $lblScriptletSearch -Size 9)
-$lblScriptletSearch.Location = New-Object System.Drawing.Point(10, 112)
-$lblScriptletSearch.Size = New-Object System.Drawing.Size(85, 18)
-$scriptletsTab.Controls.Add($lblScriptletSearch)
-
-$script:TxtScriptletSearch = New-Object System.Windows.Forms.TextBox
-$script:TxtScriptletSearch.Location = New-Object System.Drawing.Point(95, 108)
-$script:TxtScriptletSearch.Size = New-Object System.Drawing.Size(360, 22)
-$script:TxtScriptletSearch.Font = New-Object System.Drawing.Font('Consolas', 8.5)
-$script:TxtScriptletSearch.Add_TextChanged({ Start-ScriptletFilterDelay })
-$script:TxtScriptletSearch.Add_KeyDown({
-    if ($_.KeyCode -eq 'Enter') {
-        if ($script:ScriptletFilterTimer) { $script:ScriptletFilterTimer.Stop() }
-        Update-ScriptletListView
-        $_.SuppressKeyPress = $true
-    }
-})
-$scriptletsTab.Controls.Add($script:TxtScriptletSearch)
-
-$script:ScriptletFilterTimer = New-Object System.Windows.Forms.Timer
-$script:ScriptletFilterTimer.Interval = 250
-$script:ScriptletFilterTimer.Add_Tick({
-    $script:ScriptletFilterTimer.Stop()
-    Update-ScriptletListView
-})
-
-$script:BtnScriptletFilter = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletFilter 'scriptlet.filter')
-$script:BtnScriptletFilter.Size = New-Object System.Drawing.Size(75, 26)
-$script:BtnScriptletFilter.Location = New-Object System.Drawing.Point(465, 106)
-$script:BtnScriptletFilter.Add_Click({
-    if ($script:ScriptletFilterTimer) { $script:ScriptletFilterTimer.Stop() }
-    Update-ScriptletListView
-})
-$scriptletsTab.Controls.Add($script:BtnScriptletFilter)
-
-$script:ChkScriptletDisabledOnly = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $script:ChkScriptletDisabledOnly 'scriptlet.disabledOnly')
-$script:ChkScriptletDisabledOnly.Location = New-Object System.Drawing.Point(550, 110)
-$script:ChkScriptletDisabledOnly.Size = New-Object System.Drawing.Size(190, 20)
-$script:ChkScriptletDisabledOnly.Add_CheckedChanged({ Update-ScriptletListView })
-$scriptletsTab.Controls.Add($script:ChkScriptletDisabledOnly)
-
-$script:ChkScriptletAdvanced = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $script:ChkScriptletAdvanced 'scriptlet.advancedMode')
-$script:ChkScriptletAdvanced.Location = New-Object System.Drawing.Point(755, 110)
-$script:ChkScriptletAdvanced.Size = New-Object System.Drawing.Size(330, 20)
-$script:ChkScriptletAdvanced.ForeColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
-$scriptletsTab.Controls.Add($script:ChkScriptletAdvanced)
-
-$script:ScriptletList = New-Object System.Windows.Forms.ListView
-$script:ScriptletList.Location = New-Object System.Drawing.Point(10, 140)
-$script:ScriptletList.Size = New-Object System.Drawing.Size(1110, 190)
-$script:ScriptletList.View = 'Details'
-$script:ScriptletList.FullRowSelect = $true
-$script:ScriptletList.GridLines = $true
-$script:ScriptletList.MultiSelect = $true
-$script:ScriptletList.HideSelection = $false
-$script:ScriptletList.CheckBoxes = $true
-$script:ScriptletList.Anchor = 'Top, Left, Right'
-$script:ScriptletList.Add_SizeChanged({ Resize-ScriptletColumns })
-$script:ScriptletList.Add_ItemChecked({
-    param($sender, $eventArgs)
-
-    if (-not $script:SuppressScriptletStatusEvents) {
-        Set-ScriptletRecordChecked -Record $eventArgs.Item.Tag -Checked $eventArgs.Item.Checked
-        Update-ScriptletStatusText
-    }
-})
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.pick'), 96)
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.domain'), 190)
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.scriptlet'), 190)
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.arguments'), 260)
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.source'), 180)
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.line'), 55)
-[void]$script:ScriptletList.Columns.Add((T 'scriptlet.col.rawRule'), 520)
-$scriptletsTab.Controls.Add($script:ScriptletList)
-
-$script:LblScriptletStatus = New-Object System.Windows.Forms.Label
-[void](Set-Loc $script:LblScriptletStatus 'scriptlet.statusIdle')
-[void](Set-LocFont $script:LblScriptletStatus -Size 9)
-$script:LblScriptletStatus.Location = New-Object System.Drawing.Point(10, 336)
-$script:LblScriptletStatus.Size = New-Object System.Drawing.Size(520, 18)
-$script:LblScriptletStatus.ForeColor = [System.Drawing.Color]::DimGray
-$scriptletsTab.Controls.Add($script:LblScriptletStatus)
-
-$script:ScriptletProgress = New-Object System.Windows.Forms.ProgressBar
-$script:ScriptletProgress.Location = New-Object System.Drawing.Point(545, 336)
-$script:ScriptletProgress.Size = New-Object System.Drawing.Size(575, 16)
-$script:ScriptletProgress.Minimum = 0
-$script:ScriptletProgress.Maximum = 1000
-$script:ScriptletProgress.Value = 0
-$script:ScriptletProgress.Style = 'Continuous'
-$script:ScriptletProgress.Anchor = 'Top, Left, Right'
-$scriptletsTab.Controls.Add($script:ScriptletProgress)
-
-$script:ChkScriptletAffectDuplicates = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $script:ChkScriptletAffectDuplicates 'scriptlet.affectDupes')
-$script:ChkScriptletAffectDuplicates.Checked = $true
-$script:ChkScriptletAffectDuplicates.Location = New-Object System.Drawing.Point(10, 360)
-$script:ChkScriptletAffectDuplicates.Size = New-Object System.Drawing.Size(270, 20)
-[void](Set-LocTooltip $script:ChkScriptletAffectDuplicates 'scriptlet.tipAffectDupes')
-$scriptletsTab.Controls.Add($script:ChkScriptletAffectDuplicates)
-
-$script:BtnScriptletCheckVisible = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletCheckVisible 'scriptlet.checkFiltered')
-$script:BtnScriptletCheckVisible.Size = New-Object System.Drawing.Size(125, 26)
-$script:BtnScriptletCheckVisible.Location = New-Object System.Drawing.Point(290, 356)
-$script:BtnScriptletCheckVisible.Add_Click({ Set-ScriptletVisibleChecks $true })
-[void](Set-LocTooltip $script:BtnScriptletCheckVisible 'scriptlet.tipCheckFiltered')
-$scriptletsTab.Controls.Add($script:BtnScriptletCheckVisible)
-
-$script:BtnScriptletClearChecks = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletClearChecks 'scriptlet.clearChecks')
-$script:BtnScriptletClearChecks.Size = New-Object System.Drawing.Size(105, 26)
-$script:BtnScriptletClearChecks.Location = New-Object System.Drawing.Point(425, 356)
-$script:BtnScriptletClearChecks.Add_Click({ Set-ScriptletVisibleChecks $false })
-$scriptletsTab.Controls.Add($script:BtnScriptletClearChecks)
-
-$script:BtnScriptletDisable = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletDisable 'scriptlet.disableChecked')
-$script:BtnScriptletDisable.Size = New-Object System.Drawing.Size(125, 28)
-$script:BtnScriptletDisable.Location = New-Object System.Drawing.Point(10, 388)
-$script:BtnScriptletDisable.BackColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
-$script:BtnScriptletDisable.ForeColor = [System.Drawing.Color]::White
-$script:BtnScriptletDisable.Add_Click({
+# ---- Button actions (same behaviour as before, now testable functions) ---------------
+function Invoke-ScriptletDisable {
     $records = @(Get-SelectedScriptletRecords)
-    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.selectFirst'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+    if ($records.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.selectFirst') -Title (T 'msg.title.scriptlet')); return }
     if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
-    $ans = [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.scriptlet.confirmDisable' @($records.Count, $script:ScriptletDisablePrefix)),
-        (T 'msg.title.scriptlet'),
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    $ans = Show-Message -Text (T 'msg.scriptlet.confirmDisable' @($records.Count, $script:ScriptletDisablePrefix)) -Title (T 'msg.title.scriptlet') -Buttons 'YesNo' -Icon 'Warning'
     if ($ans -ne 'Yes') { return }
     try {
         $changed = Set-ScriptletRuleState -Records $records -Enable:$false -AffectDuplicates:$script:ChkScriptletAffectDuplicates.Checked
@@ -4105,18 +5042,13 @@ $script:BtnScriptletDisable.Add_Click({
         Invoke-ScriptletScan
     } catch {
         Write-Log "Scriptlet disable failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.disableFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.disableFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
-})
-$scriptletsTab.Controls.Add($script:BtnScriptletDisable)
+}
 
-$script:BtnScriptletEnable = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletEnable 'scriptlet.enableChecked')
-$script:BtnScriptletEnable.Size = New-Object System.Drawing.Size(120, 28)
-$script:BtnScriptletEnable.Location = New-Object System.Drawing.Point(145, 388)
-$script:BtnScriptletEnable.Add_Click({
+function Invoke-ScriptletEnable {
     $records = @(Get-SelectedScriptletRecords)
-    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.selectFirst'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+    if ($records.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.selectFirst') -Title (T 'msg.title.scriptlet')); return }
     if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
     try {
         $changed = Set-ScriptletRuleState -Records $records -Enable:$true -AffectDuplicates:$script:ChkScriptletAffectDuplicates.Checked
@@ -4124,18 +5056,13 @@ $script:BtnScriptletEnable.Add_Click({
         Invoke-ScriptletScan
     } catch {
         Write-Log "Scriptlet enable failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.enableFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.enableFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
-})
-$scriptletsTab.Controls.Add($script:BtnScriptletEnable)
+}
 
-$btnScriptletDetails = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletDetails 'scriptlet.viewSelected')
-$btnScriptletDetails.Size = New-Object System.Drawing.Size(115, 28)
-$btnScriptletDetails.Location = New-Object System.Drawing.Point(275, 388)
-$btnScriptletDetails.Add_Click({
+function Show-ScriptletDetails {
     $records = @(Get-SelectedScriptletRecords)
-    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.selectOne'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+    if ($records.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.selectOne') -Title (T 'msg.title.scriptlet')); return }
     $report = New-Object System.Text.StringBuilder
     foreach ($r in $records) {
         [void]$report.AppendLine("Enabled: $($r.Enabled)")
@@ -4148,99 +5075,64 @@ $btnScriptletDetails.Add_Click({
         [void]$report.AppendLine("Rule: $($r.Rule)")
         [void]$report.AppendLine('')
     }
-    Show-TextReport -Title (T 'report.scriptletTitle') -Text ($report.ToString()) -DefaultFileName "brave-free-origin-scriptlet-details-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
-})
-$scriptletsTab.Controls.Add($btnScriptletDetails)
+    Show-TextReport -Title (T 'report.scriptletTitle') -Text ($report.ToString()) -DefaultFileName ("brave-free-origin-scriptlet-details-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+}
 
-$btnScriptletBackupAll = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletBackupAll 'scriptlet.backupAll')
-$btnScriptletBackupAll.Size = New-Object System.Drawing.Size(120, 28)
-$btnScriptletBackupAll.Location = New-Object System.Drawing.Point(400, 388)
-$btnScriptletBackupAll.Add_Click({
+function Invoke-ScriptletBackupAll {
     try {
         $files = @($script:ScriptletRules | Select-Object -ExpandProperty File -Unique)
-        if ($files.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.scanFirst'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+        if ($files.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.scanFirst') -Title (T 'msg.title.scriptlet')); return }
         foreach ($file in $files) { [void](Backup-ScriptletFile -File $file) }
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.backupDone' @($files.Count)), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.backupDone' @($files.Count)) -Title (T 'msg.title.scriptlet'))
     } catch {
         Write-Log "Scriptlet backup failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.backupFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.backupFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
-})
-$scriptletsTab.Controls.Add($btnScriptletBackupAll)
+}
 
-$btnScriptletRestoreSelected = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletRestoreSelected 'scriptlet.restoreSelected')
-$btnScriptletRestoreSelected.Size = New-Object System.Drawing.Size(145, 28)
-$btnScriptletRestoreSelected.Location = New-Object System.Drawing.Point(530, 388)
-$btnScriptletRestoreSelected.Add_Click({
+function Invoke-ScriptletRestoreSelected {
     $records = @(Get-SelectedScriptletRecords)
-    if ($records.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.restoreSelectFile'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+    if ($records.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.restoreSelectFile') -Title (T 'msg.title.scriptlet')); return }
     if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
     $files = @($records | Select-Object -ExpandProperty File -Unique)
-    $ans = [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.scriptlet.confirmRestoreSel' @($files.Count)),
-        (T 'msg.title.scriptlet'),
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning)
-    if ($ans -ne 'Yes') { return }
+    if ((Show-Message -Text (T 'msg.scriptlet.confirmRestoreSel' @($files.Count)) -Title (T 'msg.title.scriptlet') -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
     try {
         foreach ($file in $files) { Restore-ScriptletBackup -File $file }
         Write-Log "Restored $($files.Count) scriptlet list file(s) from backup." 'OK'
         Invoke-ScriptletScan
     } catch {
         Write-Log "Scriptlet restore selected failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.restoreFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.restoreFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
-})
-$scriptletsTab.Controls.Add($btnScriptletRestoreSelected)
+}
 
-$btnScriptletRestoreAll = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletRestoreAll 'scriptlet.restoreAll')
-$btnScriptletRestoreAll.Size = New-Object System.Drawing.Size(140, 28)
-$btnScriptletRestoreAll.Location = New-Object System.Drawing.Point(685, 388)
-$btnScriptletRestoreAll.Add_Click({
+function Invoke-ScriptletRestoreAll {
     if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
-    $ans = [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.scriptlet.confirmRestoreAll' @($script:TxtScriptletRoot.Text)),
-        (T 'msg.title.scriptlet'),
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning)
-    if ($ans -ne 'Yes') { return }
+    if ((Show-Message -Text (T 'msg.scriptlet.confirmRestoreAll' @($script:TxtScriptletRoot.Text)) -Title (T 'msg.title.scriptlet') -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
     try {
         $count = Restore-AllScriptletBackups -Root $script:TxtScriptletRoot.Text.Trim()
         Write-Log "Restored $count scriptlet backup file(s)." 'OK'
         Invoke-ScriptletScan
     } catch {
         Write-Log "Scriptlet restore all failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.restoreAllFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.restoreAllFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
-})
-$scriptletsTab.Controls.Add($btnScriptletRestoreAll)
+}
 
-$btnScriptletExportCsv = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletExportCsv 'scriptlet.exportCsv')
-$btnScriptletExportCsv.Size = New-Object System.Drawing.Size(130, 28)
-$btnScriptletExportCsv.Location = New-Object System.Drawing.Point(835, 388)
-$btnScriptletExportCsv.Add_Click({
-    if (-not $script:ScriptletVisibleRules -or $script:ScriptletVisibleRules.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.nothingVisible'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+function Invoke-ScriptletExportCsv {
+    if (-not $script:ScriptletVisibleRules -or $script:ScriptletVisibleRules.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.nothingVisible') -Title (T 'msg.title.scriptlet')); return }
     $sfd = New-Object System.Windows.Forms.SaveFileDialog
     $sfd.Filter = '{0} (*.csv)|*.csv' -f (T 'dialog.filter.csv')
     $sfd.FileName = "brave-free-origin-scriptlets-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
     if ($sfd.ShowDialog() -ne 'OK') { return }
     $script:ScriptletVisibleRules |
-        Select-Object Enabled,Domain,Scriptlet,Arguments,Source,Version,ComponentId,File,LineNumber,Rule |
-        Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8
+        Select-Object Enabled, Domain, Scriptlet, Arguments, Source, Version, ComponentId, File, LineNumber, Rule |
+        Export-Csv -LiteralPath $sfd.FileName -NoTypeInformation -Encoding UTF8
     Write-Log "Scriptlet CSV exported: $($sfd.FileName)" 'OK'
-})
-$scriptletsTab.Controls.Add($btnScriptletExportCsv)
+}
 
-$btnScriptletExportPrefs = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnScriptletExportPrefs 'scriptlet.exportPrefs')
-$btnScriptletExportPrefs.Size = New-Object System.Drawing.Size(150, 28)
-$btnScriptletExportPrefs.Location = New-Object System.Drawing.Point(10, 424)
-$btnScriptletExportPrefs.Add_Click({
-    if (-not $script:ScriptletRules -or $script:ScriptletRules.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.noRulesLoaded'), (T 'msg.title.scriptlet'), 'OK', 'Information') | Out-Null; return }
+function Invoke-ScriptletExportPrefs {
+    if (-not $script:ScriptletRules -or $script:ScriptletRules.Count -eq 0) { [void](Show-Message -Text (T 'msg.scriptlet.noRulesLoaded') -Title (T 'msg.title.scriptlet')); return }
     $sfd = New-Object System.Windows.Forms.SaveFileDialog
     $sfd.Filter = '{0} (*.json)|*.json' -f (T 'dialog.filter.scriptletPrefs')
     $sfd.FileName = "brave-free-origin-disabled-scriptlets-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
@@ -4249,987 +5141,588 @@ $btnScriptletExportPrefs.Add_Click({
         $count = Export-ScriptletDisabledPreferences -File $sfd.FileName
         Write-Log "Disabled scriptlet prefs exported: $count rule(s)." 'OK'
     } catch {
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.exportFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
+        [void](Show-Message -Text (T 'msg.scriptlet.exportFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
-})
-$scriptletsTab.Controls.Add($btnScriptletExportPrefs)
+}
 
-$script:BtnScriptletImportPrefs = New-Object System.Windows.Forms.Button
-[void](Set-Loc $script:BtnScriptletImportPrefs 'scriptlet.importPrefs')
-$script:BtnScriptletImportPrefs.Size = New-Object System.Drawing.Size(165, 28)
-$script:BtnScriptletImportPrefs.Location = New-Object System.Drawing.Point(170, 424)
-$script:BtnScriptletImportPrefs.Add_Click({
+function Invoke-ScriptletImportPrefs {
     if (-not (Test-ScriptletAdvancedWriteAllowed)) { return }
     $ofd = New-Object System.Windows.Forms.OpenFileDialog
     $ofd.Filter = '{0} (*.json)|*.json' -f (T 'dialog.filter.scriptletPrefs')
     if ($ofd.ShowDialog() -ne 'OK') { return }
-    $ans = [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.scriptlet.confirmReapply' @($script:TxtScriptletRoot.Text)),
-        (T 'msg.title.scriptlet'),
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning)
-    if ($ans -ne 'Yes') { return }
+    if ((Show-Message -Text (T 'msg.scriptlet.confirmReapply' @($script:TxtScriptletRoot.Text)) -Title (T 'msg.title.scriptlet') -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
     try {
         $changed = Import-ScriptletPreferencesAndReapply -PrefsFile $ofd.FileName -Root $script:TxtScriptletRoot.Text.Trim()
         Write-Log "Reapplied disabled scriptlet prefs: $changed line(s)." 'OK'
         Invoke-ScriptletScan
     } catch {
         Write-Log "Scriptlet preference reapply failed: $_" 'ERR'
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.scriptlet.reapplyFailed' @("$_")), (T 'msg.title.scriptlet'), 'OK', 'Error') | Out-Null
-    }
-})
-$scriptletsTab.Controls.Add($script:BtnScriptletImportPrefs)
-
-$scriptletFooter = New-Object System.Windows.Forms.Label
-[void](Set-Loc $scriptletFooter 'scriptlet.footer')
-$scriptletFooter.Location = New-Object System.Drawing.Point(350, 429)
-$scriptletFooter.Size = New-Object System.Drawing.Size(760, 32)
-$scriptletFooter.ForeColor = [System.Drawing.Color]::DimGray
-[void](Set-LocFont $scriptletFooter -Size 8)
-$scriptletsTab.Controls.Add($scriptletFooter)
-
-$tabs.TabPages.Add($scriptletsTab)
-
-# ---- Search & Startup tab (v1.6) -------------------------------------------
-# Three independent, opt-in sections. Each has its own "Override" checkbox.
-# Off by default: Brave's user-chosen search engine and startup behavior stay
-# untouched unless the user actively ticks an override.
-$searchTab = New-Object System.Windows.Forms.TabPage
-$searchTab.Name = 'searchTab'
-[void](Set-Loc $searchTab 'tab.searchStartup')
-$searchTab.AutoScroll = $true
-$searchTab.BackColor = [System.Drawing.Color]::White
-
-$searchIntro = New-Object System.Windows.Forms.Label
-[void](Set-Loc $searchIntro 'searchTab.intro')
-[void](Set-LocFont $searchIntro -Size 9)
-$searchIntro.Location = New-Object System.Drawing.Point(10, 8)
-$searchIntro.Size = New-Object System.Drawing.Size(1100, 36)
-$searchIntro.ForeColor = [System.Drawing.Color]::FromArgb(70, 70, 90)
-$searchTab.Controls.Add($searchIntro)
-
-# --- Section 1: Default search engine ---
-$secSearch = New-Object System.Windows.Forms.GroupBox
-[void](Set-Loc $secSearch 'searchTab.secSearch')
-$secSearch.Location = New-Object System.Drawing.Point(10, 50)
-$secSearch.Size = New-Object System.Drawing.Size(1110, 110)
-[void](Set-LocFont $secSearch -Size 9 -Semibold)
-$searchTab.Controls.Add($secSearch)
-
-$script:ChkSearchOverride = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $script:ChkSearchOverride 'searchTab.chkSearch')
-$script:ChkSearchOverride.Location = New-Object System.Drawing.Point(15, 22)
-$script:ChkSearchOverride.Size = New-Object System.Drawing.Size(530, 20)
-[void](Set-LocFont $script:ChkSearchOverride -Size 9)
-$secSearch.Controls.Add($script:ChkSearchOverride)
-
-$lblEngine = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblEngine 'searchTab.engineLabel')
-$lblEngine.Location = New-Object System.Drawing.Point(35, 50)
-$lblEngine.Size = New-Object System.Drawing.Size(60, 18)
-[void](Set-LocFont $lblEngine -Size 9)
-$secSearch.Controls.Add($lblEngine)
-
-$script:CmbSearchEngine = New-Object System.Windows.Forms.ComboBox
-$script:CmbSearchEngine.Location = New-Object System.Drawing.Point(95, 47)
-$script:CmbSearchEngine.Size = New-Object System.Drawing.Size(200, 22)
-$script:CmbSearchEngine.DropDownStyle = 'DropDownList'
-Set-ComboLabels -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds -LabelKeys $script:SearchEngineLabelKeys
-$script:CmbSearchEngine.SelectedIndex = 0
-$secSearch.Controls.Add($script:CmbSearchEngine)
-
-$lblCustomSearch = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblCustomSearch 'searchTab.customLabel')
-$lblCustomSearch.Location = New-Object System.Drawing.Point(310, 50)
-$lblCustomSearch.Size = New-Object System.Drawing.Size(115, 18)
-[void](Set-LocFont $lblCustomSearch -Size 9)
-$secSearch.Controls.Add($lblCustomSearch)
-
-$script:TxtCustomSearchUrl = New-Object System.Windows.Forms.TextBox
-$script:TxtCustomSearchUrl.Location = New-Object System.Drawing.Point(425, 47)
-$script:TxtCustomSearchUrl.Size = New-Object System.Drawing.Size(370, 22)
-$script:TxtCustomSearchUrl.Font = New-Object System.Drawing.Font('Consolas', 8.5)
-$script:TxtCustomSearchUrl.Enabled = $false
-$secSearch.Controls.Add($script:TxtCustomSearchUrl)
-
-$searchHelp = New-Object System.Windows.Forms.Label
-[void](Set-Loc $searchHelp 'searchTab.searchHelp')
-$searchHelp.Location = New-Object System.Drawing.Point(35, 78)
-$searchHelp.Size = New-Object System.Drawing.Size(900, 18)
-$searchHelp.ForeColor = [System.Drawing.Color]::DimGray
-[void](Set-LocFont $searchHelp -Size 8)
-$secSearch.Controls.Add($searchHelp)
-
-$script:CmbSearchEngine.Add_SelectedIndexChanged({
-    $isCustom = ((Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds) -eq 'custom')
-    $script:TxtCustomSearchUrl.Enabled = $isCustom
-})
-
-# --- Section 2: New tab page ---
-$secNtp = New-Object System.Windows.Forms.GroupBox
-[void](Set-Loc $secNtp 'searchTab.secNtp')
-$secNtp.Location = New-Object System.Drawing.Point(10, 168)
-$secNtp.Size = New-Object System.Drawing.Size(1110, 90)
-[void](Set-LocFont $secNtp -Size 9 -Semibold)
-$searchTab.Controls.Add($secNtp)
-
-$script:ChkNtpOverride = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $script:ChkNtpOverride 'searchTab.chkNtp')
-$script:ChkNtpOverride.Location = New-Object System.Drawing.Point(15, 22)
-$script:ChkNtpOverride.Size = New-Object System.Drawing.Size(450, 20)
-[void](Set-LocFont $script:ChkNtpOverride -Size 9)
-$secNtp.Controls.Add($script:ChkNtpOverride)
-
-$lblNtpDest = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblNtpDest 'searchTab.ntpOpenLabel')
-[void](Set-LocFont $lblNtpDest -Size 9)
-$lblNtpDest.Location = New-Object System.Drawing.Point(35, 50)
-$lblNtpDest.Size = New-Object System.Drawing.Size(50, 18)
-$secNtp.Controls.Add($lblNtpDest)
-
-$script:CmbNtpDest = New-Object System.Windows.Forms.ComboBox
-$script:CmbNtpDest.Location = New-Object System.Drawing.Point(85, 47)
-$script:CmbNtpDest.Size = New-Object System.Drawing.Size(310, 22)
-$script:CmbNtpDest.DropDownStyle = 'DropDownList'
-Set-ComboLabels -Combo $script:CmbNtpDest -Ids $script:DestinationIds -LabelKeys $script:DestinationLabelKeys
-$script:CmbNtpDest.SelectedIndex = 0
-$secNtp.Controls.Add($script:CmbNtpDest)
-
-$lblNtpCustom = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblNtpCustom 'searchTab.ntpCustomLabel')
-[void](Set-LocFont $lblNtpCustom -Size 9)
-$lblNtpCustom.Location = New-Object System.Drawing.Point(410, 50)
-$lblNtpCustom.Size = New-Object System.Drawing.Size(80, 18)
-$secNtp.Controls.Add($lblNtpCustom)
-
-$script:TxtNtpCustomUrl = New-Object System.Windows.Forms.TextBox
-$script:TxtNtpCustomUrl.Location = New-Object System.Drawing.Point(490, 47)
-$script:TxtNtpCustomUrl.Size = New-Object System.Drawing.Size(305, 22)
-$script:TxtNtpCustomUrl.Font = New-Object System.Drawing.Font('Consolas', 8.5)
-$script:TxtNtpCustomUrl.Enabled = $false
-$secNtp.Controls.Add($script:TxtNtpCustomUrl)
-
-$script:CmbNtpDest.Add_SelectedIndexChanged({
-    $isCustom = ((Get-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds) -eq 'custom')
-    $script:TxtNtpCustomUrl.Enabled = $isCustom
-})
-
-# --- Section 3: Startup behavior ---
-$secStartup = New-Object System.Windows.Forms.GroupBox
-[void](Set-Loc $secStartup 'searchTab.secStartup')
-$secStartup.Location = New-Object System.Drawing.Point(10, 266)
-$secStartup.Size = New-Object System.Drawing.Size(1110, 110)
-[void](Set-LocFont $secStartup -Size 9 -Semibold)
-$searchTab.Controls.Add($secStartup)
-
-$script:ChkStartupOverride = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $script:ChkStartupOverride 'searchTab.chkStartup')
-$script:ChkStartupOverride.Location = New-Object System.Drawing.Point(15, 22)
-$script:ChkStartupOverride.Size = New-Object System.Drawing.Size(550, 20)
-[void](Set-LocFont $script:ChkStartupOverride -Size 9)
-$secStartup.Controls.Add($script:ChkStartupOverride)
-
-$lblStartMode = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblStartMode 'searchTab.modeLabel')
-[void](Set-LocFont $lblStartMode -Size 9)
-$lblStartMode.Location = New-Object System.Drawing.Point(35, 50)
-$lblStartMode.Size = New-Object System.Drawing.Size(50, 18)
-$secStartup.Controls.Add($lblStartMode)
-
-$script:CmbStartupMode = New-Object System.Windows.Forms.ComboBox
-$script:CmbStartupMode.Location = New-Object System.Drawing.Point(85, 47)
-$script:CmbStartupMode.Size = New-Object System.Drawing.Size(310, 22)
-$script:CmbStartupMode.DropDownStyle = 'DropDownList'
-Set-ComboLabels -Combo $script:CmbStartupMode -Ids $script:StartupModeIds -LabelKeys $script:StartupModeLabelKeys
-$script:CmbStartupMode.SelectedIndex = 0
-$secStartup.Controls.Add($script:CmbStartupMode)
-
-$lblStartUrl = New-Object System.Windows.Forms.Label
-[void](Set-Loc $lblStartUrl 'searchTab.urlLabel')
-[void](Set-LocFont $lblStartUrl -Size 9)
-$lblStartUrl.Location = New-Object System.Drawing.Point(410, 50)
-$lblStartUrl.Size = New-Object System.Drawing.Size(60, 18)
-$secStartup.Controls.Add($lblStartUrl)
-
-$script:TxtStartupUrl = New-Object System.Windows.Forms.TextBox
-$script:TxtStartupUrl.Location = New-Object System.Drawing.Point(470, 47)
-$script:TxtStartupUrl.Size = New-Object System.Drawing.Size(325, 22)
-$script:TxtStartupUrl.Font = New-Object System.Drawing.Font('Consolas', 8.5)
-$script:TxtStartupUrl.Enabled = $false
-$secStartup.Controls.Add($script:TxtStartupUrl)
-
-$startupHelp = New-Object System.Windows.Forms.Label
-[void](Set-Loc $startupHelp 'searchTab.startupHelp')
-$startupHelp.Location = New-Object System.Drawing.Point(35, 78)
-$startupHelp.Size = New-Object System.Drawing.Size(900, 18)
-$startupHelp.ForeColor = [System.Drawing.Color]::DimGray
-[void](Set-LocFont $startupHelp -Size 8)
-$secStartup.Controls.Add($startupHelp)
-
-$script:CmbStartupMode.Add_SelectedIndexChanged({
-    $mode = $script:StartupModes[(Get-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds)]
-    $script:TxtStartupUrl.Enabled = ($mode -and $mode.UsesURL -and -not $mode.FixedURL)
-})
-
-# Conflict note
-$conflictNote = New-Object System.Windows.Forms.Label
-[void](Set-Loc $conflictNote 'searchTab.conflictNote')
-$conflictNote.Location = New-Object System.Drawing.Point(10, 384)
-$conflictNote.Size = New-Object System.Drawing.Size(1100, 36)
-$conflictNote.ForeColor = [System.Drawing.Color]::FromArgb(120, 60, 30)
-[void](Set-LocFont $conflictNote -Size 8)
-$searchTab.Controls.Add($conflictNote)
-
-# --- Section 4: Extensions (manual installs, no force-push) -----------------
-$secExt = New-Object System.Windows.Forms.GroupBox
-[void](Set-Loc $secExt 'ext.section')
-$secExt.Location = New-Object System.Drawing.Point(10, 426)
-$secExt.Size = New-Object System.Drawing.Size(1110, 130)
-[void](Set-LocFont $secExt -Size 9 -Semibold)
-$searchTab.Controls.Add($secExt)
-
-$extIntro = New-Object System.Windows.Forms.Label
-[void](Set-Loc $extIntro 'ext.intro')
-$extIntro.Location = New-Object System.Drawing.Point(15, 22)
-$extIntro.Size = New-Object System.Drawing.Size(1080, 36)
-[void](Set-LocFont $extIntro -Size 8.5)
-$extIntro.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
-$secExt.Controls.Add($extIntro)
-
-$extWarn = New-Object System.Windows.Forms.Label
-[void](Set-Loc $extWarn 'ext.warn')
-$extWarn.Location = New-Object System.Drawing.Point(15, 60)
-$extWarn.Size = New-Object System.Drawing.Size(1080, 32)
-[void](Set-LocFont $extWarn -Size 8)
-$extWarn.ForeColor = [System.Drawing.Color]::FromArgb(160, 70, 30)
-$secExt.Controls.Add($extWarn)
-
-$btnUboLite = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnUboLite 'ext.uboLite')
-$btnUboLite.Size = New-Object System.Drawing.Size(220, 28)
-$btnUboLite.Location = New-Object System.Drawing.Point(15, 95)
-$btnUboLite.Add_Click({
-    $exe = Test-BraveInstalled
-    $url = 'https://chromewebstore.google.com/detail/ublock-origin-lite/ddkjiahejlhfcafbddmgiahcphecmpfh'
-    if ($exe) { Start-Process $exe $url } else { Start-Process $url }
-    Write-Log 'Opened uBlock Origin Lite install page.'
-})
-$secExt.Controls.Add($btnUboLite)
-
-$btnShieldsSettings = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnShieldsSettings 'ext.shields')
-$btnShieldsSettings.Size = New-Object System.Drawing.Size(200, 28)
-$btnShieldsSettings.Location = New-Object System.Drawing.Point(245, 95)
-$btnShieldsSettings.Add_Click({
-    $exe = Test-BraveInstalled
-    if ($exe) { Start-Process $exe 'brave://settings/shields' } else { Write-Log 'Brave not found.' 'WARN' }
-})
-$secExt.Controls.Add($btnShieldsSettings)
-
-$btnBitwarden = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnBitwarden 'ext.bitwarden')
-$btnBitwarden.Size = New-Object System.Drawing.Size(240, 28)
-$btnBitwarden.Location = New-Object System.Drawing.Point(455, 95)
-$btnBitwarden.Add_Click({
-    $exe = Test-BraveInstalled
-    $url = 'https://chromewebstore.google.com/detail/bitwarden-password-manage/nngceckbapebfimnlniiiahkandclblb'
-    if ($exe) { Start-Process $exe $url } else { Start-Process $url }
-    Write-Log 'Opened Bitwarden install page.'
-})
-$secExt.Controls.Add($btnBitwarden)
-
-$tabs.TabPages.Add($searchTab)
-
-# ---- Helpers: write search-engine + startup overrides into one channel ------
-function Resolve-Destination {
-    param([string]$DestinationId, [string]$CustomUrl, [string]$SearchEngineHome)
-    $entry = $script:DestinationOptions[$DestinationId]
-    if (-not $entry) { return $null }
-    $code = $entry.Value
-    switch ($code) {
-        '__SKIP__'   { return $null }
-        '__SEARCH__' { return $SearchEngineHome }
-        '__CUSTOM__' { return $CustomUrl.Trim() }
-        default      { return $code }
+        [void](Show-Message -Text (T 'msg.scriptlet.reapplyFailed' @("$_")) -Title (T 'msg.title.scriptlet') -Icon 'Error')
     }
 }
+#endregion
 
-function Apply-SearchEngineOverride {
-    param([string]$Path)
-    # Always clear first so toggling off truly removes them
-    foreach ($n in @('DefaultSearchProviderEnabled','DefaultSearchProviderName','DefaultSearchProviderKeyword','DefaultSearchProviderSearchURL','DefaultSearchProviderSuggestURL')) {
-        try { Remove-ItemProperty -Path $Path -Name $n -ErrorAction Stop } catch {}
-    }
-    if (-not $script:ChkSearchOverride.Checked) { return $false }
 
-    $engineId = Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds
-    $eng = $script:SearchEngines[$engineId]
-    $url = $eng.URL
-    $sug = $eng.Suggest
-    $name = $eng.ProviderName
-    $keyword = $eng.Keyword
-    if ($eng.IsCustom) {
-        $url = $script:TxtCustomSearchUrl.Text.Trim()
-        if ([string]::IsNullOrWhiteSpace($url)) { Write-Log 'Search override skipped: custom URL is empty.' 'WARN'; return $false }
-        if ($url -notmatch '\{searchTerms\}') { Write-Log 'Search override skipped: custom URL must contain {searchTerms}.' 'WARN'; return $false }
-        $name = 'Custom Search'
-    }
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderEnabled'   -Value 1     -PropertyType DWord  -Force | Out-Null
-    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderName'      -Value $name -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderKeyword'   -Value $keyword -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $Path -Name 'DefaultSearchProviderSearchURL' -Value $url  -PropertyType String -Force | Out-Null
-    if ($sug) {
-        New-ItemProperty -Path $Path -Name 'DefaultSearchProviderSuggestURL' -Value $sug -PropertyType String -Force | Out-Null
-    }
-    Write-Log "Search engine override -> $name" 'OK'
-    return $true
+#region UI: dialogs ----------------------------------------------------------------------
+function New-BfoDialog {
+    param([string]$Title, [int]$Width = 720, [int]$Height = 520, [int]$MinWidth = 520, [int]$MinHeight = 360)
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = $Title
+    $f.StartPosition = 'CenterParent'
+    $f.Size = New-Object System.Drawing.Size($Width, $Height)
+    $f.MinimumSize = New-Object System.Drawing.Size($MinWidth, $MinHeight)
+    $f.Font = Get-BfoUiFont -Size 9
+    $f.BackColor = $script:Clr.White
+    $f.ShowInTaskbar = $false
+    $f.KeyPreview = $true
+    $f.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $this.Close() } })
+    if ($script:IsRtl) { $f.RightToLeft = 'Yes'; $f.RightToLeftLayout = $true }
+    return $f
 }
 
-function Apply-NtpOverride {
-    param([string]$Path)
-    # Clear first
-    try { Remove-ItemProperty -Path $Path -Name 'NewTabPageLocation' -ErrorAction Stop } catch {}
-    if (-not $script:ChkNtpOverride.Checked) { return $false }
-
-    # Resolve destination
-    $engineId = Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds
-    $engineHome = if ($script:SearchEngines[$engineId].IsCustom) { '' } else { $script:SearchEngines[$engineId].Home }
-    $url = Resolve-Destination -DestinationId (Get-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds) -CustomUrl $script:TxtNtpCustomUrl.Text -SearchEngineHome $engineHome
-    if (-not $url) { Write-Log 'NTP override skipped: no resolvable URL.' 'WARN'; return $false }
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    New-ItemProperty -Path $Path -Name 'NewTabPageLocation' -Value $url -PropertyType String -Force | Out-Null
-    Write-Log "New tab page override -> $url" 'OK'
-    return $true
-}
-
-function Apply-StartupOverride {
-    param([string]$Path)
-    # Clear first
-    try { Remove-ItemProperty -Path $Path -Name 'RestoreOnStartup' -ErrorAction Stop } catch {}
-    try { Remove-Item -Path (Join-Path $Path 'RestoreOnStartupURLs') -Recurse -Force -ErrorAction Stop } catch {}
-    if (-not $script:ChkStartupOverride.Checked) { return $false }
-
-    $modeId = Get-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds
-    $mode = $script:StartupModes[$modeId]
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    New-ItemProperty -Path $Path -Name 'RestoreOnStartup' -Value $mode.Code -PropertyType DWord -Force | Out-Null
-
-    if ($mode.UsesURL) {
-        $listPath = Join-Path $Path 'RestoreOnStartupURLs'
-        New-Item -Path $listPath -Force | Out-Null
-        $urls = if ($mode.FixedURL) { @($mode.FixedURL) }
-                else { ($script:TxtStartupUrl.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-        if ($urls.Count -eq 0) { Write-Log 'Startup override skipped: no URL provided.' 'WARN'; return $false }
-        $i = 1
-        foreach ($u in $urls) {
-            New-ItemProperty -Path $listPath -Name "$i" -Value $u -PropertyType String -Force | Out-Null
-            $i++
+# Preview / Verify / details: a scrollable read-only report with Copy and Save.
+function Show-TextReport {
+    param([string]$Title, [string]$Text, [string]$DefaultFileName = 'brave-free-origin-report.txt')
+    if ($script:SelfTestMode) { $script:SelfTestReports += , @($Title, $Text); return }
+    $rf = New-BfoDialog -Title $Title -Width 780 -Height 580
+    $bar = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Bottom'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $false; BackColor = $script:Clr.Fog; Padding = (New-Object System.Windows.Forms.Padding(10, 8, 10, 8)) } $rf
+    $tb = New-Ctl 'TextBox' @{ Multiline = $true; ReadOnly = $true; ScrollBars = 'Both'; WordWrap = $false; Dock = 'Fill'; Text = $Text; BorderStyle = 'None'; BackColor = $script:Clr.White } $rf
+    $tb.Font = Get-BfoUiFont -Size 9 -Mono
+    $tb.SelectionStart = 0; $tb.SelectionLength = 0
+    $copy = New-BfoButton 'report.copy' 'Default' 90
+    $copy.Add_Click({ if ($tb.Text) { [System.Windows.Forms.Clipboard]::SetText($tb.Text) } })
+    $save = New-BfoButton 'report.save' 'Default' 110
+    $save.Add_Click({
+        Invoke-Guarded 'Save report' {
+            $sfd = New-Object System.Windows.Forms.SaveFileDialog
+            $sfd.Filter = '{0} (*.txt)|*.txt' -f (T 'dialog.filter.textReport')
+            $sfd.FileName = $DefaultFileName
+            $sfd.InitialDirectory = Get-BackupDirectory
+            if ($sfd.ShowDialog() -eq 'OK') {
+                [System.IO.File]::WriteAllText($sfd.FileName, $tb.Text, (New-Object System.Text.UTF8Encoding($true)))
+                Write-Log "Report saved: $($sfd.FileName)" 'OK'
+            }
         }
-        Write-Log "Startup override -> code $($mode.Code), URLs: $($urls -join ', ')" 'OK'
-    } else {
-        Write-Log "Startup override -> $modeId (code $($mode.Code))" 'OK'
+    })
+    $close = New-BfoButton 'report.close' 'Default' 90
+    $close.Add_Click({ $rf.Close() })
+    $bar.Controls.AddRange([System.Windows.Forms.Control[]]@($copy, $save, $close))
+    $tb.BringToFront()
+    [void]$rf.ShowDialog($script:Form)
+    $rf.Dispose()
+}
+$script:SelfTestReports = @()
+
+function Show-HelpDialog {
+    if ($script:SelfTestMode) { return }
+    $d = New-BfoDialog -Title (T 'help.title') -Width 760 -Height 640 -MinWidth 560 -MinHeight 420
+    $close = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Bottom'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; BackColor = $script:Clr.Fog; Padding = (New-Object System.Windows.Forms.Padding(10, 8, 10, 8)) } $d
+    $bIssues = New-BfoButton 'help.reportIssue' 'Default' 150
+    $bIssues.Add_Click({ Invoke-Guarded 'Open issues' { Start-Process ($script:ProjectUrl + '/issues') } })
+    $bLog = New-BfoButton 'help.openLog' 'Default' 140
+    $bLog.Add_Click({ Invoke-Guarded 'Open log' { if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) } } })
+    $bClose = New-BfoButton 'report.close' 'Primary' 90
+    $bClose.Add_Click({ $d.Close() })
+    $close.Controls.AddRange([System.Windows.Forms.Control[]]@($bIssues, $bLog, $bClose))
+    $scroll = New-Ctl 'Panel' @{ Dock = 'Fill'; AutoScroll = $true; BackColor = $script:Clr.White; Padding = (New-Object System.Windows.Forms.Padding(20, 14, 20, 14)) } $d
+    $flow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; FlowDirection = 'TopDown'; WrapContents = $false; BackColor = $script:Clr.White } $scroll
+    $braveVersion = (Get-BraveInfo (Get-PrimaryChannel)).Version
+    $sections = @(
+        @('help.what.title',   'help.what.body',   @()),
+        @('help.tick.title',   'help.tick.body',   @()),
+        @('help.status.title', 'help.status.body', @()),
+        @('help.undo.title',   'help.undo.body',   @((Get-BackupDirectory))),
+        @('help.managed.title','help.managed.body',@()),
+        @('help.compat.title', 'help.compat.body', @($script:CatalogBrave, $script:CatalogBraveMajor, $script:CatalogDate, $(if ($braveVersion) { $braveVersion } else { '-' })))
+    )
+    foreach ($s in $sections) {
+        $h = New-Ctl 'Label' @{ AutoSize = $true; ForeColor = $script:Clr.Ink; Margin = (New-Object System.Windows.Forms.Padding(0, 10, 0, 2)); Text = (T $s[0]) } $flow
+        $h.Font = Get-BfoUiFont -Size 10.5 -Semibold
+        $b = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(660, 0)); ForeColor = $script:Clr.Slate; Margin = (New-Object System.Windows.Forms.Padding(0, 0, 0, 4)); Text = (T $s[1] $s[2]) } $flow
+        $b.Font = Get-BfoUiFont -Size 9
     }
-    return $true
+    $foot = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(660, 0)); ForeColor = $script:Clr.Mist; Margin = (New-Object System.Windows.Forms.Padding(0, 14, 0, 0)); Text = (T 'help.footer' @($script:AppVersion, $script:ProjectUrl, $script:LogFile)) } $flow
+    $foot.Font = Get-BfoUiFont -Size 8.5
+    [void]$d.ShowDialog($script:Form)
+    $d.Dispose()
 }
 
-# ---- Utility buttons --------------------------------------------------------
-$utilityPanel = New-Object System.Windows.Forms.Panel
-$utilityPanel.Location = New-Object System.Drawing.Point(10, 716)
-$utilityPanel.Size = New-Object System.Drawing.Size(1145, 40)
-$utilityPanel.Anchor = 'Left, Right, Bottom'
-$form.Controls.Add($utilityPanel)
+# Shown after Apply: what happened, and the obvious next steps.
+function Show-ApplyResult {
+    param($Result, [string]$BackupFile)
+    if ($script:SelfTestMode) { $script:SelfTestLastResult = $Result; return }
+    $failed = $Result.Failures.Count
+    $d = New-BfoDialog -Title (T 'msg.title.app') -Width 560 -Height $(if ($failed) { 470 } else { 330 }) -MinWidth 460 -MinHeight 280
+    $d.StartPosition = 'CenterParent'
+    $bar = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Bottom'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; WrapContents = $true; BackColor = $script:Clr.Fog; Padding = (New-Object System.Windows.Forms.Padding(10, 8, 10, 8)) } $d
+    $bVerify = New-BfoButton 'result.verify' 'Default' 100
+    $bVerify.Add_Click({ $d.Close(); Invoke-Guarded 'Verify' { Invoke-VerifyAction } })
+    $bPolicy = New-BfoButton 'util.openPolicy' 'Default' 150
+    $bPolicy.Add_Click({ Invoke-Guarded 'Open policy page' { [void](Open-InBrave 'brave://policy') } })
+    $bClose = New-BfoButton 'report.close' 'Primary' 90
+    $bClose.Add_Click({ $d.Close() })
+    $bar.Controls.AddRange([System.Windows.Forms.Control[]]@($bVerify, $bPolicy, $bClose))
+    $body = New-Ctl 'Panel' @{ Dock = 'Fill'; AutoScroll = $true; Padding = (New-Object System.Windows.Forms.Padding(20, 16, 20, 12)); BackColor = $script:Clr.White } $d
+    $flow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; FlowDirection = 'TopDown'; WrapContents = $false; BackColor = $script:Clr.White } $body
+    $head = New-Ctl 'Label' @{ AutoSize = $true; Text = $(if ($failed) { T 'result.partial' } else { T 'result.done' }); ForeColor = $(if ($failed) { $script:Clr.Red } else { $script:Clr.Green }) } $flow
+    $head.Font = Get-BfoUiFont -Size 12 -Semibold
+    $lines = @((T 'result.counts' @($Result.Added, $Result.Changed, $Result.Cleared, $Result.Kept)))
+    if ($Result.System -gt 0) { $lines += (T 'result.system' @($Result.System)) }
+    if ($BackupFile) { $lines += (T 'result.backup' @($BackupFile)) }
+    $lines += ''
+    $lines += (T 'result.restart')
+    $txt = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(490, 0)); ForeColor = $script:Clr.Ink; Text = ($lines -join "`r`n"); Margin = (New-Object System.Windows.Forms.Padding(0, 8, 0, 0)) } $flow
+    if ($failed) {
+        $fl = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(490, 0)); ForeColor = $script:Clr.Red; Margin = (New-Object System.Windows.Forms.Padding(0, 10, 0, 0))
+            Text = ((T 'result.failures' @($failed)) + "`r`n" + (($Result.Failures | Select-Object -First 8) -join "`r`n")) } $flow
+    }
+    [void]$d.ShowDialog($script:Form)
+    $d.Dispose()
+}
+$script:SelfTestLastResult = $null
+#endregion
 
-# Export config to JSON
-$btnExport = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnExport 'util.export')
-$btnExport.Size = New-Object System.Drawing.Size(110, 30)
-$btnExport.Location = New-Object System.Drawing.Point(420, 5)
-$btnExport.Add_Click({
+#region UI: actions --------------------------------------------------------------------------
+function Set-CustomMode {
+    if ($script:SuppressSelectionEvents) { return }
+    $script:ActiveProfile = 'Custom'
+}
+
+function Update-ModeInfo {
+    if (-not $script:LblModeInfo) { return }
+    $key = if ($script:ActiveProfile) { $script:ActiveProfile } else { 'Custom' }
+    $name = T "preset.$key.name"
+    $risk = T "preset.$key.risk"
+    $count = @($script:Items | Where-Object { $_.Kind -eq 'Policy' -and $_.Checked }).Count
+    $script:LblModeInfo.Text = T 'mode.info' @($name, $risk, $count, (T "preset.$key.description"))
+}
+
+function Update-PendingSummary {
+    if (-not $script:LblPending) { return }
+    $add = 0; $change = 0; $clear = 0; $problem = $false
+    try {
+        $desired = Get-DesiredPolicyMap
+        $snap = $script:Snapshot
+        if (-not $snap) { $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath; $script:Snapshot = $snap }
+        foreach ($op in (Get-RegistryOps -Desired $desired -Snapshot $snap)) {
+            switch ($op.Action) { 'Add' { $add++ } 'Change' { $change++ } 'Clear' { $clear++ } }
+        }
+        if (Get-StartupUrlOp -Desired $desired -Snapshot $snap) { $change++ }
+    } catch { $problem = $true }
+    $system = 0
+    foreach ($i in $script:Items) { if (($i.Kind -eq 'Task' -or $i.Kind -eq 'Service') -and $i.Loaded -and $i.Checked -ne $i.Baseline) { $system++ } }
+    $total = $add + $change + $clear + $system
+    if ($problem) { $script:LblPending.Text = T 'bar.problem'; $script:LblPending.ForeColor = $script:Clr.Red }
+    elseif ($total -eq 0) { $script:LblPending.Text = T 'bar.none'; $script:LblPending.ForeColor = $script:Clr.Slate }
+    else { $script:LblPending.Text = T 'bar.pending' @($total, ($add + $system), $change, $clear); $script:LblPending.ForeColor = $script:Clr.Ink }
+}
+
+# One call after any change of state refreshes everything derived from it.
+function Update-Chrome {
+    if (-not $script:FormReady) { return }
+    Update-PendingSummary
+    Update-NavCounts
+    Update-PresetStrip
+    Update-ModeInfo
+}
+
+function Update-BraveInfo {
+    $info = Get-BraveInfo (Get-PrimaryChannel)
+    if ($info.Installed) {
+        $scope = if ($info.Scope -eq 'user') { T 'header.scope.user' } else { T 'header.scope.machine' }
+        $script:LblBrave.Text = T 'header.braveDetected' @($info.Version, $scope)
+        $others = @(Get-DetectedChannels | Where-Object { $_ -ne $info.Channel } | ForEach-Object { '{0} {1}' -f $_, (Get-BraveInfo $_).Version })
+        $tip = T 'header.policiesShared'
+        if ($others.Count -gt 0) { $tip += "`r`n" + (T 'header.alsoInstalled' @(($others -join ', '))) }
+        $script:ToolTip.SetToolTip($script:LblBrave, $tip)
+    } else {
+        $script:LblBrave.Text = T 'header.braveNotFound'
+    }
+    if ($script:LblCompat) {
+        $note = ''
+        if ($info.Major -gt $script:CatalogBraveMajor) { $note = T 'header.compat.newer' @($info.Major, $script:CatalogBraveMajor) }
+        elseif ($info.Major -gt 0 -and $info.Major -lt ($script:CatalogBraveMajor - 12)) { $note = T 'header.compat.older' @($info.Major, $script:CatalogBraveMajor) }
+        $script:LblCompat.Text = $note
+        $script:LblCompat.Visible = [bool]$note
+        $script:HeaderTable.RowStyles[3] = $(if ($note) { New-Object System.Windows.Forms.RowStyle('AutoSize') } else { New-Object System.Windows.Forms.RowStyle('Absolute', 0) })
+    }
+}
+
+function Invoke-PresetClick {
+    param([string]$Key)
+    Push-SuppressSelectionEvents
+    try { Set-PresetChecks -Preset $Key } finally { Pop-SuppressSelectionEvents }
+    Update-AllItemViews
+    Update-Filter
+    Update-Chrome
+    Write-Log ("Loaded mode: {0}" -f (TEn "preset.$Key.name"))
+}
+
+function Invoke-LoadCurrentState {
+    Push-SuppressSelectionEvents
+    try {
+        Import-CurrentPolicyState
+        Update-HostsCache
+        Sync-OverrideControls
+    } finally { Pop-SuppressSelectionEvents }
+    Update-AllItemViews
+    Update-Filter
+    Update-Chrome
+    Write-Log 'Loaded current system state.'
+}
+
+function Invoke-PreviewAction {
+    try { $plan = New-ApplyPlan }
+    catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); Select-NavPage 'overrides'; return }
+    Show-TextReport -Title (T 'report.previewTitle') -Text (New-ApplyPlanReport $plan) -DefaultFileName ("brave-free-origin-apply-preview-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+}
+
+function Invoke-VerifyAction {
+    Show-TextReport -Title (T 'report.verifyTitle') -Text (New-VerifyReport) -DefaultFileName ("brave-free-origin-verify-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+}
+
+function Invoke-ApplyAction {
+    try { $plan = New-ApplyPlan }
+    catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); Select-NavPage 'overrides'; return }
+
+    if (-not (Test-PlanHasChanges $plan)) {
+        [void](Show-Message -Text (T 'msg.apply.nothing') -Title (T 'msg.title.app'))
+        return
+    }
+    if (@($plan.System | Where-Object { $_.Action -eq 'Disable' }).Count -gt 0) {
+        $ans = Show-Message -Text (T 'msg.updater.confirm') -Title (T 'msg.title.updater') -Buttons 'YesNo' -Icon 'Warning' -Default 'Button2'
+        if ($ans -ne 'Yes') { return }
+    }
+    $backupFile = $null
+    if ($script:ChkBackup.Checked) {
+        $b = Export-PolicyBackup
+        if (-not $b.Ok) {
+            Write-Log "Backup failed: $($b.Reason)" 'ERR'
+            $ans = Show-Message -Text (T 'msg.backup.failed' @($b.Reason)) -Title (T 'msg.title.app') -Buttons 'YesNo' -Icon 'Warning' -Default 'Button2'
+            if ($ans -ne 'Yes') { return }
+        } elseif ($b.File) { $backupFile = $b.File; Write-Log "Backup saved: $($b.File)" 'OK' }
+    }
+    $script:Form.UseWaitCursor = $true
+    try { $result = Invoke-ApplyPlan $plan } finally { $script:Form.UseWaitCursor = $false }
+    Write-Log ("Done. Added {0}, changed {1}, cleared {2}, {3} system change(s), {4} failure(s)." -f $result.Added, $result.Changed, $result.Cleared, $result.System, $result.Failures.Count) 'DONE'
+
+    # Re-read reality so every row shows its true state after the write.
+    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    if ($script:UpdaterLoaded -and $result.System -gt 0) { Import-CurrentSystemState -Refresh }
+    Update-AllItemViews
+    Update-Chrome
+    Show-ApplyResult -Result $result -BackupFile $backupFile
+}
+
+function Invoke-RestoreAction {
+    $f = Get-ForeignPolicyValues
+    $foreign = @($f.Values) + @($f.SubKeys | ForEach-Object { "($_)" })
+    $removeForeign = $false
+    if ($foreign.Count -gt 0) {
+        $sample = ($foreign | Select-Object -First 8) -join ', '
+        $ans = Show-Message -Text (T 'msg.restore.confirmForeign' @($foreign.Count, $sample)) -Title (T 'msg.title.fullRestore') -Buttons 'YesNoCancel' -Icon 'Warning' -Default 'Button1'
+        if ($ans -eq 'Cancel') { return }
+        $removeForeign = ($ans -eq 'No')
+    } else {
+        if ((Show-Message -Text (T 'msg.restore.confirm') -Title (T 'msg.title.fullRestore') -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
+    }
+    if ($script:ChkBackup.Checked) {
+        $b = Export-PolicyBackup
+        if (-not $b.Ok) {
+            Write-Log "Backup failed: $($b.Reason)" 'ERR'
+            if ((Show-Message -Text (T 'msg.backup.failed' @($b.Reason)) -Title (T 'msg.title.app') -Buttons 'YesNo' -Icon 'Warning' -Default 'Button2') -ne 'Yes') { return }
+        }
+    }
+    $failures = @(Invoke-FullRestore -RemoveForeign $removeForeign)
+    Push-SuppressSelectionEvents
+    try {
+        foreach ($item in $script:Items) { Set-ItemChecked $item $false }
+        $script:Overrides.Search.Enabled = $false; $script:Overrides.Ntp.Enabled = $false; $script:Overrides.Startup.Enabled = $false
+        Sync-OverrideControls
+    } finally { Pop-SuppressSelectionEvents }
+    $script:ActiveProfile = 'None'
+    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    if ($script:UpdaterLoaded) { Import-CurrentSystemState -Refresh }
+    Update-HostsCache
+    Update-AllItemViews
+    Update-Filter
+    Update-Chrome
+    if ($failures.Count -gt 0) {
+        [void](Show-Message -Text ((T 'msg.restore.partial' @($failures.Count)) + "`r`n`r`n" + (($failures | Select-Object -First 6) -join "`r`n")) -Title (T 'msg.title.fullRestore') -Icon 'Warning')
+    } else {
+        [void](Show-Message -Text (T 'msg.restore.done') -Title (T 'msg.title.app'))
+    }
+    Write-Log 'Full restore completed. Restart Brave to see stock behavior.' 'DONE'
+}
+
+function Invoke-ExportConfig {
     $sfd = New-Object System.Windows.Forms.SaveFileDialog
     $sfd.Filter = '{0} (*.json)|*.json' -f (T 'dialog.filter.config')
     $sfd.FileName = "brave-free-origin-config-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
-    $sfd.InitialDirectory = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
-    if (-not (Test-Path $sfd.InitialDirectory)) { New-Item -ItemType Directory -Path $sfd.InitialDirectory | Out-Null }
+    $sfd.InitialDirectory = Get-BackupDirectory
     if ($sfd.ShowDialog() -ne 'OK') { return }
-
-    # schemaVersion tracks the config format, appVersion tracks the app. They
-    # move independently: gaining a button must not force a config migration.
-    $cfg = [ordered]@{
-        schemaVersion = 2
-        appVersion    = $script:AppVersion
-        exported      = (Get-Date -Format 's')
-        channel       = $script:TargetChannels
-        profile       = $script:ActiveProfile
-        policies      = [ordered]@{}
-        policyValues  = [ordered]@{}
-        tasks         = [ordered]@{}
-        services      = [ordered]@{}
-        hosts         = [ordered]@{}
-        search   = [ordered]@{
-            enabled   = [bool]$script:ChkSearchOverride.Checked
-            engineId  = "$(Get-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds)"
-            customUrl = "$($script:TxtCustomSearchUrl.Text)"
-        }
-        ntp = [ordered]@{
-            enabled       = [bool]$script:ChkNtpOverride.Checked
-            destinationId = "$(Get-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds)"
-            customUrl     = "$($script:TxtNtpCustomUrl.Text)"
-        }
-        startup = [ordered]@{
-            enabled = [bool]$script:ChkStartupOverride.Checked
-            modeId  = "$(Get-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds)"
-            urls    = "$($script:TxtStartupUrl.Text)"
-        }
-    }
-    foreach ($cb in $script:CheckBoxes)        {
-        $cfg.policies[$cb.Tag.Policy.Name] = [bool]$cb.Checked
-        # Remember the picked value for choice policies (e.g. hardware accel).
-        if ($cb.Tag.Policy.Choices) { $cfg.policyValues[$cb.Tag.Policy.Name] = $cb.Tag.Policy.ApplyValue }
-    }
-    foreach ($cb in $script:TaskCheckBoxes)    { $cfg.tasks[$cb.Tag.Name]            = [bool]$cb.Checked }
-    foreach ($cb in $script:ServiceCheckBoxes) { $cfg.services[$cb.Tag.Name]         = [bool]$cb.Checked }
-    foreach ($cb in $script:HostsCheckBoxes)   { $cfg.hosts[$cb.Tag.Id]              = [bool]$cb.Checked }
-
-    $cfg | ConvertTo-Json -Depth 5 | Set-Content -Path $sfd.FileName -Encoding UTF8
+    $json = (New-ConfigObject) | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText($sfd.FileName, $json, (New-Object System.Text.UTF8Encoding($false)))
     Write-Log "Config exported: $($sfd.FileName)" 'OK'
-})
-$utilityPanel.Controls.Add($btnExport)
+}
 
-# Import config from JSON
-$btnImport = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnImport 'util.import')
-$btnImport.Size = New-Object System.Drawing.Size(110, 30)
-$btnImport.Location = New-Object System.Drawing.Point(535, 5)
-$btnImport.Add_Click({
+function Invoke-ImportConfig {
     $ofd = New-Object System.Windows.Forms.OpenFileDialog
     $ofd.Filter = '{0} (*.json)|*.json' -f (T 'dialog.filter.config')
-    $ofd.InitialDirectory = Join-Path $env:USERPROFILE 'Documents\Brave-Free-Origin-Backups'
+    $ofd.InitialDirectory = Get-BackupDirectory
     if ($ofd.ShowDialog() -ne 'OK') { return }
-    try {
-        $cfg = Get-Content $ofd.FileName -Raw | ConvertFrom-Json
-    } catch {
-        [System.Windows.Forms.MessageBox]::Show((T 'msg.config.badJson' @("$_")), (T 'msg.title.importError'), 'OK', 'Error') | Out-Null
-        return
-    }
+    try { $cfg = [System.IO.File]::ReadAllText($ofd.FileName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json }
+    catch { [void](Show-Message -Text (T 'msg.config.badJson' @("$_")) -Title (T 'msg.title.importError') -Icon 'Error'); return }
     Push-SuppressSelectionEvents
-    try {
-        if ($cfg.policies) {
-            foreach ($cb in $script:CheckBoxes) {
-                $name = $cb.Tag.Policy.Name
-                if ($cfg.policies.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.policies.$name }
-            }
-        }
-        if ($cfg.policyValues) {
-            # Restore the picked value for choice policies (e.g. hardware accel).
-            foreach ($cb in $script:CheckBoxes) {
-                $p = $cb.Tag.Policy
-                if (-not $p.Choices) { continue }
-                if ($cfg.policyValues.PSObject.Properties.Name -notcontains $p.Name) { continue }
-                $wanted = "$($cfg.policyValues.$($p.Name))"
-                foreach ($cid in $p.Choices.Keys) {
-                    if ("$($p.Choices[$cid])" -eq $wanted) {
-                        [void](Set-PolicyChoiceId -Policy $p -ChoiceId $cid)
-                        break
-                    }
-                }
-            }
-        }
-        if ($cfg.tasks) {
-            foreach ($cb in $script:TaskCheckBoxes) {
-                $name = $cb.Tag.Name
-                if ($cfg.tasks.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.tasks.$name }
-            }
-        }
-        if ($cfg.services) {
-            foreach ($cb in $script:ServiceCheckBoxes) {
-                $name = $cb.Tag.Name
-                if ($cfg.services.PSObject.Properties.Name -contains $name) { $cb.Checked = [bool]$cfg.services.$name }
-            }
-        }
-        if ($cfg.hosts) {
-            # Accept both schema 2 ids and the pre-1.12 English display names.
-            $hostsById = @{}
-            foreach ($p in $cfg.hosts.PSObject.Properties) {
-                $id = $p.Name
-                if ($script:LegacyHostsIds.ContainsKey($id)) { $id = $script:LegacyHostsIds[$id] }
-                $hostsById[$id] = [bool]$p.Value
-            }
-            foreach ($cb in $script:HostsCheckBoxes) {
-                if ($hostsById.ContainsKey($cb.Tag.Id)) { $cb.Checked = $hostsById[$cb.Tag.Id] }
-            }
-        }
-        if ($cfg.search) {
-            $script:ChkSearchOverride.Checked = [bool]$cfg.search.enabled
-            $engineId = if ($cfg.search.engineId) { "$($cfg.search.engineId)" }
-                        elseif ($cfg.search.engine -and $script:LegacySearchEngineIds.ContainsKey("$($cfg.search.engine)")) {
-                            $script:LegacySearchEngineIds["$($cfg.search.engine)"]
-                        } else { $null }
-            if ($engineId) { [void](Set-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds -Id $engineId) }
-            if ($cfg.search.customUrl) { $script:TxtCustomSearchUrl.Text = $cfg.search.customUrl }
-        }
-        if ($cfg.ntp) {
-            $script:ChkNtpOverride.Checked = [bool]$cfg.ntp.enabled
-            $destId = if ($cfg.ntp.destinationId) { "$($cfg.ntp.destinationId)" }
-                      elseif ($cfg.ntp.destination -and $script:LegacyDestinationIds.ContainsKey("$($cfg.ntp.destination)")) {
-                          $script:LegacyDestinationIds["$($cfg.ntp.destination)"]
-                      } else { $null }
-            if ($destId) { [void](Set-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds -Id $destId) }
-            if ($cfg.ntp.customUrl) { $script:TxtNtpCustomUrl.Text = $cfg.ntp.customUrl }
-        }
-        if ($cfg.startup) {
-            $script:ChkStartupOverride.Checked = [bool]$cfg.startup.enabled
-            $modeId = if ($cfg.startup.modeId) { "$($cfg.startup.modeId)" }
-                      elseif ($cfg.startup.mode -and $script:LegacyStartupModeIds.ContainsKey("$($cfg.startup.mode)")) {
-                          $script:LegacyStartupModeIds["$($cfg.startup.mode)"]
-                      } else { $null }
-            if ($modeId) { [void](Set-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds -Id $modeId) }
-            if ($cfg.startup.urls) { $script:TxtStartupUrl.Text = $cfg.startup.urls }
-        }
-    } finally {
-        Pop-SuppressSelectionEvents
-    }
-    $script:ActiveProfile = if ($cfg.profile) { "$($cfg.profile)" } else { 'Custom' }
-    Update-OverrideControlStates
-    Update-SelectionSummary
-    $schema = if ($cfg.schemaVersion) { $cfg.schemaVersion } else { 1 }
-    Write-Log "Config imported from $($ofd.FileName) (schema $schema, app $($cfg.appVersion)$(if (-not $cfg.appVersion) { $cfg.version }))" 'OK'
-    Update-ConfigurationFilter
-    [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.config.imported'),
-        (T 'msg.title.imported'), 'OK', 'Information') | Out-Null
-})
-$utilityPanel.Controls.Add($btnImport)
-
-# Verify - read registry, compare to UI selections
-$btnVerify = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnVerify 'util.verify')
-$btnVerify.Size = New-Object System.Drawing.Size(80, 30)
-$btnVerify.Location = New-Object System.Drawing.Point(650, 5)
-$btnVerify.Add_Click({
-    $report = New-Object System.Text.StringBuilder
-    foreach ($channel in $script:TargetChannels) {
-        $path = $script:Channels[$channel].Path
-        [void]$report.AppendLine("=== $channel  ($path) ===")
-        if (-not (Test-Path $path)) {
-            [void]$report.AppendLine('  (no policy key exists - nothing applied)')
-            [void]$report.AppendLine('')
-            continue
-        }
-        $matchCount = 0; $missingCount = 0; $mismatchCount = 0; $tickedCount = 0
-        $missingList = @(); $mismatchList = @()
-        foreach ($cb in $script:CheckBoxes) {
-            if (-not $cb.Checked) { continue }
-            $tickedCount++
-            $p = $cb.Tag.Policy
-            try {
-                $cur = (Get-ItemProperty -Path $path -Name $p.Name -ErrorAction Stop).$($p.Name)
-                if ("$cur" -eq "$($p.ApplyValue)") { $matchCount++ }
-                else { $mismatchCount++; $mismatchList += "$($p.Name): registry=$cur, expected=$($p.ApplyValue)" }
-            } catch {
-                $missingCount++; $missingList += $p.Name
-            }
-        }
-        [void]$report.AppendLine("  Ticked in UI: $tickedCount")
-        [void]$report.AppendLine("  Match in registry: $matchCount")
-        [void]$report.AppendLine("  Missing (not in registry): $missingCount")
-        [void]$report.AppendLine("  Mismatch (wrong value): $mismatchCount")
-        if ($missingList) {
-            [void]$report.AppendLine('  -- missing:')
-            foreach ($n in $missingList) { [void]$report.AppendLine("     - $n") }
-        }
-        if ($mismatchList) {
-            [void]$report.AppendLine('  -- mismatch:')
-            foreach ($n in $mismatchList) { [void]$report.AppendLine("     - $n") }
-        }
-        [void]$report.AppendLine('')
-    }
-
-    # Hosts state
-    $hostsCurrent = Get-HostsCurrentDomains
-    [void]$report.AppendLine("=== Hosts blocklist ===")
-    [void]$report.AppendLine("  Currently blocked domains: $($hostsCurrent.Count)")
-    if ($hostsCurrent.Count -gt 0) {
-        foreach ($d in $hostsCurrent) { [void]$report.AppendLine("     - $d") }
-    }
-    [void]$report.AppendLine('')
-
-    # Search / NTP / Startup overrides
-    [void]$report.AppendLine('=== Search & Startup overrides ===')
-    foreach ($channel in $script:TargetChannels) {
-        $path = $script:Channels[$channel].Path
-        [void]$report.AppendLine("  [$channel]")
-        if (-not (Test-Path $path)) { [void]$report.AppendLine('     (no policy key - nothing set)'); continue }
-        try {
-            $se = (Get-ItemProperty -Path $path -Name 'DefaultSearchProviderEnabled' -ErrorAction Stop).DefaultSearchProviderEnabled
-            $name = (Get-ItemProperty -Path $path -Name 'DefaultSearchProviderName' -ErrorAction SilentlyContinue).DefaultSearchProviderName
-            $url  = (Get-ItemProperty -Path $path -Name 'DefaultSearchProviderSearchURL' -ErrorAction SilentlyContinue).DefaultSearchProviderSearchURL
-            if ($se -eq 1) { [void]$report.AppendLine("     Search engine forced: $name ($url)") }
-            else           { [void]$report.AppendLine('     Search engine override: not set') }
-        } catch { [void]$report.AppendLine('     Search engine override: not set') }
-        try {
-            $ntp = (Get-ItemProperty -Path $path -Name 'NewTabPageLocation' -ErrorAction Stop).NewTabPageLocation
-            [void]$report.AppendLine("     New tab page forced: $ntp")
-        } catch { [void]$report.AppendLine('     New tab page override: not set') }
-        try {
-            $rc = (Get-ItemProperty -Path $path -Name 'RestoreOnStartup' -ErrorAction Stop).RestoreOnStartup
-            $listPath = Join-Path $path 'RestoreOnStartupURLs'
-            $urls = @()
-            if (Test-Path $listPath) {
-                $props = Get-ItemProperty -Path $listPath
-                foreach ($p in $props.PSObject.Properties) {
-                    if ($p.Name -match '^\d+$') { $urls += $p.Value }
-                }
-            }
-            $extra = if ($urls.Count -gt 0) { " URLs: $($urls -join ', ')" } else { '' }
-            [void]$report.AppendLine("     Startup forced: code $rc$extra")
-        } catch { [void]$report.AppendLine('     Startup override: not set') }
-    }
-
-    Show-TextReport -Title (T 'report.verifyTitle') -Text ($report.ToString()) -DefaultFileName "brave-free-origin-verify-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
-})
-$utilityPanel.Controls.Add($btnVerify)
-
-$btnLoad = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnLoad 'util.loadState')
-$btnLoad.Size = New-Object System.Drawing.Size(145, 30)
-$btnLoad.Location = New-Object System.Drawing.Point(0, 5)
-$btnLoad.Add_Click({
-    Push-SuppressSelectionEvents
-    try {
-        # Read from the FIRST target channel (loading is single-source by design)
-        $loadPath = $script:Channels[$script:TargetChannels[0]].Path
-        $originalPath = $script:BravePolicyPath
-        $script:BravePolicyPath = $loadPath
-        foreach ($cb in $script:CheckBoxes) {
-            $p = $cb.Tag.Policy
-            $cur = Get-ExistingPolicy $p.Name
-            if ($p.Choices) {
-                # A choice policy counts as "on" whenever a value is present; point
-                # the picker at whatever the registry actually holds.
-                if ($null -ne $cur) {
-                    foreach ($cid in $p.Choices.Keys) {
-                        if ("$($p.Choices[$cid])" -eq "$cur") {
-                            [void](Set-PolicyChoiceId -Policy $p -ChoiceId $cid)
-                            break
-                        }
-                    }
-                    $cb.Checked = $true
-                } else {
-                    $cb.Checked = $false
-                }
-            } else {
-                $cb.Checked = ($null -ne $cur -and "$cur" -eq "$($p.ApplyValue)")
-            }
-        }
-        $script:BravePolicyPath = $originalPath
-        foreach ($cb in $script:TaskCheckBoxes) {
-            $t = $cb.Tag
-            $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
-            $cb.Checked = ($task -and $task.State -eq 'Disabled')
-        }
-        foreach ($cb in $script:ServiceCheckBoxes) {
-            $s = $cb.Tag
-            $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
-            $cb.Checked = ($svc -and $svc.StartType -eq 'Disabled')
-        }
-        # Hosts state
-        if ($script:HostsCheckBoxes) {
-            $current = Get-HostsCurrentDomains
-            foreach ($cb in $script:HostsCheckBoxes) {
-                $blockDomains = $cb.Tag.Domains
-                $allPresent = $true
-                foreach ($d in $blockDomains) { if ($current -notcontains $d) { $allPresent = $false; break } }
-                $cb.Checked = $allPresent
-            }
-        }
-        # Search engine override state
-        if ($script:ChkSearchOverride) {
-            $sePath = $loadPath
-            $seEnabled = $false
-            try {
-                $val = (Get-ItemProperty -Path $sePath -Name 'DefaultSearchProviderEnabled' -ErrorAction Stop).DefaultSearchProviderEnabled
-                $seEnabled = ($val -eq 1)
-            } catch { $seEnabled = $false }
-            $script:ChkSearchOverride.Checked = $seEnabled
-            if ($seEnabled) {
-                try {
-                    $url = (Get-ItemProperty -Path $sePath -Name 'DefaultSearchProviderSearchURL' -ErrorAction Stop).DefaultSearchProviderSearchURL
-                    $matched = $false
-                    foreach ($key in $script:SearchEngines.Keys) {
-                        if (-not $script:SearchEngines[$key].IsCustom -and $script:SearchEngines[$key].URL -eq $url) {
-                            [void](Set-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds -Id $key)
-                            $matched = $true; break
-                        }
-                    }
-                    if (-not $matched) {
-                        [void](Set-ComboId -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds -Id 'custom')
-                        $script:TxtCustomSearchUrl.Text = $url
-                    }
-                } catch {}
-            }
-        }
-        # NTP override state
-        if ($script:ChkNtpOverride) {
-            try {
-                $ntpUrl = (Get-ItemProperty -Path $loadPath -Name 'NewTabPageLocation' -ErrorAction Stop).NewTabPageLocation
-                $script:ChkNtpOverride.Checked = $true
-                $matched = $false
-                foreach ($k in $script:DestinationOptions.Keys) {
-                    if ($script:DestinationOptions[$k].Value -eq $ntpUrl) {
-                        $matched = [bool](Set-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds -Id $k)
-                        if ($matched) { break }
-                    }
-                }
-                if (-not $matched) {
-                    [void](Set-ComboId -Combo $script:CmbNtpDest -Ids $script:DestinationIds -Id 'custom')
-                    $script:TxtNtpCustomUrl.Text = $ntpUrl
-                }
-            } catch { $script:ChkNtpOverride.Checked = $false }
-        }
-        # Startup override state
-        if ($script:ChkStartupOverride) {
-            try {
-                $code = (Get-ItemProperty -Path $loadPath -Name 'RestoreOnStartup' -ErrorAction Stop).RestoreOnStartup
-                $script:ChkStartupOverride.Checked = $true
-                foreach ($k in $script:StartupModes.Keys) {
-                    if ($script:StartupModes[$k].Code -eq $code) {
-                        [void](Set-ComboId -Combo $script:CmbStartupMode -Ids $script:StartupModeIds -Id $k); break
-                    }
-                }
-                $listPath = Join-Path $loadPath 'RestoreOnStartupURLs'
-                if (Test-Path $listPath) {
-                    $props = Get-ItemProperty -Path $listPath
-                    $urls = @()
-                    foreach ($p in $props.PSObject.Properties) {
-                        if ($p.Name -match '^\d+$') { $urls += $p.Value }
-                    }
-                    if ($urls.Count -gt 0) { $script:TxtStartupUrl.Text = ($urls -join ', ') }
-                }
-            } catch { $script:ChkStartupOverride.Checked = $false }
-        }
-    } finally {
-        Pop-SuppressSelectionEvents
-    }
-    $script:ActiveProfile = 'CurrentState'
-    Update-OverrideControlStates
-    Update-SelectionSummary
-    Update-ConfigurationFilter
-    Write-Log 'Loaded current system state.'
-})
-$utilityPanel.Controls.Add($btnLoad)
-
-$btnOpenBrave = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnOpenBrave 'util.openPolicy')
-$btnOpenBrave.Size = New-Object System.Drawing.Size(150, 30)
-$btnOpenBrave.Location = New-Object System.Drawing.Point(155, 5)
-$btnOpenBrave.Add_Click({
-    $exe = Test-BraveInstalled
-    if ($exe) { Start-Process $exe 'brave://policy' }
-    else { [System.Windows.Forms.MessageBox]::Show((T 'msg.braveMissing'), (T 'msg.title.info')) | Out-Null }
-})
-$utilityPanel.Controls.Add($btnOpenBrave)
-
-$btnClose = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnClose 'util.close')
-$btnClose.Size = New-Object System.Drawing.Size(95, 30)
-$btnClose.Location = New-Object System.Drawing.Point(315, 5)
-$btnClose.Add_Click({ $form.Close() })
-$utilityPanel.Controls.Add($btnClose)
-
-$flowLabel = New-Object System.Windows.Forms.Label
-[void](Set-Loc $flowLabel 'util.flow')
-[void](Set-LocFont $flowLabel -Size 9)
-$flowLabel.Location = New-Object System.Drawing.Point(740, 11)
-$flowLabel.Size = New-Object System.Drawing.Size(400, 18)
-$flowLabel.ForeColor = [System.Drawing.Color]::DimGray
-$utilityPanel.Controls.Add($flowLabel)
-
-# ---- Action buttons ---------------------------------------------------------
-$actionPanel = New-Object System.Windows.Forms.Panel
-$actionPanel.Location = New-Object System.Drawing.Point(10, 760)
-$actionPanel.Size = New-Object System.Drawing.Size(1145, 44)
-$actionPanel.Anchor = 'Left, Right, Bottom'
-$form.Controls.Add($actionPanel)
-
-$chkBackup = New-Object System.Windows.Forms.CheckBox
-[void](Set-Loc $chkBackup 'action.backup')
-$chkBackup.Checked = $true
-$chkBackup.Location = New-Object System.Drawing.Point(0, 12)
-$chkBackup.Size = New-Object System.Drawing.Size(270, 20)
-$actionPanel.Controls.Add($chkBackup)
-
-$btnPreview = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnPreview 'action.preview')
-$btnPreview.Size = New-Object System.Drawing.Size(140, 34)
-$btnPreview.Location = New-Object System.Drawing.Point(280, 4)
-$btnPreview.Add_Click({
-    Show-TextReport -Title (T 'report.previewTitle') -Text (New-ApplyPlanReport) -DefaultFileName "brave-free-origin-apply-preview-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
-})
-$actionPanel.Controls.Add($btnPreview)
-
-$btnApply = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnApply 'action.apply')
-$btnApply.Size = New-Object System.Drawing.Size(150, 34)
-$btnApply.Location = New-Object System.Drawing.Point(430, 4)
-$btnApply.BackColor = [System.Drawing.Color]::FromArgb(37, 99, 63)
-$btnApply.ForeColor = [System.Drawing.Color]::White
-[void](Set-LocFont $btnApply -Size 9 -Semibold)
-$btnApply.Add_Click({
-    if ($chkBackup.Checked) { [void](Export-Backup) }
-
-    $applied = 0
-    $cleared = 0
-    $originalPath = $script:BravePolicyPath
-    foreach ($channel in $script:TargetChannels) {
-        $script:BravePolicyPath = $script:Channels[$channel].Path
-        Write-Log "--- Applying to channel: $channel ($($script:BravePolicyPath)) ---"
-        foreach ($cb in $script:CheckBoxes) {
-            $p = $cb.Tag.Policy
-            if ($cb.Checked) {
-                try {
-                    Set-PolicyValue -Name $p.Name -Type $p.Type -Value $p.ApplyValue
-                    Write-Log "[$channel] SET $($p.Name) = $($p.ApplyValue)" 'OK'
-                    $applied++
-                } catch {
-                    Write-Log "[$channel] FAIL $($p.Name): $_" 'ERR'
-                }
-            } else {
-                if (Remove-PolicyValue -Name $p.Name) {
-                    Write-Log "[$channel] CLEARED $($p.Name)" 'OK'
-                    $cleared++
-                }
-            }
-        }
-
-        # Search/NTP/Startup overrides run LAST so they always win over any
-        # NewTabPageLocation/HomepageLocation/RestoreOnStartup ticks above.
-        # Each helper clears its own keys first, so unticking + Apply truly removes them.
-        if ($script:BravePolicyPath -and (Test-Path $script:BravePolicyPath)) {
-            try { [void](Apply-SearchEngineOverride -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Search override: $_" 'ERR' }
-            try { [void](Apply-NtpOverride          -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] NTP override: $_" 'ERR' }
-            try { [void](Apply-StartupOverride      -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Startup override: $_" 'ERR' }
-        } elseif ($script:ChkSearchOverride.Checked -or $script:ChkNtpOverride.Checked -or $script:ChkStartupOverride.Checked) {
-            # No policy key yet but overrides are requested - create the key and run them
-            New-Item -Path $script:BravePolicyPath -Force | Out-Null
-            try { [void](Apply-SearchEngineOverride -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Search override: $_" 'ERR' }
-            try { [void](Apply-NtpOverride          -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] NTP override: $_" 'ERR' }
-            try { [void](Apply-StartupOverride      -Path $script:BravePolicyPath) } catch { Write-Log "[$channel] Startup override: $_" 'ERR' }
-        }
-    }
-    $script:BravePolicyPath = $originalPath
-
-    foreach ($cb in $script:TaskCheckBoxes) {
-        $t = $cb.Tag
-        try {
-            if ($cb.Checked) {
-                Disable-ScheduledTask -TaskName $t.Name -ErrorAction Stop | Out-Null
-                Write-Log "DISABLED task $($t.Name)" 'OK'
-            } else {
-                $existing = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
-                if ($existing -and $existing.State -eq 'Disabled') {
-                    Enable-ScheduledTask -TaskName $t.Name -ErrorAction Stop | Out-Null
-                    Write-Log "ENABLED task $($t.Name)" 'OK'
-                }
-            }
-        } catch {
-            Write-Log "Task $($t.Name): $_" 'WARN'
-        }
-    }
-
-    foreach ($cb in $script:ServiceCheckBoxes) {
-        $s = $cb.Tag
-        try {
-            $svc = Get-Service -Name $s.Name -ErrorAction SilentlyContinue
-            if (-not $svc) {
-                Write-Log "Service $($s.Name) not present - skipped." 'INFO'
-                continue
-            }
-            if ($cb.Checked) {
-                if ($svc.Status -eq 'Running') { Stop-Service -Name $s.Name -Force -ErrorAction SilentlyContinue }
-                Set-Service -Name $s.Name -StartupType Disabled -ErrorAction Stop
-                Write-Log "DISABLED service $($s.Name)" 'OK'
-            } else {
-                if ($svc.StartType -eq 'Disabled') {
-                    Set-Service -Name $s.Name -StartupType Manual -ErrorAction Stop
-                    Write-Log "RESET service $($s.Name) to Manual" 'OK'
-                }
-            }
-        } catch {
-            Write-Log "Service $($s.Name): $_" 'WARN'
-        }
-    }
-
-    Update-SelectionSummary
-    Write-Log "Done. Applied $applied policies, cleared $cleared. Restart Brave to take effect." 'DONE'
-    [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.apply.done' @((Get-PresetName $script:ActiveProfile), $applied, $cleared)),
-        (T 'msg.title.app'),
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-})
-$actionPanel.Controls.Add($btnApply)
-
-$btnRemoveAll = New-Object System.Windows.Forms.Button
-[void](Set-Loc $btnRemoveAll 'action.fullRestore')
-$btnRemoveAll.Size = New-Object System.Drawing.Size(170, 34)
-$btnRemoveAll.Location = New-Object System.Drawing.Point(590, 4)
-$btnRemoveAll.BackColor = [System.Drawing.Color]::FromArgb(150, 60, 60)
-$btnRemoveAll.ForeColor = [System.Drawing.Color]::White
-$btnRemoveAll.Add_Click({
-    $targets = $script:TargetChannels -join ', '
-    $ans = [System.Windows.Forms.MessageBox]::Show(
-        (T 'msg.restore.confirm' @($targets)),
-        (T 'msg.title.fullRestore'),
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning)
-    if ($ans -ne 'Yes') { return }
-    Invoke-FullRestore -Backup $chkBackup.Checked
-    [System.Windows.Forms.MessageBox]::Show((T 'msg.restore.done'), (T 'msg.title.app'), 'OK', 'Information') | Out-Null
-})
-$actionPanel.Controls.Add($btnRemoveAll)
-
-# ---- Log box ----------------------------------------------------------------
-$script:LogBox = New-Object System.Windows.Forms.TextBox
-$script:LogBox.Location = New-Object System.Drawing.Point(10, 810)
-$script:LogBox.Size = New-Object System.Drawing.Size(1145, 90)
-$script:LogBox.Multiline = $true
-$script:LogBox.ScrollBars = 'Vertical'
-$script:LogBox.ReadOnly = $true
-$script:LogBox.Font = New-Object System.Drawing.Font('Consolas', 8.5)
-$script:LogBox.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 18)
-$script:LogBox.ForeColor = [System.Drawing.Color]::LightGreen
-$script:LogBox.Anchor = 'Left, Right, Bottom'
-$form.Controls.Add($script:LogBox)
-
-# ---- Locale bootstrap -------------------------------------------------------
-# Order: -Lang, then the saved preference, then the Windows UI culture, then
-# English. Applied after the whole UI exists so one pass re-texts everything.
-$script:BfoSettings = Get-BfoSettings -Path $BfoSettingsPath
-$startupLocale = Resolve-StartupLocale -Requested $Lang -Saved "$($script:BfoSettings['language'])"
-if ($startupLocale -ne 'en-US') {
-    if (Set-BfoLocale -Code $startupLocale) {
-        $form.Font = Get-BfoUiFont -Size 9
-        Update-UiLanguage
-    }
+    try { $unknown = Import-ConfigObject $cfg; Sync-OverrideControls } finally { Pop-SuppressSelectionEvents }
+    Update-AllItemViews
+    Update-Filter
+    Update-Chrome
+    Write-Log ("Config imported from {0} (schema {1}, app {2}, {3} unknown entr{4} skipped)" -f $ofd.FileName, $(if ($cfg.schemaVersion) { $cfg.schemaVersion } else { 1 }), $cfg.appVersion, $unknown, $(if ($unknown -eq 1) { 'y' } else { 'ies' })) 'OK'
+    [void](Show-Message -Text (T 'msg.config.imported') -Title (T 'msg.title.imported'))
 }
+
+function New-ToolsMenu {
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    $menu.Font = Get-BfoUiFont -Size 9
+    $menu.ShowImageMargin = $false
+    $entries = @(
+        @('tools.load',    { Invoke-Guarded 'Load current state' { Invoke-LoadCurrentState } }),
+        @('util.verify',   { Invoke-Guarded 'Verify' { Invoke-VerifyAction } }),
+        @('util.openPolicy', { Invoke-Guarded 'Open policy page' { [void](Open-InBrave 'brave://policy') } }),
+        @('-', $null),
+        @('util.export',   { Invoke-Guarded 'Export config' { Invoke-ExportConfig } }),
+        @('util.import',   { Invoke-Guarded 'Import config' { Invoke-ImportConfig } }),
+        @('-', $null),
+        @('tools.backups', { Invoke-Guarded 'Open backups' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f (Get-BackupDirectory)) } }),
+        @('tools.log',     { Invoke-Guarded 'Toggle log' { Switch-LogPanel } }),
+        @('tools.help',    { Invoke-Guarded 'Help' { Show-HelpDialog } }),
+        @('-', $null),
+        @('util.close',    { $script:Form.Close() })
+    )
+    $script:ToolsMenuItems = @()
+    foreach ($e in $entries) {
+        if ($e[0] -eq '-') { [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)); continue }
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+        $mi.Text = T $e[0]
+        $mi.Tag = $e[0]
+        $mi.Padding = New-Object System.Windows.Forms.Padding(4, 5, 4, 5)
+        $action = $e[1]
+        $mi.Add_Click($action)
+        [void]$menu.Items.Add($mi)
+        $script:ToolsMenuItems += $mi
+    }
+    return $menu
+}
+
+function Update-ToolsMenuText {
+    foreach ($mi in $script:ToolsMenuItems) { $mi.Text = T $mi.Tag }
+    if ($script:ToolsMenu) { $script:ToolsMenu.Font = Get-BfoUiFont -Size 9; $script:ToolsMenu.RightToLeft = $(if ($script:IsRtl) { 'Yes' } else { 'No' }) }
+}
+
+function Switch-LogPanel {
+    $script:LogPanel.Visible = -not $script:LogPanel.Visible
+    $script:BtnLogToggle.Text = if ($script:LogPanel.Visible) { T 'status.hideLog' } else { T 'status.showLog' }
+}
+#endregion
+
+
+#region Startup ---------------------------------------------------------------
+# Language first, so the window is built in the right script, font and direction
+# instead of being built in English and re-texted. Order: -Lang, saved choice,
+# Windows display language, same language family, English.
+$script:BfoSettings = Get-BfoSettings -Path $script:SettingsPath
+$script:LocaleList  = @(Get-AvailableLocales)
+$startupLocale = Resolve-StartupLocale -Requested $Lang -Saved "$($script:BfoSettings['language'])"
+if ($startupLocale -ne 'en-US') { [void](Set-BfoLocale -Code $startupLocale) }
+if ($script:BfoSettings.ContainsKey('showTechnical')) { $script:ShowTechnical = ConvertTo-BoolStrict $script:BfoSettings['showTechnical'] }
+
+Initialize-PolicyCatalog
+Initialize-Items
+
+# ---- Window ------------------------------------------------------------------
+$form = New-MainForm
+$script:Form = $form
+if ($script:IsRtl) { $form.RightToLeft = 'Yes'; $form.RightToLeftLayout = $true }
+
+$headerPanel = New-HeaderPanel
+$sidebar     = New-Sidebar
+$actionBar   = New-ActionBar
+$script:LogPanel = New-LogPanel
+$statusStrip = New-StatusStrip
+
+$content = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White }
+$pageHost = New-Ctl 'Panel' @{ Dock = 'Fill'; BackColor = $script:Clr.White }
+$script:PageHost = $pageHost
+$topParts = New-ContentTop
+$content.Controls.Add($pageHost)
+$content.Controls.Add($topParts[1])      # bulk links bar
+$content.Controls.Add($topParts[0])      # page title + search
+$pageHost.BringToFront()
+
+foreach ($p in $script:PageOrder) {
+    $panel = switch ($p.Kind) {
+        'grid'       { New-GridPage $p.Id }
+        'updater'    { New-UpdaterPage }
+        'hosts'      { New-HostsPage }
+        'overrides'  { New-OverridesPage }
+        'scriptlets' { New-ScriptletsPage }
+    }
+    $script:PagePanels[$p.Id] = $panel
+    $pageHost.Controls.Add($panel)
+}
+
+# Dock order: the last control added docks first (nearest the edge), Fill last.
+$form.Controls.Add($content)
+$form.Controls.Add($sidebar)
+$form.Controls.Add($headerPanel)
+$form.Controls.Add($actionBar)
+$form.Controls.Add($script:LogPanel)
+$form.Controls.Add($statusStrip)
+$content.BringToFront()
+$form.ResumeLayout($true)   # New-MainForm suspended layout while the window was being assembled
+
+# ---- Language picker -----------------------------------------------------------
+foreach ($loc in $script:LocaleList) { [void]$script:LanguageCombo.Items.Add($loc.Name) }
 for ($i = 0; $i -lt $script:LocaleList.Count; $i++) {
     if ($script:LocaleList[$i].Code -eq $script:CurrentLocale) { $script:LanguageCombo.SelectedIndex = $i; break }
 }
 if ($script:LanguageCombo.SelectedIndex -lt 0) { $script:LanguageCombo.SelectedIndex = 0 }
+
+function Update-LocaleNote {
+    $entry = @($script:LocaleList | Where-Object { $_.Code -eq $script:CurrentLocale })
+    if ($entry.Count -gt 0 -and -not $entry[0].Reviewed -and $script:CurrentLocale -ne 'en-US') { $script:LblLocaleNote.Text = T 'header.unreviewedLocale' }
+    else { $script:LblLocaleNote.Text = '' }
+}
 Update-LocaleNote
 
-$script:FilterReady = $true
-Update-SelectionSummary
-Update-ConfigurationFilter
+# ---- Direction, fonts and text after a language switch ----------------------------------
+function Set-UiDirection {
+    param([bool]$Rtl)
+    $want = if ($Rtl) { [System.Windows.Forms.RightToLeft]::Yes } else { [System.Windows.Forms.RightToLeft]::No }
+    if ($script:Form.RightToLeft -eq $want -and $script:Form.RightToLeftLayout -eq $Rtl) { return }
+    $script:Form.SuspendLayout()
+    try { $script:Form.RightToLeft = $want; $script:Form.RightToLeftLayout = $Rtl }
+    finally { $script:Form.ResumeLayout($true) }
+}
 
-# ---- Startup ---------------------------------------------------------------
-$form.Add_Shown({
-    Write-Log "Brave Free Origin v$($script:AppVersion) - running as administrator, OK."
-    Write-Log "Brave version: $braveVer"
-    Write-Log "UI locale: $($script:CurrentLocale)"
-    Write-Log 'Loading current policy state...'
-    $btnLoad.PerformClick()
+# A language switch is a pure re-text: it must not move one tick, one combo
+# selection or the active preset, so the whole pass runs with the handlers muted
+# and the active preset is captured and restored around it.
+function Update-UiLanguage {
+    $keepProfile = $script:ActiveProfile
+    $script:Form.SuspendLayout()
+    Push-SuppressSelectionEvents
+    try {
+        Set-UiDirection $script:IsRtl
+        $script:Form.Font = Get-BfoUiFont -Size 9
+        foreach ($binding in $script:I18nBindings) {
+            try {
+                if ($binding.Kind -eq 'Tooltip') { $script:ToolTip.SetToolTip($binding.Control, (T $binding.Key $binding.Args)); continue }
+                $bindArgs = $binding.Args
+                if ($binding.ArgsScript) { $bindArgs = @(& $binding.ArgsScript) }
+                $binding.Control.($binding.Property) = T $binding.Key $bindArgs
+            } catch { }
+        }
+        Update-LocalizedFonts
+        Update-ToolsMenuText
+        Set-ComboLabels -Combo $script:CmbSearchEngine -Ids $script:SearchEngineIds -LabelKeys $script:SearchEngineLabelKeys
+        Set-ComboLabels -Combo $script:CmbNtpDest      -Ids $script:DestinationIds  -LabelKeys $script:DestinationLabelKeys
+        Set-ComboLabels -Combo $script:CmbStartupMode  -Ids $script:StartupModeIds  -LabelKeys $script:StartupModeLabelKeys
+        foreach ($g in $script:Grids.Values) {
+            Set-GridFonts $g
+            Update-GridHeaders $g
+            $g.SuspendLayout()
+            foreach ($row in $g.Rows) { if ($row.Tag) { Update-ItemTexts $row.Tag; Update-ItemView $row.Tag } }
+            $g.ResumeLayout()
+            $script:GridsDirty[$g.Name] = $true
+        }
+        Build-Nav
+        if ($script:CurrentPageId) {
+            Select-NavPage $script:CurrentPageId
+            $script:LblPageTitle.Text = Get-PageTitle $script:CurrentPageId
+            $script:LblPageIntro.Text = Get-PageIntro $script:CurrentPageId
+        }
+        Update-BraveInfo
+        Update-ScriptletLocalizedText
+        Update-LocaleNote
+        $script:BtnLogToggle.Text = if ($script:LogPanel.Visible) { T 'status.hideLog' } else { T 'status.showLog' }
+    } finally {
+        Pop-SuppressSelectionEvents
+        $script:Form.ResumeLayout($true)
+    }
+    $script:ActiveProfile = $keepProfile
+    Update-OverrideControlStates
+    Update-Filter
+    Update-Chrome
+    Update-GridColumnVisibility
+    Start-RowHeightTimer
+}
+
+$script:LanguageCombo.Add_SelectedIndexChanged({
+    if ($script:SuppressSelectionEvents) { return }
+    $i = $script:LanguageCombo.SelectedIndex
+    if ($i -lt 0 -or $i -ge $script:LocaleList.Count) { return }
+    $code = $script:LocaleList[$i].Code
+    if ($code -eq $script:CurrentLocale) { return }
+    Invoke-Guarded 'Change language' {
+        [void](Set-BfoLocale -Code $code)
+        Update-UiLanguage
+        Set-BfoSetting 'language' $code
+        Write-Log (T 'msg.language.switched' @($script:LocaleList[$i].Name)) 'OK'
+    }
 })
 
+# ---- Buttons and menus -----------------------------------------------------------------
+$script:ToolsMenu = New-ToolsMenu
+Update-ToolsMenuText
+$script:BtnTools.Add_Click({ $script:ToolsMenu.Show($script:BtnTools, (New-Object System.Drawing.Point(0, $script:BtnTools.Height))) })
+$script:BtnPreview.Add_Click({ Invoke-Guarded 'Preview changes' { Invoke-PreviewAction } })
+$script:BtnApply.Add_Click({ Invoke-Guarded 'Apply to Brave' { Invoke-ApplyAction } })
+$script:BtnRestore.Add_Click({ Invoke-Guarded 'Restore stock' { Invoke-RestoreAction } })
+$script:BtnLogToggle.Add_Click({ Invoke-Guarded 'Toggle log' { Switch-LogPanel } })
+$form.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::F1) { Invoke-Guarded 'Help' { Show-HelpDialog }; $_.Handled = $true }
+    elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::F) { $script:TxtFilter.Focus(); $script:TxtFilter.SelectAll(); $_.Handled = $true }
+})
+$form.Add_FormClosing({ Remove-TempShortcuts })
+$form.Add_SizeChanged({
+    # Copy the keys first: assigning to a hashtable while enumerating its own Keys throws "Collection was modified".
+    foreach ($k in @($script:GridsDirty.Keys)) { $script:GridsDirty[$k] = $true }
+    Update-GridColumnVisibility
+    Start-RowHeightTimer
+})
+
+# ---- Initial state ------------------------------------------------------------------------
+Build-Nav
+Update-BraveInfo
+Update-GridColumnVisibility
+$script:FormReady = $true
+Show-Page $script:PolicyPageOrder[0]
+Select-NavPage $script:PolicyPageOrder[0]
+
+$form.Add_Shown({
+    # The window is started from a hidden, elevated process; make sure it comes to the front rather than opening behind other windows.
+    try { $script:Form.Activate() } catch { }
+    Invoke-Guarded 'Startup' {
+        Write-Log ("Brave Free Origin v{0} - running as administrator, OK." -f $script:AppVersion)
+        $info = Get-BraveInfo (Get-PrimaryChannel)
+        Write-Log ("Brave version: {0} ({1} install)" -f $(if ($info.Version) { $info.Version } else { 'not found' }), $info.Scope)
+        Write-Log ("UI locale: {0}" -f $script:CurrentLocale)
+        Invoke-LoadCurrentState
+        Update-GridColumnVisibility
+        Show-Page $script:PolicyPageOrder[0]
+    }
+})
+
+if ($script:SelfTestMode) {
+    # Maintainer hook: run the test script inside the finished app, then leave.
+    # No window is shown, no UAC prompt was raised, and nothing outside the
+    # sandbox (HKCU test hive, temp hosts file, in-memory tasks) was touched.
+    $script:SelfTestExit = 0
+    . $SelfTest
+    Remove-TempShortcuts
+    exit $script:SelfTestExit
+}
 [void]$form.ShowDialog()
+#endregion
