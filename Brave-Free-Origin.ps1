@@ -5860,17 +5860,18 @@ function Sync-KeptExistingToUi {
     $changed = $false
     foreach ($name in $KeepNames) {
         $item = Get-BfoItem 'Policy' $name
-        if ($item -and $item.Checked) {
-            Set-ItemChecked $item $false
-            $changed = $true
+        if ($item) {
+            $target = [bool]$item.Baseline
+            if ($item.Checked -ne $target) {
+                Set-ItemChecked $item $target
+                $changed = $true
+            }
         }
     }
     foreach ($g in $script:OverrideGroups) {
         if (@($g.Names | Where-Object { $KeepNames -contains $_ }).Count -eq 0) { continue }
-        if ($script:Overrides[$g.Toggle].Enabled) {
-            $script:Overrides[$g.Toggle].Enabled = $false
-            $changed = $true
-        }
+        Restore-OverrideBaseline -Toggle $g.Toggle
+        $changed = $true
     }
 
     if ($changed) {
