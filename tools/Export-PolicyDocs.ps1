@@ -81,8 +81,9 @@ Add-Line
 Add-Line '## How to read the tables'
 Add-Line
 Add-Line '- **Ticked** means this tool enforces the row. For most rows that switches a feature **off** (the title says so: "Turn off ..."). Rows marked **keeps on** lock a protection Brave already uses by default, so nothing can silently weaken it. Rows marked **sets** write a specific value.'
-Add-Line '- **Unticked** means the tool sets nothing and Brave decides. Pressing Apply removes the policy this tool wrote earlier.'
-Add-Line '- **Set elsewhere** (in the Status column of the app) means the policy already holds a value this tool would never write, for example one set by your organization. Apply lists such a value and asks before replacing it (the row then says **Will replace**; you can keep it, replace it or stop), and Restore stock leaves it alone unless you choose to remove everything. A value identical to one this tool writes cannot be told apart from its own.'
+Add-Line '- **Unticked** means BFO requests that policy be absent. If the current value was recorded as BFO-owned it is removed directly; if it was not recorded as BFO-owned, Apply shows it first and asks before removing it.'
+Add-Line '- **Set elsewhere** means the policy already exists but BFO did not record writing that exact value. It is left alone until you deliberately change that row. Apply asks before replacing or removing it; keeping it restores the row to the state that was loaded from the PC.'
+Add-Line '- **Data-loss warning:** applying **Forget site data when a tab closes** or **Block custom New Tab backgrounds** can erase site data or saved customization. Apply shows a second warning and lets you unselect those settings while continuing with the rest.'
 Add-Line '- **Risk** says what an everyday user could lose: *Safe* and *Low* are fine for everybody; *Medium* and *High* change how Brave behaves, so read the description first.'
 Add-Line '- **Policy** is the registry value name under `HKLM\SOFTWARE\Policies\BraveSoftware\Brave` (one key for Stable, Beta, Nightly and Dev). It is also the name you will see in `brave://policy`.'
 Add-Line '- The preset columns show which presets tick the row: **Quick** = Quick Debloat, **Rec.** = Recommended, **Origin** = Origin Mode, **Boost** = Privacy + Boost, **Max perf.** = Max Performance, **Max priv.** = Max Privacy.'
