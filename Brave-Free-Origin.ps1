@@ -809,8 +809,8 @@ Add-Strings @{
     'util.close'         = 'Close'
     'util.export'        = 'Export config...'
     'util.import'        = 'Import config...'
-    'util.openPolicy'    = 'Open brave://policy'
-    'util.verify'        = 'Verify'
+    'util.openPolicy'    = 'View in Brave'
+    'util.verify'        = 'Check changes'
 }
 
 # ---- Updater page ---------------------------------------------------------------------
@@ -914,18 +914,18 @@ Add-Strings @{
 # Asked before Apply replaces or removes a value that this app did not write.
 Add-Strings @{
     'existing.cancel'        = 'Cancel'
-    'existing.col.current'   = 'Current value'
-    'existing.col.wants'     = 'BFO wants'
+    'existing.col.current'   = 'Current'
+    'existing.col.wants'     = 'Selected'
     'existing.group.ntp'     = 'New Tab page'
     'existing.group.search'  = 'Search engine'
     'existing.group.startup' = 'Startup pages'
-    'existing.intro'         = '{0} existing setting(s) would be changed:'
-    'existing.keep'          = 'Keep existing settings'
-    'existing.note'          = 'These settings may have been set by hand, by another tool or by your organization. Ticked settings are replaced. Untick a setting to keep it as it is. Everything else you selected is still applied.'
-    'existing.remember'      = 'Do this every time without asking (you can change it in Tools)'
+    'existing.intro'         = '{0} existing setting(s) are different from your selection.'
+    'existing.keep'          = 'Keep all existing'
+    'existing.note'          = 'Checked rows will be changed. Untick a row to keep its current value.'
+    'existing.remember'      = 'Remember this choice (change it later in Tools)'
     'existing.remove'        = '(remove it)'
-    'existing.replace'       = 'Apply BFO changes anyway'
-    'existing.title'         = 'Existing Brave policies detected'
+    'existing.replace'       = 'Apply selected changes'
+    'existing.title'         = 'Review existing settings'
 }
 
 
@@ -1292,14 +1292,16 @@ Add-Strings @{
 Add-Strings @{
     'result.backup'    = 'Backup saved: {0}'
     'result.counts'    = 'Added {0}, changed {1}, removed {2}, already correct {3}.'
-    'result.done'      = 'Changes applied'
+    'result.done'      = 'Done'
     'result.failures'  = '{0} change(s) could not be made:'
     'result.kept'      = 'Kept {0} existing setting(s) as they were.'
     'result.partial'   = 'Applied with problems'
     'result.replaced'  = 'Replaced {0} existing setting(s).'
-    'result.restart'   = 'Fully close and reopen Brave for the changes to take effect. Then open brave://policy or press Verify to check.'
+    'result.restart'   = 'Fully close and reopen Brave to activate the new settings.'
     'result.system'    = '{0} updater change(s) made.'
-    'result.verify'    = 'Verify'
+    'result.summary'   = '{0} change(s) applied.'
+    'result.backupShort' = 'Backup created.'
+    'result.verify'    = 'Check changes'
 }
 
 # ---- Dialogs -----------------------------------------------------------------
@@ -4204,7 +4206,7 @@ $script:ColCheck = 0; $script:ColSetting = 1; $script:ColWhat = 2; $script:ColRi
 $script:ColState = 4; $script:ColPolicy = 5; $script:ColValue = 6
 $script:Grids = @{}
 $script:GridsDirty = @{}
-$script:ShowTechnical = $true
+$script:ShowTechnical = $false
 
 function Get-ItemText {
     param($Item, [ValidateSet('title', 'description')][string]$Part)
@@ -5515,11 +5517,10 @@ function Show-ApplyResult {
     $flow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; FlowDirection = 'TopDown'; WrapContents = $false; BackColor = $script:Clr.White } $body
     $head = New-Ctl 'Label' @{ AutoSize = $true; Text = $(if ($failed) { T 'result.partial' } else { T 'result.done' }); ForeColor = $(if ($failed) { $script:Clr.Red } else { $script:Clr.Green }) } $flow
     $head.Font = Get-BfoUiFont -Size 12 -Semibold
-    $lines = @((T 'result.counts' @($Result.Added, $Result.Changed, $Result.Cleared, $Result.Kept)))
-    if ($Result.ConflictsReplaced -gt 0) { $lines += (T 'result.replaced' @($Result.ConflictsReplaced)) }
-    if ($Result.ConflictsKept -gt 0)     { $lines += (T 'result.kept' @($Result.ConflictsKept)) }
-    if ($Result.System -gt 0) { $lines += (T 'result.system' @($Result.System)) }
-    if ($BackupFile) { $lines += (T 'result.backup' @($BackupFile)) }
+    $applied = $Result.Added + $Result.Changed + $Result.Cleared + $Result.System
+    $lines = @((T 'result.summary' @($applied)))
+    if ($Result.ConflictsKept -gt 0) { $lines += (T 'result.kept' @($Result.ConflictsKept)) }
+    if ($BackupFile) { $lines += (T 'result.backupShort') }
     $lines += ''
     $lines += (T 'result.restart')
     $txt = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(490, 0)); ForeColor = $script:Clr.Ink; Text = ($lines -join "`r`n"); Margin = (New-Object System.Windows.Forms.Padding(0, 8, 0, 0)) } $flow
