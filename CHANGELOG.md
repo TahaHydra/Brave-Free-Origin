@@ -4,6 +4,17 @@ All notable changes to Brave Free Origin. Newest first. Every release is checked
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow the app's own numbering.
 
+## [2.0.2] - 2026-09-30
+
+Critical policy-state fix: unticking a policy that was loaded from the PC now really requests its removal, while unrelated external policies still remain untouched.
+
+### Fixed
+- **Unticking now works for existing policies.** If a matching policy was present when BFO loaded the current state, unticking it produces a real pending removal. If BFO did not record owning the value, the existing-settings review appears before anything is removed. Previously the planner silently converted that action to `LEAVE`, so Preview showed nothing and Apply said there was nothing to change.
+- **No surprise removals on startup.** An existing policy whose value does not match the BFO row still starts unticked and remains untouched until the user explicitly selects or changes it.
+- **Keep existing restores the loaded state.** If the user declines a replacement/removal, the checkbox or Search/New Tab/startup override returns to the state that was read from the PC, avoiding repeated contradictory prompts.
+- **Data-loss confirmation.** Applying the policies that can delete site data or saved browser customization now shows a separate warning. The user can apply them, unselect those risky settings and continue with the rest, or cancel. Clearing those policies does not trigger the warning.
+- Updated all seven UI languages and the policy documentation for the corrected behavior.
+
 ## [2.0.1] - 2026-09-30
 
 Fixes for 2.0: switching language while the app is open no longer closes the window, and the question before Apply is easier to read and more careful about what it treats as yours.
