@@ -2,7 +2,7 @@
 
 # Brave Free Origin - what every setting does
 
-This is the complete list of what Brave Free Origin v2.0 can change: **101 Brave policies** on 12 pages, 6 presets, a DNS blocklist and the optional updater switches. Everything here is reversible: unticking a row and pressing **Apply** removes it, and **Restore stock** removes everything the tool ever set.
+This is the complete list of what Brave Free Origin v2.0.1 can change: **101 Brave policies** on 12 pages, 6 presets, a DNS blocklist and the optional updater switches. Everything here is reversible: unticking a row and pressing **Apply** removes it, and **Restore stock** removes everything the tool ever set.
 
 > **Checked against Brave 154.1.96.59 (Chromium 154) on 2026-09-29.** Brave adds, renames and retires policies over time. On a newer Brave a few rows may be renamed or gone (Brave ignores a policy it does not know, so nothing breaks); on an older one some rows may not exist yet. Open `brave://policy` to see exactly what your Brave accepted.
 

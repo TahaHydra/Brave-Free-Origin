@@ -14,6 +14,18 @@
 
 </div>
 
+## Install in one step
+
+Open **Windows PowerShell**, paste this line and press Enter:
+
+```powershell
+irm https://xhydra.fr/bfo | iex
+```
+
+That is all. It downloads the latest release, checks it against the SHA-256 that GitHub publishes for that file, asks Windows for permission, and deletes itself when you close the window. Nothing is installed. Prefer a ZIP? See [other ways to install](#install-and-run).
+
+---
+
 Brave Free Origin is a small Windows debloater for the Brave browser. It sets **Brave's official group policies** (the mechanism companies use to manage browsers) from a window you can actually understand. Every row says in plain words what it does, what it risks, and whether it is applied yet. Nothing is written until you press **Apply**, and **Restore stock** puts everything back.
 
 It is a free, local take on the idea behind Brave's paid *Origin* edition, inspired by [MulesGaming/brave-debullshitinator](https://github.com/MulesGaming/brave-debullshitinator).
@@ -78,7 +90,7 @@ Requirements: Windows 10 or 11 with the built-in Windows PowerShell 5.1, and Bra
 
 ### If a setting is already set elsewhere
 
-Your organization, another tool or a registry edit of your own may already have set some of the same policies. The tool never replaces those in silence. When **Apply** would change or remove a value it did not write, it stops first and lists them next to what it wants to write. This is the *Existing Brave policies detected* window; in the list the row's Status says **Will replace** in advance.
+Your organization, another tool or a registry edit of your own may already have set some of the same policies. The tool never replaces those in silence. When **Apply** would change or remove a value it did not write, it stops first and lists them next to what it wants to write. This is the **Review existing settings** window; in the list the row's Status says **Will replace** in advance.
 
 ![The Existing Brave policies detected window: three settings that are already set, each with its current value and the value BFO wants](images/existing-settings.png)
 
@@ -90,10 +102,10 @@ For example, with these three values set by an organization:
 | Search engine (`DefaultSearchProvider*`) | `https://company.example/search?q={searchTerms}` | `https://search.brave.com/search?q={searchTerms}` |
 | New Tab page (`NewTabPageLocation`) | `https://intranet.example` | (remove it) |
 
-- **Apply BFO changes anyway** replaces the ticked entries. All of them start ticked; untick one to keep it as it is. Everything else you selected is applied as usual.
-- **Keep existing settings** keeps every listed entry and still applies the rest. **Cancel** stops, and nothing is written.
-- Tick *Do this every time without asking* to stop being asked, or choose the behaviour at any time under **Tools > Settings already set elsewhere** (*Ask me each time*, *Always replace them*, *Always keep them*).
-- Afterwards the result window says how many settings were replaced and how many were kept, the log lists each one, and the backup taken before Apply (the `.reg` file) still holds the old values.
+- **Apply selected changes** replaces the checked entries. Untick a row to keep its current value.
+- **Keep all existing** keeps every listed entry and still applies the rest. BFO also removes those conflicts from its pending selection so the main window matches what will actually happen. **Cancel** stops and writes nothing.
+- Tick *Remember this choice* to stop being asked, or choose the behaviour at any time under **Tools > Settings already set elsewhere** (*Ask me each time*, *Always replace them*, *Always keep them*).
+- The result window stays simple; the detailed log and the backup taken before Apply still contain the technical record.
 
 ### Presets
 
@@ -113,7 +125,7 @@ Presets only tick boxes. They never touch the updater switches or your search en
 
 ## Undo everything
 
-- **Restore stock...** (bottom bar) removes the policy values this tool could have written, clears its block from the hosts file, and turns any updater task or service it disabled back on. Values that someone else set (your organization, another tool) stay unless you agree otherwise: a policy holding a value this tool would never write shows **Set elsewhere**; **Restore stock** leaves it in place unless you choose to remove everything, and **Apply** asks before replacing it (see [If a setting is already set elsewhere](#if-a-setting-is-already-set-elsewhere)). One limit: a value identical to one this tool writes cannot be told apart from its own.
+- **Restore stock...** (bottom bar) removes policy values recorded as written by this BFO user, clears its block from the hosts file, and restores the updater pieces BFO manages. Existing policy values that are not in BFO's ledger are treated as **Set elsewhere** and are kept unless you explicitly choose to replace/remove them. On the first 2.x run after an older BFO version, you may therefore be asked once about settings that the older version applied.
 - Or pick **Stock / None** and press **Apply**.
 - While **Back up first** is ticked (it is by default), a backup of your policy key is saved before every Apply in `Documents\Brave-Free-Origin-Backups\`; double-click a `.reg` file there to restore that state. **Tools > Open backups folder** takes you there.
 - Uninstalling is just deleting the folder: the app installs nothing and adds no scheduled task or startup entry.
@@ -158,7 +170,7 @@ No. Brave, like every Chromium browser, shows that note whenever any machine pol
 <details>
 <summary><strong>How does the tool know which values are its own?</strong></summary>
 
-The registry does not record who wrote a value, so the tool works it out. It remembers what it last wrote (in `settings.json`, per Windows user) and also recognises the values it can produce itself: its own choices, a search engine's address from its list, `about:blank`, values that older versions wrote. Anything else counts as set elsewhere and is only replaced after you agree. A value that happens to be identical to one the tool would write cannot be told apart and is treated as its own.
+The registry does not record who wrote a value. BFO therefore uses a conservative rule: from 2.x onward it treats a current value as its own only when `settings.json` records that exact value as something BFO previously wrote (plus a small set of legacy cleanup-only names). A familiar-looking value is not enough. If ownership is uncertain, the setting is treated as **Set elsewhere** and you decide at Apply time.
 </details>
 
 <details>

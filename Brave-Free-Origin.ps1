@@ -40,7 +40,7 @@ param(
 #region Bootstrap -------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
 
-$script:AppVersion       = '2.0'
+$script:AppVersion       = '2.0.1'
 $script:CatalogBrave     = '154.1.96.59'   # Brave build the policy catalog was verified against
 $script:CatalogBraveMajor = 154
 $script:CatalogDate      = '2026-09-29'
@@ -809,8 +809,8 @@ Add-Strings @{
     'util.close'         = 'Close'
     'util.export'        = 'Export config...'
     'util.import'        = 'Import config...'
-    'util.openPolicy'    = 'Open brave://policy'
-    'util.verify'        = 'Verify'
+    'util.openPolicy'    = 'View in Brave'
+    'util.verify'        = 'Check changes'
 }
 
 # ---- Updater page ---------------------------------------------------------------------
@@ -914,18 +914,18 @@ Add-Strings @{
 # Asked before Apply replaces or removes a value that this app did not write.
 Add-Strings @{
     'existing.cancel'        = 'Cancel'
-    'existing.col.current'   = 'Current value'
-    'existing.col.wants'     = 'BFO wants'
+    'existing.col.current'   = 'Current'
+    'existing.col.wants'     = 'Selected'
     'existing.group.ntp'     = 'New Tab page'
     'existing.group.search'  = 'Search engine'
     'existing.group.startup' = 'Startup pages'
-    'existing.intro'         = '{0} existing setting(s) would be changed:'
-    'existing.keep'          = 'Keep existing settings'
-    'existing.note'          = 'These settings may have been set by hand, by another tool or by your organization. Ticked settings are replaced. Untick a setting to keep it as it is. Everything else you selected is still applied.'
-    'existing.remember'      = 'Do this every time without asking (you can change it in Tools)'
+    'existing.intro'         = '{0} existing setting(s) are different from your selection.'
+    'existing.keep'          = 'Keep all existing'
+    'existing.note'          = 'Checked rows will be changed. Untick a row to keep its current value.'
+    'existing.remember'      = 'Remember this choice (change it later in Tools)'
     'existing.remove'        = '(remove it)'
-    'existing.replace'       = 'Apply BFO changes anyway'
-    'existing.title'         = 'Existing Brave policies detected'
+    'existing.replace'       = 'Apply selected changes'
+    'existing.title'         = 'Review existing settings'
 }
 
 
@@ -1292,14 +1292,16 @@ Add-Strings @{
 Add-Strings @{
     'result.backup'    = 'Backup saved: {0}'
     'result.counts'    = 'Added {0}, changed {1}, removed {2}, already correct {3}.'
-    'result.done'      = 'Changes applied'
+    'result.done'      = 'Done'
     'result.failures'  = '{0} change(s) could not be made:'
     'result.kept'      = 'Kept {0} existing setting(s) as they were.'
     'result.partial'   = 'Applied with problems'
     'result.replaced'  = 'Replaced {0} existing setting(s).'
-    'result.restart'   = 'Fully close and reopen Brave for the changes to take effect. Then open brave://policy or press Verify to check.'
+    'result.restart'   = 'Fully close and reopen Brave to activate the new settings.'
     'result.system'    = '{0} updater change(s) made.'
-    'result.verify'    = 'Verify'
+    'result.summary'   = '{0} change(s) applied.'
+    'result.backupShort' = 'Backup created.'
+    'result.verify'    = 'Check changes'
 }
 
 # ---- Dialogs -----------------------------------------------------------------
@@ -2271,45 +2273,19 @@ function Get-DesiredPolicyMap {
     return [pscustomobject]@{ Values = $map; Urls = $ov.Urls; HasStartupOverride = $script:Overrides.Startup.Enabled }
 }
 
-# Ownership. A value in the shared Brave policy key can come from this tool, an administrator, Group Policy or another
-# tool, and the registry does not say which. A value counts as this tool's own if it is one it could have written: a
-# name only older versions used, a value the ledger says was written here, a catalog name holding the same kind of data
-# with a value from the catalog (any choice, or a value an older version wrote), or a value one of the search / New Tab /
-# startup choices produces. Anything else - for example BrowserSignin = 1 set by an administrator - is not touched by
-# Apply and Restore stock without asking. A value identical to what this tool writes cannot be told apart from its own;
-# that is the one unavoidable ambiguity.
+# Ownership is deliberately conservative. The registry does not record who created a policy, so BFO only treats a
+# current policy as its own when its per-user ledger records that exact value (or when the name is a legacy BFO-only
+# cleanup value from older releases). Merely looking like a value BFO could write is not proof of ownership.
+#
+# This means the first 2.x run after an older release may ask once about policies that older BFO versions set. That is
+# intentional: when there is doubt, the user decides. After BFO writes a value it is recorded and future changes to it
+# do not prompt again unless something else changes the value.
 function Test-OwnedPolicyValue {
-    # Siblings: the other values of the key. A custom search engine written by versions before 2.0 (which remembered
-    # nothing) is recognised by the name and keyword this tool always gave it.
     param([string]$Name, $Value, [string]$Kind, $Siblings = $null)
     if ($script:LegacyPolicyNames -contains $Name) { return $true }
     $text = "$Value"
-    if ($script:AppliedLedger.ContainsKey($Name) -and $script:AppliedLedger[$Name] -eq $text) { return $true }
-    $kindIs = { param([string]$type) (-not $Kind) -or ($Kind -eq $(if ($type -eq 'DWORD') { 'DWord' } else { 'String' })) }
-
-    $def = $script:PolicyByName[$Name]
-    if ($def -and (& $kindIs $def.Type)) {
-        # @( ) around the whole if: a one-element result would otherwise be unrolled to a scalar and += would fail.
-        $known = @(if ($def.Choices) { $def.Choices.Values } else { $def.Value })
-        if ($script:LegacyPolicyValues.ContainsKey($Name)) { $known += $script:LegacyPolicyValues[$Name] }
-        if (@($known | Where-Object { "$_" -eq $text }).Count -gt 0) { return $true }
-    }
-
-    $engines = @($script:SearchEngines.Values | Where-Object { -not $_.IsCustom })
-    $customEngine = ($Siblings -and ("$($Siblings['DefaultSearchProviderName'])" -eq 'Custom Search') -and ("$($Siblings['DefaultSearchProviderKeyword'])" -eq 'custom'))
-    switch ($Name) {
-        'DefaultSearchProviderEnabled'    { return ((& $kindIs 'DWORD') -and ($text -eq '1')) }
-        'DefaultSearchProviderName'       { return ((& $kindIs 'STRING') -and ((@($engines | ForEach-Object { $_.ProviderName }) + 'Custom Search') -contains $text)) }
-        'DefaultSearchProviderKeyword'    { return ((& $kindIs 'STRING') -and ((@($engines | ForEach-Object { $_.Keyword }) + 'custom') -contains $text)) }
-        'DefaultSearchProviderSearchURL'  { return ((& $kindIs 'STRING') -and ($customEngine -or (@($engines | ForEach-Object { $_.URL }) -contains $text))) }
-        'DefaultSearchProviderSuggestURL' { return ((& $kindIs 'STRING') -and (@($engines | ForEach-Object { $_.Suggest }) -contains $text)) }
-        'NewTabPageLocation' {
-            $homes = @($engines | ForEach-Object { $_.Home }) + @($script:DestinationOptions.Values | ForEach-Object { $_.Value })
-            return ((& $kindIs 'STRING') -and ($homes -contains $text))
-        }
-        'RestoreOnStartup' { return ((& $kindIs 'DWORD') -and (@($script:StartupModes.Values | ForEach-Object { "$($_.Code)" }) -contains $text)) }
-    }
-    return $false
+    if ($script:LegacyPolicyValues.ContainsKey($Name) -and @($script:LegacyPolicyValues[$Name] | Where-Object { "$_" -eq $text }).Count -gt 0) { return $true }
+    return ($script:AppliedLedger.ContainsKey($Name) -and $script:AppliedLedger[$Name] -eq $text)
 }
 
 function Get-ManagedPolicyNames {
@@ -2358,8 +2334,9 @@ function Get-StartupUrlOp {
     $have = @($Snapshot.Urls)
     if (-not $Desired.HasStartupOverride) { $want = @() }
     if (($want -join "`n") -eq ($have -join "`n")) { return $null }
-    # The existing list is ours if it is empty, is the blank page, or is what the ledger says was written here.
-    $owned = ($have.Count -eq 0) -or (($have -join "`n") -eq ($script:AppliedUrls -join "`n")) -or (($have.Count -eq 1) -and ($have[0] -eq 'about:blank'))
+    # Existing startup URLs are ours only when the ledger records that exact list. A familiar-looking URL is not proof
+    # that BFO created it; when in doubt Apply asks before replacing or removing it.
+    $owned = ($have.Count -eq 0) -or (($script:AppliedUrls.Count -gt 0) -and (($have -join "`n") -eq ($script:AppliedUrls -join "`n")))
     return [pscustomobject]@{ Path = (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs'); Want = $want; Have = $have; Foreign = (-not $owned) }
 }
 
@@ -2456,9 +2433,9 @@ function Get-PolicyConflicts {
 
     foreach ($g in $script:OverrideGroups) {
         if (-not $hit.Contains($g.Id)) { continue }
-        $names = @()
-        foreach ($op in $Plan.Registry) { if (($g.Names -contains $op.Name) -and ($op.Action -in 'Add', 'Change', 'Clear')) { $names += $op.Name } }
-        if (($g.Names -contains 'RestoreOnStartupURLs') -and $Plan.UrlOps.Count -gt 0) { $names += 'RestoreOnStartupURLs' }
+        # The whole choice, not only the values that would change: once it is kept, the values that already match must
+        # stay as well (a kept search engine that lost its "enabled" flag would be half gone).
+        $names = @($g.Names)
         $cur = ''
         $want = $null
         if ($g.Id -eq 'startup') {
@@ -2882,7 +2859,10 @@ function Get-ItemState {
             $has = ($snap -and $snap.Values.ContainsKey($Item.Id))
             if ($Item.Checked) {
                 if (-not $has) { return 'willApply' }
-                if ("$($snap.Values[$Item.Id])" -eq "$($Item.Value)" -and $snap.Kinds[$Item.Id] -eq $(if ($Item.Def.Type -eq 'DWORD') { 'DWord' } else { 'String' })) { return 'active' }
+                if ("$($snap.Values[$Item.Id])" -eq "$($Item.Value)" -and $snap.Kinds[$Item.Id] -eq $(if ($Item.Def.Type -eq 'DWORD') { 'DWord' } else { 'String' })) {
+                    if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'active' }
+                    return 'foreign'
+                }
                 if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'willChange' }
                 # Someone else's value: Apply asks before replacing it (or leaves it, if the preference is to keep such settings).
                 return $(if ($script:ExistingMode -eq 'keep') { 'foreign' } else { 'willReplace' })
@@ -4227,7 +4207,7 @@ $script:ColCheck = 0; $script:ColSetting = 1; $script:ColWhat = 2; $script:ColRi
 $script:ColState = 4; $script:ColPolicy = 5; $script:ColValue = 6
 $script:Grids = @{}
 $script:GridsDirty = @{}
-$script:ShowTechnical = $true
+$script:ShowTechnical = $false
 
 function Get-ItemText {
     param($Item, [ValidateSet('title', 'description')][string]$Part)
@@ -5538,11 +5518,10 @@ function Show-ApplyResult {
     $flow = New-Ctl 'FlowLayoutPanel' @{ Dock = 'Top'; AutoSize = $true; AutoSizeMode = 'GrowAndShrink'; FlowDirection = 'TopDown'; WrapContents = $false; BackColor = $script:Clr.White } $body
     $head = New-Ctl 'Label' @{ AutoSize = $true; Text = $(if ($failed) { T 'result.partial' } else { T 'result.done' }); ForeColor = $(if ($failed) { $script:Clr.Red } else { $script:Clr.Green }) } $flow
     $head.Font = Get-BfoUiFont -Size 12 -Semibold
-    $lines = @((T 'result.counts' @($Result.Added, $Result.Changed, $Result.Cleared, $Result.Kept)))
-    if ($Result.ConflictsReplaced -gt 0) { $lines += (T 'result.replaced' @($Result.ConflictsReplaced)) }
-    if ($Result.ConflictsKept -gt 0)     { $lines += (T 'result.kept' @($Result.ConflictsKept)) }
-    if ($Result.System -gt 0) { $lines += (T 'result.system' @($Result.System)) }
-    if ($BackupFile) { $lines += (T 'result.backup' @($BackupFile)) }
+    $applied = $Result.Added + $Result.Changed + $Result.Cleared + $Result.System
+    $lines = @((T 'result.summary' @($applied)))
+    if ($Result.ConflictsKept -gt 0) { $lines += (T 'result.kept' @($Result.ConflictsKept)) }
+    if ($BackupFile) { $lines += (T 'result.backupShort') }
     $lines += ''
     $lines += (T 'result.restart')
     $txt = New-Ctl 'Label' @{ AutoSize = $true; MaximumSize = (New-Object System.Drawing.Size(490, 0)); ForeColor = $script:Clr.Ink; Text = ($lines -join "`r`n"); Margin = (New-Object System.Windows.Forms.Padding(0, 8, 0, 0)) } $flow
@@ -5840,6 +5819,40 @@ function Update-Chrome {
     Update-ModeInfo
 }
 
+# When the user chooses to keep an existing setting in the Apply conflict dialog, make the main UI match that
+# decision immediately. Otherwise a kept policy would remain ticked and look as if BFO still intended to replace it
+# the next time Apply is pressed.
+function Sync-KeptExistingToUi {
+    param([string[]]$KeepNames)
+    $KeepNames = @($KeepNames | Where-Object { $_ } | Select-Object -Unique)
+    if ($KeepNames.Count -eq 0) { return }
+
+    $changed = $false
+    foreach ($name in $KeepNames) {
+        $item = Get-BfoItem 'Policy' $name
+        if ($item -and $item.Checked) {
+            Set-ItemChecked $item $false
+            $changed = $true
+        }
+    }
+    foreach ($g in $script:OverrideGroups) {
+        if (@($g.Names | Where-Object { $KeepNames -contains $_ }).Count -eq 0) { continue }
+        if ($script:Overrides[$g.Toggle].Enabled) {
+            $script:Overrides[$g.Toggle].Enabled = $false
+            $changed = $true
+        }
+    }
+
+    if ($changed) {
+        $script:ActiveProfile = 'Custom'
+        Push-SuppressSelectionEvents
+        try { Sync-OverrideControls } finally { Pop-SuppressSelectionEvents }
+        Update-AllItemViews
+        Update-Filter
+        Update-Chrome
+    }
+}
+
 function Update-BraveInfo {
     $info = Get-BraveInfo (Get-PrimaryChannel)
     if ($info.Installed) {
@@ -5925,6 +5938,7 @@ function Invoke-ApplyAction {
         }
         if ($keep.Count -gt 0) {
             $keptEntries = @($conflicts | Where-Object { @($_.Names | Where-Object { $keep -contains $_ }).Count -gt 0 }).Count
+            Sync-KeptExistingToUi -KeepNames $keep
             try { $plan = New-ApplyPlan -KeepNames $keep }
             catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); Select-NavPage 'overrides'; return }
             Write-Log ("Kept {0} setting(s) that were set elsewhere." -f $keptEntries) 'INFO'
@@ -6249,7 +6263,11 @@ $form.Add_KeyDown({
     if ($_.KeyCode -eq [System.Windows.Forms.Keys]::F1) { Invoke-Guarded 'Help' { Show-HelpDialog }; $_.Handled = $true }
     elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::F) { $script:TxtFilter.Focus(); $script:TxtFilter.SelectAll(); $_.Handled = $true }
 })
-$form.Add_FormClosing({ Remove-TempShortcuts })
+$form.Add_FormClosing({
+    param($sender, $e)
+    Write-Log ("Main window closing. Reason: {0}" -f $e.CloseReason) 'INFO'
+    Remove-TempShortcuts
+})
 $form.Add_SizeChanged({
     # Copy the keys first: assigning to a hashtable while enumerating its own Keys throws "Collection was modified".
     foreach ($k in @($script:GridsDirty.Keys)) { $script:GridsDirty[$k] = $true }
@@ -6288,5 +6306,7 @@ if ($script:SelfTestMode) {
     Remove-TempShortcuts
     exit $script:SelfTestExit
 }
-[void]$form.ShowDialog()
+# This is the application's main window, not a child dialog. Application.Run owns the message loop and remains stable
+# if WinForms recreates the form handle (notably when live-switching into or out of an RTL language).
+[System.Windows.Forms.Application]::Run($form)
 #endregion

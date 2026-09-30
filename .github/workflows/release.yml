@@ -67,25 +67,10 @@ jobs:
         shell: pwsh
         run: ./tools/Build-Package.ps1
 
-      - name: Pull this version's notes out of CHANGELOG.md
+      # Short page: install lines, a one-paragraph summary, everything else folded away (tools/New-ReleaseNotes.ps1).
+      - name: Build the release notes from CHANGELOG.md
         shell: pwsh
-        run: |
-          $version = '${{ steps.version.outputs.version }}'
-          $text = Get-Content 'CHANGELOG.md' -Raw
-          $pattern = '(?ms)^##\s+\[?v?' + [regex]::Escape($version) + '\]?[^\r\n]*\r?\n(.*?)(?=^##\s|\z)'
-          if ($text -notmatch $pattern) { throw "CHANGELOG.md has no section for $version." }
-          $changes = $Matches[1].Trim()
-          # The release page is what people land on, so it starts with how to install; the changes follow.
-          $intro = @(
-            '## Install',
-            '',
-            '- **One line** (Windows PowerShell): `irm https://xhydra.fr/bfo | iex`',
-            '- **Portable:** download `Brave-Free-Origin.zip` below, extract it and double-click `Brave-Free-Origin.bat`. Its SHA-256 is in `SHA256SUMS.txt`.',
-            '',
-            "## What is new in $version",
-            ''
-          ) -join "`n"
-          ($intro + "`n" + $changes) | Set-Content -Path release-notes.md -Encoding utf8
+        run: ./tools/New-ReleaseNotes.ps1 -Version '${{ steps.version.outputs.version }}' -OutFile release-notes.md
 
       - name: Publish
         if: steps.version.outputs.publish == 'true'
