@@ -14,6 +14,18 @@
 
 </div>
 
+## Install in one step
+
+Open **Windows PowerShell**, paste this line and press Enter:
+
+```powershell
+irm https://xhydra.fr/bfo | iex
+```
+
+That is all. It downloads the latest release, checks it against the SHA-256 that GitHub publishes for that file, asks Windows for permission, and deletes itself when you close the window. Nothing is installed. Prefer a ZIP? See [other ways to install](#install-and-run).
+
+---
+
 Brave Free Origin is a small Windows debloater for the Brave browser. It sets **Brave's official group policies** (the mechanism companies use to manage browsers) from a window you can actually understand. Every row says in plain words what it does, what it risks, and whether it is applied yet. Nothing is written until you press **Apply**, and **Restore stock** puts everything back.
 
 It is a free, local take on the idea behind Brave's paid *Origin* edition, inspired by [MulesGaming/brave-debullshitinator](https://github.com/MulesGaming/brave-debullshitinator).

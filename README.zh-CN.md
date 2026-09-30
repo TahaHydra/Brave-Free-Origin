@@ -14,6 +14,18 @@
 
 </div>
 
+## 一步安装
+
+打开 **Windows PowerShell**，粘贴下面这一行并按回车：
+
+```powershell
+irm https://xhydra.fr/bfo | iex
+```
+
+仅此而已。它会下载最新发行版，对照 GitHub 为该文件发布的 SHA-256 校验和进行核对，向 Windows 申请权限，并在你关闭窗口时自行删除。不会安装任何东西。想用 ZIP？见[其他安装方式](#安装与运行)。
+
+---
+
 Brave Free Origin 是一款针对 Brave 浏览器的小型 Windows 瘦身工具。它让你在一个真正看得懂的窗口里设置 **Brave 官方的组策略**（企业用来管理浏览器的机制）。每一行都用大白话说明它的作用、风险，以及是否已经生效。在你点击**应用**之前不会写入任何内容，而**还原原厂设置**会把一切恢复原样。
 
 它是 Brave 付费 *Origin* 版本背后理念的免费本地版本，灵感来自 [MulesGaming/brave-debullshitinator](https://github.com/MulesGaming/brave-debullshitinator)。
