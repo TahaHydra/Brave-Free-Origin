@@ -38,7 +38,7 @@ irm https://xhydra.fr/bfo | iex
 
 That's the whole install. It downloads the latest release from GitHub, **checks it against the SHA-256 checksum GitHub publishes for that exact file**, unpacks it to a temporary folder, starts the app with a one-process execution-policy bypass (your system policy is never changed), asks Windows for administrator permission, and **deletes everything when you close the window**. Nothing is installed.
 
-Prefer not to trust a shortcut? Read it first: [`install/bfo.ps1`](install/bfo.ps1) is a plain, commented script. To download and verify without running anything, so you can read every file first:
+The one-liner itself runs before anything can be checked, so it trusts the website that serves it; everything it then downloads from GitHub is verified before it runs. Prefer not to trust a shortcut? Read it first: [`install/bfo.ps1`](install/bfo.ps1) is a plain, commented script. To download and verify without running anything, so you can read every file first:
 
 ```powershell
 $env:BFO_NO_LAUNCH = '1'; irm https://xhydra.fr/bfo | iex
@@ -82,19 +82,19 @@ Requirements: Windows 10 or 11 with the built-in Windows PowerShell 5.1, and Bra
 | --- | --- | --- | ---: |
 | **Quick Debloat** | Switches off the six loudest extras: Rewards, Wallet, VPN, Leo AI, News and Talk. Nothing else. | Low | 6 |
 | **Recommended** | Quick Debloat plus telemetry off, Chromium's AI and promo features off, and Brave's protections locked on. Passwords, autofill, sync, updates and session restore are left alone. | Low | 42 |
-| **Origin Mode** | The 16 policies that mirror what Brave's Origin edition removes: no Leo, Rewards, Wallet, VPN, News, Talk, Tor, Wayback Machine, Playlist, Speedreader, Email Aliases or usage analytics, with Shields kept strong. | Low | 16 |
+| **Origin Mode** | The 16 switches Brave's own Origin code manages: no Leo, Rewards, Wallet, VPN, News, Talk, Tor, Wayback Machine, Playlist, Speedreader, Email Aliases, Web Discovery, local AI, usage analytics or PSST, with Shields kept strong. | Low | 16 |
 | **Privacy + Boost** | Origin Mode and Recommended together, plus Memory Saver, Battery Saver, no background running, no Cast, no Live Caption download. | Medium | 54 |
 | **Max Performance** | Privacy + Boost, plus a blank New Tab and home page, a fresh start on every launch (no session restore) and a smaller disk cache. | Medium | 61 |
 | **Max Privacy** | Recommended plus strict privacy: no sign-in, sync or imports, no autofill or password prompts, HTTPS only, site data forgotten when a tab closes, site permissions blocked. Expect signed-out sites and extra clicks. | High | 73 |
 | **Stock / None** | Unticks everything. Press Apply to return to stock Brave. | None | 0 |
 
-Presets only tick boxes. They never touch the updater switches or your search engine / New Tab / startup choices, and you can adjust any row afterwards. The full list of every setting, what it writes and which preset ticks it is in [docs/POLICIES.md](docs/POLICIES.md).
+Presets only tick boxes. They never touch the updater switches or your search engine / New Tab / startup choices, and you can adjust any row afterwards. *Origin Mode* uses the same 16 policies that `browser/brave_origin/brave_origin_service_factory.cc` lists in brave-core 1.96.59; being policy-only, it cannot remove the code of those features the way Brave's separate paid Origin build does. The full list of every setting, what it writes and which preset ticks it is in [docs/POLICIES.md](docs/POLICIES.md).
 
 ---
 
 ## Undo everything
 
-- **Restore stock...** (bottom bar) removes the policies this tool wrote, clears its block from the hosts file, and turns any updater task or service it disabled back on. Policies that someone else set (your organization, another tool) are kept unless you choose to remove them too.
+- **Restore stock...** (bottom bar) removes the policy values this tool could have written, clears its block from the hosts file, and turns any updater task or service it disabled back on. Values that someone else set (your organization, another tool) are left alone: a policy holding a value this tool would never write shows **Set elsewhere**, and Apply and Restore stock only replace it if you tick that row or ask to remove everything. One limit: a value identical to one this tool writes cannot be told apart from its own.
 - Or pick **Stock / None** and press **Apply**.
 - While **Back up first** is ticked (it is by default), a backup of your policy key is saved before every Apply in `Documents\Brave-Free-Origin-Backups\`; double-click a `.reg` file there to restore that state. **Tools > Open backups folder** takes you there.
 - Uninstalling is just deleting the folder: the app installs nothing and adds no scheduled task or startup entry.

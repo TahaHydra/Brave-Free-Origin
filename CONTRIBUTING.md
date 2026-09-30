@@ -53,7 +53,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Brave-Free-Origin.ps1 -Lan
 
 ## Changing the catalog (adding or editing a setting)
 
-1. Confirm the policy exists in the Brave you target: open `brave://policy`, tick *Show policies with no value set*, or read the definitions in [brave-core](https://github.com/brave/brave-core/tree/master/components/policy/resources/templates/policy_definitions/BraveSoftware) and Chromium's `policy_definitions`. Check the meaning of every allowed value; Brave's naming is inconsistent (`*Disabled` is switched off by `1`, `*Enabled` by `0`).
+1. Confirm the policy exists in the Brave you target: run `tools\Export-BravePolicyNames.ps1 -Check` (compares the catalog with your installed Brave's policy table), open `brave://policy`, tick *Show policies with no value set*, or read the definitions in [brave-core](https://github.com/brave/brave-core/tree/master/components/policy/resources/templates/policy_definitions/BraveSoftware) and Chromium's `policy_definitions`. Check the meaning of every allowed value; Brave's naming is inconsistent (`*Disabled` is switched off by `1`, `*Enabled` by `0`).
 2. Add one line to `$script:PolicyTable`: `Page|Name|Type|Value|Kind|Risk|Lock|Presets`. `Kind` is `Off` (turns a feature off), `On` (keeps a protection on) or `Set`; `Lock` is `1` when Brave already behaves this way by default; the last field lists the presets that tick it (`Q` Quick Debloat, `O` Origin, `R` Recommended, `B` Privacy + Boost, `X` Max Performance, `P` Max Privacy).
 3. Add `policy.<Name>.title` (an imperative that says what happens) and `policy.<Name>.description` (what actually changes, including side effects) to the English catalog. If you cannot say it in one or two plain sentences, the row is not ready.
 4. Regenerate the generated files and run the tests:
@@ -61,6 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Brave-Free-Origin.ps1 -Lan
    ```powershell
    .\tools\Export-EnglishLocale.ps1   # locales/en-US.json
    .\tools\Export-PolicyDocs.ps1      # docs/POLICIES.md
+   .\tools\Export-BravePolicyNames.ps1  # tools/data/brave-policy-names.txt, only when you moved to a newer Brave
    powershell -NoProfile -ExecutionPolicy Bypass -File .\Brave-Free-Origin.ps1 -SelfTest .\tools\Test-App.ps1
    ```
 
@@ -74,5 +75,5 @@ Small, focused PRs are easiest. The checklist in the PR template is short. CI (`
 ## Releasing (maintainers)
 
 1. Bump `$script:AppVersion`, update `CHANGELOG.md` (the release notes are taken from its `## [x.y]` section), regenerate the generated files, run the tests.
-2. Tag and push: `git tag v1.13 && git push origin v1.13`. The **Release** workflow checks the tag against the app version, builds `Brave-Free-Origin.zip` and `SHA256SUMS.txt` with `tools\Build-Package.ps1`, and publishes the release. The asset name must stay `Brave-Free-Origin.zip`: the one-line installer downloads exactly that file and verifies it against the checksum GitHub records.
+2. Tag and push: `git tag v1.13 && git push origin v1.13`. The **Release** workflow first runs the whole CI workflow, then checks the tag against the app version, builds `Brave-Free-Origin.zip` and `SHA256SUMS.txt` with `tools\Build-Package.ps1`, and publishes the release. The asset name must stay `Brave-Free-Origin.zip`: the one-line installer downloads exactly that file and verifies it against the checksum GitHub records.
 3. The installer script is served from `install/bfo.ps1`; see [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md) for hosting notes.

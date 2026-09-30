@@ -15,7 +15,7 @@ Only the **latest release** receives fixes. The app tells you when your Brave is
 | Updater | Brave's own scheduled tasks and services (`BraveSoftwareUpdateTask*`, `brave`, `bravem`) | Only from the Updater page, and Restore stock |
 | Files | Backups in `Documents\Brave-Free-Origin-Backups`, settings and logs in `%LOCALAPPDATA%\Brave-Free-Origin`, and, only from the expert Scriptlets page, `list.txt` files inside Brave's own component folders (with `.bfo-backup` copies) | As described |
 
-It never modifies Brave's program files, never patches binaries, installs no service, adds no scheduled task or startup entry of its own, and the app itself makes no network requests. Translations are inert JSON: they can replace UI text and nothing else (no registry path, policy name, domain or URL can come from a locale file).
+Values that someone else put in the same policy key are not removed unless they are ones this tool could have written (same name, same kind of data, a value from its own list); a value identical to one it writes cannot be told apart from its own. It never modifies Brave's program files, never patches binaries, installs no service, adds no scheduled task or startup entry of its own, and the app itself makes no network requests. Translations are inert JSON: they can replace UI text and nothing else (no registry path, policy name, domain or URL can come from a locale file).
 
 ## The one-line installer: what you are trusting
 

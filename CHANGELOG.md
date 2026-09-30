@@ -35,8 +35,11 @@ A ground-up rework of the interface and of the policy catalog. The goal: **you s
 
 ### Safer changes to your system
 - **Hosts file:** the blocklist groups were rebuilt from real Brave traffic (wrong and harmful entries such as the component-updater servers are never pre-ticked). Editing preserves your own entries byte for byte, whatever the file's encoding or line endings, handles read-only and UTF-16 files, and backs up first.
+- **Config import:** importing a config can only tick updater rows ("disable this"); it never unticks one, so it cannot re-enable an updater you turned off. Exports list only ticked updater rows.
+- **Hosts markers:** the block is edited only when its START / END markers pair up; a damaged block is reported and the file is left untouched. The read-only flag is put back even when a write fails.
+- **Scriptlets:** filter-list files are split on LF, CRLF and CR alike and written back with their own line endings.
 - **Updater switches:** scheduled tasks and services are now found by pattern (Brave names them with a GUID and your account's SID, so exact names never matched), only rows you changed produce operations, and turning updates off asks first. Restore stock turns everything back on.
-- **One policy key.** Brave reads a single policy key for Stable, Beta, Nightly and Dev, so the channel selector is gone (the old per-channel keys were inert). **Restore stock** still cleans them up, and it removes only what this tool manages: policies someone else set are kept unless you explicitly choose to remove them too.
+- **One policy key.** Brave reads a single policy key for Stable, Beta, Nightly and Dev, so the channel selector is gone (the old per-channel keys were inert). **Restore stock** still cleans them up. Apply and Restore stock remove only values this tool could have written (same name, same kind of data, a value from its own list); a known policy holding some other value is shown as **Set elsewhere**, reported by Verify and left alone unless you tick the row or choose to remove everything.
 - **Opening `brave://policy` works.** Brave is now started un-elevated through Explorer (Chromium 138+ refuses or mis-handles an elevated launch); if that ever fails the address is copied to the clipboard.
 
 ### Errors are explained, not hidden
@@ -50,6 +53,8 @@ A ground-up rework of the interface and of the policy catalog. The goal: **you s
 ### For contributors
 - `tools\Test-App.ps1`: about 50 sandboxed tests (policies go to a throw-away HKCU hive, the hosts file is a temp file, tasks and services are fakes, no UAC): catalog integrity, preset invariants, apply / verify / restore, hosts encodings, updater matching, window layout, every language switch.
 - `tools\Test-Bootstrap.ps1`: 16 tests of the one-line installer against a fake GitHub on loopback.
+- `tools\Export-BravePolicyNames.ps1` reads the policy table out of an installed Brave's `chrome.dll`: `-Check` compares the catalog with that Brave, and the snapshot in `tools\data` lets the tests fail when the catalog offers a policy Brave does not know.
+- The release workflow now runs the whole CI workflow before it publishes, and can be started by hand as a dry run.
 - `docs\POLICIES.md` is generated from the catalog by `tools\Export-PolicyDocs.ps1` (CI fails if it drifts). `tools\Build-Package.ps1` builds the zip and its SHA-256; a release workflow publishes it when you push a `v*` tag.
 - Configs exported by v1.5 to v1.12 still import; exports are now schema 3.
 - `README.md` is shorter; the version-by-version notes live here.

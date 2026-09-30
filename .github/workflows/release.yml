@@ -1,10 +1,13 @@
 name: Release
 
-# Push a tag such as v1.13 and this builds the portable zip, checks that the tag
-# matches the version inside the app, and publishes the release with the zip
-# and its SHA-256 sums. The one-line installer (install\bfo.ps1) downloads
-# Brave-Free-Origin.zip from the latest release and verifies it against the
-# checksum GitHub records for that exact file, so the asset name must not change.
+# Push a tag such as v1.13 and this runs the full CI (the same workflow that runs on pull requests, so the two can
+# never drift apart), builds the portable zip, checks that the tag matches the version inside the app, and publishes
+# the release with the zip and its SHA-256 sums. The one-line installer (install\bfo.ps1) downloads
+# Brave-Free-Origin.zip from the latest release and verifies it against the checksum GitHub records for that exact
+# file, so the asset name must not change.
+#
+# Dry run: start this workflow by hand (Actions > Release > Run workflow) with the tag left empty, or with "dry run"
+# ticked. Everything runs except the final publish step.
 
 on:
   push:
@@ -12,14 +15,24 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)publish, for example v1.13'
-        required: true
+        description: 'Existing tag to (re)publish, for example v1.13. Leave empty for a dry run of the selected branch.'
+        required: false
+      dry_run:
+        description: 'Run every check and build the zip, but do not publish'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 jobs:
+  checks:
+    name: CI checks
+    uses: ./.github/workflows/ci.yml
+
   release:
+    name: Build and publish
+    needs: checks
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -31,26 +44,24 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $tag = if ('${{ github.event.inputs.tag }}') { '${{ github.event.inputs.tag }}' } else { '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v(\d+\.\d+(\.\d+)?)$') { throw "Tag '$tag' is not like v1.13." }
-          $wanted = $Matches[1]
           $source = Get-Content 'Brave-Free-Origin.ps1' -Raw
           if ($source -notmatch "AppVersion\s*=\s*'([^']+)'") { throw 'AppVersion not found in Brave-Free-Origin.ps1.' }
-          if ($Matches[1] -ne $wanted) { throw "Tag says $wanted but the app says $($Matches[1]). Fix one of them and tag again." }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$wanted" >> $env:GITHUB_OUTPUT
+          $appVersion = $Matches[1]
 
-      - name: Self-test the app before publishing
-        shell: powershell
-        env:
-          BFO_TEST_OUT: ${{ runner.temp }}\bfo-selftest
-        run: |
-          $settings = Join-Path $env:RUNNER_TEMP 'bfo-settings\settings.json'
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Brave-Free-Origin.ps1 `
-            -Lang en-US -BfoSettingsPath $settings -SelfTest .\tools\Test-App.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\tools\Test-Locales.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tag = '${{ github.event.inputs.tag }}'
+          if (-not $tag -and '${{ github.ref_type }}' -eq 'tag') { $tag = '${{ github.ref_name }}' }
+          $dryRun = ('${{ github.event.inputs.dry_run }}' -eq 'true') -or (-not $tag)
+
+          if ($tag) {
+            if ($tag -notmatch '^v(\d+\.\d+(\.\d+)?)$') { throw "Tag '$tag' is not like v1.13." }
+            if ($Matches[1] -ne $appVersion) { throw "Tag says $($Matches[1]) but the app says $appVersion. Fix one of them and tag again." }
+          } else {
+            $tag = "v$appVersion"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$appVersion" >> $env:GITHUB_OUTPUT
+          "publish=$((-not $dryRun).ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "Release $tag (app version $appVersion); publish: $(-not $dryRun)"
 
       - name: Build the zip
         shell: pwsh
@@ -66,6 +77,7 @@ jobs:
           $Matches[1].Trim() | Set-Content -Path release-notes.md -Encoding utf8
 
       - name: Publish
+        if: steps.version.outputs.publish == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,3 +91,8 @@ jobs:
             gh release create $tag Brave-Free-Origin.zip SHA256SUMS.txt --title "Brave Free Origin $tag" --notes-file release-notes.md --verify-tag
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Dry run finished
+        if: steps.version.outputs.publish != 'true'
+        shell: pwsh
+        run: 'Write-Host "Dry run: everything passed; nothing was published."'
