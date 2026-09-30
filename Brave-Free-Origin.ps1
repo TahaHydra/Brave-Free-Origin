@@ -2433,9 +2433,9 @@ function Get-PolicyConflicts {
 
     foreach ($g in $script:OverrideGroups) {
         if (-not $hit.Contains($g.Id)) { continue }
-        $names = @()
-        foreach ($op in $Plan.Registry) { if (($g.Names -contains $op.Name) -and ($op.Action -in 'Add', 'Change', 'Clear')) { $names += $op.Name } }
-        if (($g.Names -contains 'RestoreOnStartupURLs') -and $Plan.UrlOps.Count -gt 0) { $names += 'RestoreOnStartupURLs' }
+        # The whole choice, not only the values that would change: once it is kept, the values that already match must
+        # stay as well (a kept search engine that lost its "enabled" flag would be half gone).
+        $names = @($g.Names)
         $cur = ''
         $want = $null
         if ($g.Id -eq 'startup') {

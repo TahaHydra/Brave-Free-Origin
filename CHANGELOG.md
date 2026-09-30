@@ -10,7 +10,7 @@ Fixes for 2.0: switching language while the app is open no longer closes the win
 
 ### Fixed
 - **Switching language live** (most visibly to or from Arabic, which mirrors the whole window) could close the main window. The window now runs on the normal application loop, which survives that change.
-- **Keeping a setting really keeps it.** Choosing *Keep all existing* (or unticking a row) in the question before Apply now also unticks that setting in the main window, so the window shows what will happen and you are not asked again next time.
+- **Keeping a setting really keeps it.** Choosing *Keep all existing* (or unticking a row) in the question before Apply now also unticks that setting in the main window, so the window shows what will happen and you are not asked again next time. A kept search engine, New Tab page or startup choice stays whole.
 - A policy that already holds the value BFO would write, but that BFO never recorded writing, now shows **Set elsewhere** instead of **Active**.
 
 ### Changed

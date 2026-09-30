@@ -689,6 +689,7 @@ Test-Case 'existing settings: untick one to keep just that one; replace does the
     Assert ($null -eq (Get-PolicyNow 'NewTabPageLocation')) 'the ticked New Tab page was not removed'
     Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://company.example/search?q={searchTerms}' -and (Get-PolicyNow 'DefaultSearchProviderName') -eq 'Company Search') 'the unticked search engine was touched'
     Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderKeyword')) 'the unticked search engine got new values'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderEnabled') -eq 1) 'the kept search engine lost its Enabled flag: it must stay whole'
     $r = $script:SelfTestLastResult
     Assert ($r -and $r.ConflictsReplaced -eq 2 -and $r.ConflictsKept -eq 1) "replaced/kept = $($r.ConflictsReplaced)/$($r.ConflictsKept)"
     Assert ($r.Failures.Count -eq 0) 'apply reported failures'
@@ -785,6 +786,11 @@ Test-Case 'existing settings: the preference (ask / always replace / always keep
     Invoke-ApplyAction
     Assert ($script:SelfTestExistingDialogs.Count -eq 0) '"always keep" must not ask'
     Assert ((Get-PolicyNow 'BrowserSignin') -eq 1 -and (Get-PolicyNow 'NewTabPageLocation') -eq 'https://intranet.example') '"always keep" changed something'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderEnabled') -eq 1 -and (Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://company.example/search?q={searchTerms}') '"always keep" broke the search engine it kept'
+    Assert ((-not (Get-BfoItem 'Policy' 'BrowserSignin').Checked) -and (-not $script:Overrides.Search.Enabled)) 'keeping should untick the kept settings in the main window'
+    # the window now matches what was kept; tick the settings again to try "always replace"
+    Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
+    $script:Overrides.Search.Enabled = $true
     Set-ExistingMode 'replace'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willReplace') '"always replace" shows Will replace'
     Invoke-ApplyAction
@@ -956,6 +962,8 @@ Test-Case 'window: row status follows the registry (Active / Will apply / Will c
     Set-ItemChoice (Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled') 'disable'   # registry has our other choice -> change
     Set-ItemChecked (Get-BfoItem 'Policy' 'BraveVPNDisabled') $true          # not in registry -> apply
     Set-ItemChecked (Get-BfoItem 'Policy' 'BraveNewsDisabled') $false        # in registry, unticked -> remove
+    # BFO only counts a value as its own when it recorded writing it
+    foreach ($n in 'BraveRewardsDisabled', 'HardwareAccelerationModeEnabled', 'BraveNewsDisabled') { $script:AppliedLedger[$n] = "$((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values[$n])" }
     Update-AllItemViews
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveRewardsDisabled')) -eq 'active') 'active'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveWalletDisabled')) -eq 'willReplace') 'willReplace'
