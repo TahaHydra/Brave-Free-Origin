@@ -2284,6 +2284,7 @@ function Test-OwnedPolicyValue {
     param([string]$Name, $Value, [string]$Kind, $Siblings = $null)
     if ($script:LegacyPolicyNames -contains $Name) { return $true }
     $text = "$Value"
+    if ($script:LegacyPolicyValues.ContainsKey($Name) -and @($script:LegacyPolicyValues[$Name] | Where-Object { "$_" -eq $text }).Count -gt 0) { return $true }
     return ($script:AppliedLedger.ContainsKey($Name) -and $script:AppliedLedger[$Name] -eq $text)
 }
 
