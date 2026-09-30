@@ -5945,6 +5945,26 @@ function Invoke-VerifyAction {
     Show-TextReport -Title (T 'report.verifyTitle') -Text (New-VerifyReport) -DefaultFileName ("brave-free-origin-verify-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
 
+# Settings whose selected value can delete user data or saved browser customization. Clearing these policies is safe,
+# so the extra warning is shown only when Apply would add or change one of the destructive values.
+$script:DataRiskPolicyNames = @('DefaultBraveRemember1PStorageSetting', 'NTPCustomBackgroundEnabled')
+
+function Get-DataRiskOps {
+    param($Plan)
+    return @($Plan.Registry | Where-Object { ($script:DataRiskPolicyNames -contains $_.Name) -and ($_.Action -in 'Add', 'Change') })
+}
+
+function Get-DataRiskText {
+    param($Ops)
+    $lines = @()
+    foreach ($op in @($Ops)) {
+        $item = Get-BfoItem 'Policy' $op.Name
+        $title = if ($item) { Get-ItemText $item 'title' } else { $op.Name }
+        $lines += ('- ' + $title)
+    }
+    return ($lines -join "`r`n")
+}
+
 function Invoke-ApplyAction {
     try { $plan = New-ApplyPlan }
     catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); Select-NavPage 'overrides'; return }
@@ -5957,8 +5977,8 @@ function Invoke-ApplyAction {
     # Values somebody else set (by hand, another tool, the organization) are replaced only with the user's say-so.
     $conflicts = @(Get-PolicyConflicts $plan)
     $keptEntries = 0
+    $keep = @()
     if ($conflicts.Count -gt 0) {
-        $keep = @()
         if ($script:ExistingMode -eq 'keep') {
             $keep = @($conflicts | ForEach-Object { $_.Names })
         } elseif ($script:ExistingMode -eq 'ask') {
@@ -5979,6 +5999,32 @@ function Invoke-ApplyAction {
             }
         }
     }
+    # Warn separately before settings that can erase site data or saved browser customization.
+    $dataRisk = @(Get-DataRiskOps $plan)
+    if ($dataRisk.Count -gt 0) {
+        $ans = Show-Message -Text (T 'msg.dataRisk.body' @((Get-DataRiskText $dataRisk))) -Title (T 'msg.title.dataRisk') -Buttons 'YesNoCancel' -Icon 'Warning' -Default 'Button2'
+        if ($ans -eq 'Cancel') { Write-Log 'Apply cancelled at the data-loss warning.' 'INFO'; return }
+        if ($ans -eq 'No') {
+            $riskNames = @($dataRisk | ForEach-Object { $_.Name } | Select-Object -Unique)
+            foreach ($name in $riskNames) {
+                $item = Get-BfoItem 'Policy' $name
+                if ($item) { Set-ItemChecked $item $false }
+            }
+            $script:ActiveProfile = 'Custom'
+            $keep = @($keep + $riskNames | Select-Object -Unique)
+            Update-AllItemViews
+            Update-Filter
+            Update-Chrome
+            try { $plan = New-ApplyPlan -KeepNames $keep }
+            catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); return }
+            Write-Log ("Skipped data-risk setting(s): {0}" -f ($riskNames -join ', ')) 'INFO'
+            if (-not (Test-PlanHasChanges $plan)) {
+                [void](Show-Message -Text (T 'msg.dataRisk.onlySkipped') -Title (T 'msg.title.dataRisk'))
+                return
+            }
+        }
+    }
+
     if (@($plan.System | Where-Object { $_.Action -eq 'Disable' }).Count -gt 0) {
         $ans = Show-Message -Text (T 'msg.updater.confirm') -Title (T 'msg.title.updater') -Buttons 'YesNo' -Icon 'Warning' -Default 'Button2'
         if ($ans -ne 'Yes') { return }
