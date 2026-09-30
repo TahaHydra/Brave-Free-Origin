@@ -40,7 +40,7 @@ param(
 #region Bootstrap -------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
 
-$script:AppVersion       = '2.0.1'
+$script:AppVersion       = '2.0.2'
 $script:CatalogBrave     = '154.1.96.59'   # Brave build the policy catalog was verified against
 $script:CatalogBraveMajor = 154
 $script:CatalogDate      = '2026-09-29'
@@ -757,12 +757,12 @@ Add-Strings @{
     'state.willReplace' = 'Will replace'
     'state.willUnblock' = 'Will unblock'
     'tip.domains'      = 'Domains: {0}'
-    'tip.foreign'      = 'Something else (your organization, another tool) set a different value for this policy. Apply leaves it alone unless you tick this row.'
+    'tip.foreign'      = 'This policy already exists, but BFO did not record writing it. It stays untouched until you deliberately change this row; Apply asks before replacing or removing it.'
     'tip.hosts'        = 'Ticked groups are added to the Windows hosts file when you press Apply hosts blocks on this page. Unticked groups are removed.'
     'tip.lock'         = 'Brave already behaves this way by default. Ticking only makes it mandatory, so nothing can change it later.'
     'tip.pattern'      = 'Task name pattern: {0}'
     'tip.policy'       = 'Policy: {0} = {1}  ({2})'
-    'tip.replace'      = 'Something else (your organization, another tool) set a different value for this policy. Apply shows it to you first and replaces it only if you agree.'
+    'tip.replace'      = 'This existing policy is different from your selection. Apply shows it to you first and changes it only if you agree.'
     'tip.risk'         = 'Risk: {0}'
     'tip.service'      = 'Windows service: {0}'
     'tip.status'       = 'Active: already applied. Will apply / change / remove: waiting for you to press Apply. Not set: Brave decides.'
@@ -926,6 +926,9 @@ Add-Strings @{
     'existing.remove'        = '(remove it)'
     'existing.replace'       = 'Apply selected changes'
     'existing.title'         = 'Review existing settings'
+    'msg.dataRisk.body'       = "Some selected settings can delete browser data or saved customization:\r\n\r\n{0}\r\n\r\nThis can sign you out of websites or permanently remove saved browser customization.\r\n\r\nYes = apply them. No = unselect these risky settings and continue with everything else. Cancel = stop."
+    'msg.dataRisk.onlySkipped'= 'Those data-risk settings were unselected. There is nothing else to apply.'
+    'msg.title.dataRisk'      = 'Possible data loss'
 }
 
 
