@@ -55,10 +55,11 @@ function Reset-Sandbox {
     $script:Snapshot = $null
     $script:FakeTasks = @(); $script:FakeServices = @(); $script:TaskCache = $null
     $script:HostsCurrent = @()
-    foreach ($i in $script:Items) { Set-ItemChecked $i $false; $i.Loaded = $false; $i.Baseline = $null; $i.Detail = $null }
+    foreach ($i in $script:Items) { Set-ItemChecked $i $false; $i.Loaded = $false; $i.Baseline = $null; $i.BaselineValue = $null; $i.Detail = $null }
     $script:Overrides.Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
     $script:Overrides.Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
     $script:Overrides.Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
+    Save-OverrideBaseline
     $script:ActiveProfile = 'Custom'
     $script:SelfTestDialogs = @(); $script:SelfTestReports = @()
     $script:SelfTestAnswers.Clear()
@@ -305,6 +306,98 @@ Test-Case 'registry: a known policy that someone else set to a different value i
     $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BatterySaverModeAvailability')) -eq 'willRemove') 'the v1.12 Battery Saver value should count as ours'
 }
+Test-Case 'registry: unticking a matching policy loaded from the PC requests removal and asks before touching an unowned value' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveVPNDisabled' -Value 1 -PropertyType DWord | Out-Null
+    $script:ChkBackup.Checked = $false
+    Invoke-LoadCurrentState
+    $vpn = Get-BfoItem 'Policy' 'BraveVPNDisabled'
+    Assert ($vpn.Checked -and $vpn.Baseline) 'the existing matching VPN policy should load as ticked'
+    Assert ((Get-ItemState $vpn) -eq 'foreign') 'an unrecorded matching value should show Set elsewhere before the user changes it'
+    Set-ItemChecked $vpn $false
+    $plan = New-ApplyPlan
+    $op = @($plan.Registry | Where-Object { $_.Name -eq 'BraveVPNDisabled' })[0]
+    Assert ($op -and $op.Action -eq 'Clear' -and $op.Foreign) 'unticking the loaded external VPN policy must plan a foreign Clear'
+    Assert ((Get-ItemState $vpn) -eq 'willRemove') 'the row should show Will remove after the user unticks it'
+    $conflicts = @(Get-PolicyConflicts $plan)
+    Assert (($conflicts.Count -eq 1) -and ($conflicts[0].Key -eq 'BraveVPNDisabled') -and ($null -eq $conflicts[0].Wants)) 'the removal must appear in the review dialog'
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert (((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['BraveVPNDisabled']) -eq 1) 'Keep removed the existing VPN policy'
+    Assert ($vpn.Checked) 'Keep should restore the checkbox to the loaded current state'
+    Set-ItemChecked $vpn $false
+    $script:SelfTestExistingAnswers.Enqueue('Replace')
+    Invoke-ApplyAction
+    Assert ($null -eq ((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['BraveVPNDisabled'])) 'Apply selected changes did not remove the policy'
+}
+
+Test-Case 'data risk: destructive policies warn, No unselects them, Yes applies them, and clearing them does not warn' {
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    $storage = Get-BfoItem 'Policy' 'DefaultBraveRemember1PStorageSetting'
+    Set-ItemChecked $storage $true
+    $plan = New-ApplyPlan
+    Assert (@(Get-DataRiskOps $plan).Count -eq 1) 'site-data deletion policy was not classified as data risk'
+    $script:SelfTestAnswers.Enqueue('No')
+    Invoke-ApplyAction
+    Assert ($null -eq ((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['DefaultBraveRemember1PStorageSetting'])) 'answering No still applied the site-data deletion policy'
+    Assert (-not $storage.Checked) 'answering No should unselect the risky row'
+    Assert (@($script:SelfTestDialogs | Where-Object { $_[0] -eq (T 'msg.title.dataRisk') }).Count -ge 1) 'the data-loss warning was not shown'
+
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    $storage = Get-BfoItem 'Policy' 'DefaultBraveRemember1PStorageSetting'
+    Set-ItemChecked $storage $true
+    $script:SelfTestAnswers.Enqueue('Yes')
+    Invoke-ApplyAction
+    Assert (((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['DefaultBraveRemember1PStorageSetting']) -eq 2) 'answering Yes did not apply the selected risky policy'
+    Set-ItemChecked $storage $false
+    Assert (@(Get-DataRiskOps (New-ApplyPlan)).Count -eq 0) 'removing a destructive policy should not itself trigger a data-loss warning'
+
+    Reset-Sandbox
+    Set-ItemChecked (Get-BfoItem 'Policy' 'NTPCustomBackgroundEnabled') $true
+    Assert (@(Get-DataRiskOps (New-ApplyPlan)).Count -eq 1) 'permanent New Tab background removal should be classified as data risk'
+}
+
+Test-Case 'registry: keeping a changed choice restores the value loaded from the PC' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'HardwareAccelerationModeEnabled' -Value 0 -PropertyType DWord | Out-Null
+    $script:ChkBackup.Checked = $false
+    Invoke-LoadCurrentState
+    $gpu = Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled'
+    Assert ($gpu.Checked -and $gpu.Baseline -and $gpu.BaselineValue -eq 0) 'the loaded GPU choice baseline is wrong'
+    Set-ItemChoice $gpu 'enable'
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert (((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['HardwareAccelerationModeEnabled']) -eq 0) 'Keep changed the existing GPU policy'
+    Assert ($gpu.Checked -and $gpu.Value -eq 0) 'Keep did not restore the loaded GPU choice in the UI'
+}
+
+Test-Case 'overrides: incomplete external search values are not silently cleared, but disabling a loaded complete override is a reviewed removal' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderName' -Value 'Company Search' -PropertyType String | Out-Null
+    Invoke-LoadCurrentState
+    $plan = New-ApplyPlan
+    $op = @($plan.Registry | Where-Object { $_.Name -eq 'DefaultSearchProviderName' })[0]
+    Assert ($op -and $op.Action -eq 'Leave') 'an incomplete external search policy should be left alone on load'
+    Assert (-not (Test-PlanHasChanges $plan)) 'loading an incomplete external override must not create a pending removal'
+
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderEnabled' -Value 1 -PropertyType DWord | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderName' -Value 'Company Search' -PropertyType String | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderSearchURL' -Value 'https://company.example/?q={searchTerms}' -PropertyType String | Out-Null
+    Invoke-LoadCurrentState
+    Assert ($script:Overrides.Search.Enabled -and $script:OverrideBaseline.Search.Enabled) 'the complete search override should load as enabled'
+    $script:Overrides.Search.Enabled = $false
+    $plan = New-ApplyPlan
+    $c = @(Get-PolicyConflicts $plan)
+    Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'search')) 'disabling the loaded search override should be reviewed as one removal'
+}
+
 Test-Case 'config: importing never re-enables an updater the user disabled, and export lists only ticked updater rows' {
     Reset-Sandbox
     $uaName = 'BraveSoftwareUpdateTaskUserS-1-12-1-1-2-3-4UA{22222222-2222-2222-2222-222222222222}'
@@ -624,10 +717,15 @@ function Set-ExistingScenario {
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderName' -Value 'Company Search' -PropertyType String | Out-Null
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderSearchURL' -Value 'https://company.example/search?q={searchTerms}' -PropertyType String | Out-Null
     New-ItemProperty -LiteralPath $key -Name 'NewTabPageLocation' -Value 'https://intranet.example' -PropertyType String | Out-Null
-    $script:Snapshot = Read-PolicySnapshot -Path $key
-    Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
-    $script:Overrides.Search.Enabled = $true          # the Brave engine
     $script:ChkBackup.Checked = $false
+    Invoke-LoadCurrentState
+    # Now simulate real user choices after the current state and baselines were loaded.
+    Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
+    $script:Overrides.Search.Enabled = $true
+    $script:Overrides.Search.EngineId = 'brave'
+    $script:Overrides.Search.CustomUrl = ''
+    $script:Overrides.Ntp.Enabled = $false
+    $script:ActiveProfile = 'Custom'
     $script:SelfTestLastResult = $null
 }
 function Get-PolicyNow { param([string]$Name) return (Read-PolicySnapshot -Path $script:PolicyKeyPath).Values[$Name] }
@@ -677,8 +775,9 @@ Test-Case 'existing settings: Cancel changes nothing; Keep changes nothing and s
     Assert (@($script:SelfTestDialogs | Where-Object { $_[1] -eq (T 'msg.apply.allKept') }).Count -ge 1) 'Keep did not say that nothing was changed'
     Assert ($null -eq $script:SelfTestLastResult) 'nothing was applied, so there is no result'
     Assert ($script:ExistingMode -eq 'ask') 'a single Keep must not become a standing preference'
-    Assert (-not (Get-BfoItem 'Policy' 'BrowserSignin').Checked) 'keeping BrowserSignin should untick it in the main UI'
-    Assert (-not $script:Overrides.Search.Enabled) 'keeping the existing search engine should turn off BFO''s search override'
+    Assert (-not (Get-BfoItem 'Policy' 'BrowserSignin').Checked) 'keeping BrowserSignin should restore its loaded unticked state'
+    Assert ($script:Overrides.Search.Enabled -and $script:Overrides.Search.EngineId -eq 'custom') 'keeping the existing search engine should restore the loaded engine'
+    Assert ($script:Overrides.Ntp.Enabled -and $script:Overrides.Ntp.DestinationId -eq 'custom') 'keeping the existing New Tab page should restore the loaded override'
     Assert ($script:ActiveProfile -eq 'Custom') 'keeping existing settings should make the visible selection Custom'
 }
 Test-Case 'existing settings: untick one to keep just that one; replace does the rest and reports both' {
@@ -731,12 +830,15 @@ Test-Case 'existing settings: a custom search address typed in this app is ours 
     Invoke-ApplyAction
     Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderSearchURL')) 'unticking should remove our own custom engine'
     Assert ($script:SelfTestExistingDialogs.Count -eq 0) 'removing our own custom engine should not ask'
-    # somebody else's engine at the same place is asked about
+    # somebody else's complete engine is loaded, then the user explicitly turns that override off
     New-Item -Path $script:PolicyKeyPath -Force | Out-Null
-    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderSearchURL' -Value 'https://elsewhere.example/?q={searchTerms}' -PropertyType String | Out-Null
-    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderEnabled' -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderName' -Value 'Elsewhere Search' -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderSearchURL' -Value 'https://elsewhere.example/?q={searchTerms}' -PropertyType String -Force | Out-Null
+    Invoke-LoadCurrentState
+    $script:Overrides.Search.Enabled = $false
     $c = @(Get-PolicyConflicts (New-ApplyPlan))
-    Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'search') -and ($null -eq $c[0].Wants)) 'an engine set elsewhere should be listed as a removal'
+    Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'search') -and ($null -eq $c[0].Wants)) 'an explicitly disabled engine set elsewhere should be listed as a removal'
 }
 Test-Case 'existing settings: a pre-2.0 search engine with no ledger is treated as existing state and asked about once' {
     Reset-Sandbox
@@ -747,14 +849,16 @@ Test-Case 'existing settings: a pre-2.0 search engine with no ledger is treated 
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderName' -Value 'Custom Search' -PropertyType String | Out-Null
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderKeyword' -Value 'custom' -PropertyType String | Out-Null
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderSearchURL' -Value 'https://my-searx.example/search?q={searchTerms}' -PropertyType String | Out-Null
-    $script:Snapshot = Read-PolicySnapshot -Path $key
+    Invoke-LoadCurrentState
+    $script:Overrides.Search.Enabled = $false
     $conflicts = @(Get-PolicyConflicts (New-ApplyPlan))
-    Assert (($conflicts.Count -eq 1) -and ($conflicts[0].Key -eq 'search')) 'an unrecorded existing search engine should be asked about'
+    Assert (($conflicts.Count -eq 1) -and ($conflicts[0].Key -eq 'search')) 'an explicitly disabled unrecorded search engine should be asked about'
     Assert (@(@((Get-ForeignPolicyValues).Values) | Where-Object { $_ -like 'DefaultSearchProvider*' }).Count -gt 0) 'the unrecorded search engine should be treated as external state'
     $script:SelfTestExistingAnswers.Enqueue('Keep')
     Invoke-ApplyAction
     Assert ($script:SelfTestExistingDialogs.Count -eq 1) 'the existing search engine was not shown to the user'
     Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://my-searx.example/search?q={searchTerms}') 'Keep changed the existing search engine'
+    Assert ($script:Overrides.Search.Enabled) 'Keep should restore the loaded search override in the UI'
 }
 Test-Case 'existing settings: a list of startup pages set elsewhere is asked about, kept whole or removed whole' {
     Reset-Sandbox
@@ -763,13 +867,16 @@ Test-Case 'existing settings: a list of startup pages set elsewhere is asked abo
     New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'RestoreOnStartup' -Value 4 -PropertyType DWord | Out-Null
     New-Item -Path (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs') -Force | Out-Null
     New-ItemProperty -LiteralPath (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs') -Name '1' -Value 'https://intranet.example/start' -PropertyType String | Out-Null
-    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    Invoke-LoadCurrentState
+    $script:Overrides.Startup.Enabled = $false
     $c = @(Get-PolicyConflicts (New-ApplyPlan))
     Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'startup')) 'the startup pages should be one entry'
     Assert ($c[0].Current -match 'intranet\.example/start') "startup current: $($c[0].Current)"
     $script:SelfTestExistingAnswers.Enqueue('Keep')
     Invoke-ApplyAction
     Assert ((Get-PolicyNow 'RestoreOnStartup') -eq 4 -and (Read-PolicySnapshot -Path $script:PolicyKeyPath).Urls.Count -eq 1) 'Keep did not keep the startup pages'
+    Assert ($script:Overrides.Startup.Enabled) 'Keep should restore the loaded startup override in the UI'
+    $script:Overrides.Startup.Enabled = $false
     $script:SelfTestExistingAnswers.Enqueue('Replace')
     Invoke-ApplyAction
     $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
@@ -787,10 +894,13 @@ Test-Case 'existing settings: the preference (ask / always replace / always keep
     Assert ($script:SelfTestExistingDialogs.Count -eq 0) '"always keep" must not ask'
     Assert ((Get-PolicyNow 'BrowserSignin') -eq 1 -and (Get-PolicyNow 'NewTabPageLocation') -eq 'https://intranet.example') '"always keep" changed something'
     Assert ((Get-PolicyNow 'DefaultSearchProviderEnabled') -eq 1 -and (Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://company.example/search?q={searchTerms}') '"always keep" broke the search engine it kept'
-    Assert ((-not (Get-BfoItem 'Policy' 'BrowserSignin').Checked) -and (-not $script:Overrides.Search.Enabled)) 'keeping should untick the kept settings in the main window'
-    # the window now matches what was kept; tick the settings again to try "always replace"
+    Assert ((-not (Get-BfoItem 'Policy' 'BrowserSignin').Checked) -and $script:Overrides.Search.Enabled -and $script:Overrides.Ntp.Enabled) 'keeping should restore the loaded settings in the main window'
+    # Recreate the intended changes to try "always replace".
     Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
     $script:Overrides.Search.Enabled = $true
+    $script:Overrides.Search.EngineId = 'brave'
+    $script:Overrides.Search.CustomUrl = ''
+    $script:Overrides.Ntp.Enabled = $false
     Set-ExistingMode 'replace'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willReplace') '"always replace" shows Will replace'
     Invoke-ApplyAction

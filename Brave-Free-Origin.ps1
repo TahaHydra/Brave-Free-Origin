@@ -40,7 +40,7 @@ param(
 #region Bootstrap -------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
 
-$script:AppVersion       = '2.0.1'
+$script:AppVersion       = '2.0.2'
 $script:CatalogBrave     = '154.1.96.59'   # Brave build the policy catalog was verified against
 $script:CatalogBraveMajor = 154
 $script:CatalogDate      = '2026-09-29'
@@ -757,12 +757,12 @@ Add-Strings @{
     'state.willReplace' = 'Will replace'
     'state.willUnblock' = 'Will unblock'
     'tip.domains'      = 'Domains: {0}'
-    'tip.foreign'      = 'Something else (your organization, another tool) set a different value for this policy. Apply leaves it alone unless you tick this row.'
+    'tip.foreign'      = 'This policy already exists, but BFO did not record writing it. It stays untouched until you deliberately change this row; Apply asks before replacing or removing it.'
     'tip.hosts'        = 'Ticked groups are added to the Windows hosts file when you press Apply hosts blocks on this page. Unticked groups are removed.'
     'tip.lock'         = 'Brave already behaves this way by default. Ticking only makes it mandatory, so nothing can change it later.'
     'tip.pattern'      = 'Task name pattern: {0}'
     'tip.policy'       = 'Policy: {0} = {1}  ({2})'
-    'tip.replace'      = 'Something else (your organization, another tool) set a different value for this policy. Apply shows it to you first and replaces it only if you agree.'
+    'tip.replace'      = 'This existing policy is different from your selection. Apply shows it to you first and changes it only if you agree.'
     'tip.risk'         = 'Risk: {0}'
     'tip.service'      = 'Windows service: {0}'
     'tip.status'       = 'Active: already applied. Will apply / change / remove: waiting for you to press Apply. Not set: Brave decides.'
@@ -926,6 +926,9 @@ Add-Strings @{
     'existing.remove'        = '(remove it)'
     'existing.replace'       = 'Apply selected changes'
     'existing.title'         = 'Review existing settings'
+    'msg.dataRisk.body'       = "Some selected settings can delete browser data or saved customization:`r`n`r`n{0}`r`n`r`nThis can sign you out of websites or permanently remove saved browser customization.`r`n`r`nYes = apply them. No = unselect these risky settings and continue with everything else. Cancel = stop."
+    'msg.dataRisk.onlySkipped'= 'Those data-risk settings were unselected. There is nothing else to apply.'
+    'msg.title.dataRisk'      = 'Possible data loss'
 }
 
 
@@ -2103,7 +2106,7 @@ function New-BfoItem {
     param([string]$Kind, [string]$Id, [string]$Page, $Def)
     $item = [pscustomobject]@{
         Kind = $Kind; Id = $Id; Page = $Page; Def = $Def
-        Checked = $false; Value = $null; Baseline = $null; Loaded = $false; Detail = $null
+        Checked = $false; Value = $null; Baseline = $null; BaselineValue = $null; Loaded = $false; Detail = $null
         Row = $null; Status = ''
     }
     if ($Def -and $Def.ContainsKey('Value')) { $item.Value = $Def.Value }
@@ -2135,6 +2138,26 @@ $script:Overrides = @{
     Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
     Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
     Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
+}
+$script:OverrideBaseline = @{
+    Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
+    Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
+    Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
+}
+
+function Save-OverrideBaseline {
+    $script:OverrideBaseline = @{
+        Search  = @{ Enabled = [bool]$script:Overrides.Search.Enabled;  EngineId = "$($script:Overrides.Search.EngineId)"; CustomUrl = "$($script:Overrides.Search.CustomUrl)" }
+        Ntp     = @{ Enabled = [bool]$script:Overrides.Ntp.Enabled;     DestinationId = "$($script:Overrides.Ntp.DestinationId)"; CustomUrl = "$($script:Overrides.Ntp.CustomUrl)" }
+        Startup = @{ Enabled = [bool]$script:Overrides.Startup.Enabled; ModeId = "$($script:Overrides.Startup.ModeId)"; Urls = "$($script:Overrides.Startup.Urls)" }
+    }
+}
+
+function Restore-OverrideBaseline {
+    param([string]$Toggle)
+    if (-not $script:OverrideBaseline.ContainsKey($Toggle)) { return }
+    $src = $script:OverrideBaseline[$Toggle]
+    foreach ($k in @($src.Keys)) { $script:Overrides[$Toggle][$k] = $src[$k] }
 }
 # Policies that versions 1.5-1.12 wrote and that Brave 154 no longer has (removed upstream, cloud-only or renamed).
 # They are not offered any more, but they are still this tool's own leftovers: Apply and Restore stock clean them up
@@ -2316,12 +2339,24 @@ function Get-RegistryOps {
                 Type = $want.Type; Value = $want.Value; Old = $old; Foreign = ($action -eq 'Change' -and -not $owned); Kept = $false
             })
         } elseif ($has) {
-            # Clear what this tool wrote. A value someone else set is left alone - except for the search / New Tab /
-            # startup choices, where unticking is an explicit request to remove the value; that removal is asked about.
+            # An unticked row is a removal request only when it was ticked when current state was loaded and is now
+            # unticked by the user or a preset. A foreign value that never matched this row starts unticked and stays
+            # untouched. Search/New Tab/startup overrides have explicit toggles, so disabling one is always deliberate.
             $override = ($script:OverridePolicyNames -contains $name)
+            $overrideRemoval = $false
+            if ($override) {
+                $group = @($script:OverrideGroups | Where-Object { $_.Names -contains $name } | Select-Object -First 1)
+                if ($group.Count -gt 0) {
+                    $toggle = $group[0].Toggle
+                    $overrideRemoval = [bool]$script:OverrideBaseline[$toggle].Enabled -and -not [bool]$script:Overrides[$toggle].Enabled
+                }
+            }
+            $item = Get-BfoItem 'Policy' $name
+            $explicitRemoval = $overrideRemoval -or ($item -and $item.Loaded -and $item.Baseline -and -not $item.Checked)
+            $action = if ($owned -or $explicitRemoval) { 'Clear' } else { 'Leave' }
             [void]$ops.Add([pscustomobject]@{
-                Path = $script:PolicyKeyPath; Action = $(if ($owned -or $override) { 'Clear' } else { 'Leave' }); Name = $name
-                Type = $null; Value = $null; Old = $old; Foreign = ((-not $owned) -and $override); Kept = $false
+                Path = $script:PolicyKeyPath; Action = $action; Name = $name
+                Type = $null; Value = $null; Old = $old; Foreign = ($action -eq 'Clear' -and -not $owned); Kept = $false
             })
         }
     }
@@ -2770,6 +2805,9 @@ function Import-CurrentPolicyState {
         } else {
             Set-ItemChecked $item ($has -and "$($snap.Values[$item.Id])" -eq "$($item.Def.Value)")
         }
+        $item.Baseline = [bool]$item.Checked
+        $item.BaselineValue = $item.Value
+        $item.Loaded = $true
     }
 
     # Overrides: ticked only when the registry holds a value that maps back to
@@ -2806,6 +2844,7 @@ function Import-CurrentPolicyState {
         }
         if ($snap.Urls.Count -gt 0) { $so.Startup.Urls = ($snap.Urls -join ', ') }
     }
+    Save-OverrideBaseline
     Import-CurrentHostsState
     $script:ActiveProfile = 'CurrentState'
 }
@@ -2869,7 +2908,7 @@ function Get-ItemState {
             }
             if ($has) {
                 if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'willRemove' }
-                # The search / New Tab / startup names are cleared with the override that owns them, after asking.
+                if ($Item.Loaded -and $Item.Baseline -and -not $Item.Checked -and $script:ExistingMode -ne 'keep') { return 'willRemove' }
                 if (($script:OverridePolicyNames -contains $Item.Id) -and $script:ExistingMode -ne 'keep') { return 'willReplace' }
                 return 'foreign'
             }
@@ -2909,6 +2948,11 @@ function New-ApplyPlanReport {
     [void]$r.AppendLine("Policy key: $($script:PolicyKeyPath)  (shared by every Brave channel)")
     [void]$r.AppendLine('')
     [void]$r.AppendLine('This is a dry run. Nothing has been written.')
+    $dataRisk = @(Get-DataRiskOps $Plan)
+    if ($dataRisk.Count -gt 0) {
+        [void]$r.AppendLine('WARNING: the following selected settings can delete browser data or saved customization:')
+        foreach ($op in $dataRisk) { [void]$r.AppendLine("  ! $($op.Name)") }
+    }
     [void]$r.AppendLine('')
     $elsewhere = switch ($script:ExistingMode) {
         'replace' { '  - set elsewhere; replaced without asking (your preference)' }
@@ -5830,17 +5874,22 @@ function Sync-KeptExistingToUi {
     $changed = $false
     foreach ($name in $KeepNames) {
         $item = Get-BfoItem 'Policy' $name
-        if ($item -and $item.Checked) {
-            Set-ItemChecked $item $false
-            $changed = $true
+        if ($item) {
+            $target = [bool]$item.Baseline
+            if ($item.Def.Choices -and $null -ne $item.BaselineValue -and "$($item.Value)" -ne "$($item.BaselineValue)") {
+                $item.Value = $item.BaselineValue
+                $changed = $true
+            }
+            if ($item.Checked -ne $target) {
+                Set-ItemChecked $item $target
+                $changed = $true
+            }
         }
     }
     foreach ($g in $script:OverrideGroups) {
         if (@($g.Names | Where-Object { $KeepNames -contains $_ }).Count -eq 0) { continue }
-        if ($script:Overrides[$g.Toggle].Enabled) {
-            $script:Overrides[$g.Toggle].Enabled = $false
-            $changed = $true
-        }
+        Restore-OverrideBaseline -Toggle $g.Toggle
+        $changed = $true
     }
 
     if ($changed) {
@@ -5914,6 +5963,26 @@ function Invoke-VerifyAction {
     Show-TextReport -Title (T 'report.verifyTitle') -Text (New-VerifyReport) -DefaultFileName ("brave-free-origin-verify-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
 
+# Settings whose selected value can delete user data or saved browser customization. Clearing these policies is safe,
+# so the extra warning is shown only when Apply would add or change one of the destructive values.
+$script:DataRiskPolicyNames = @('DefaultBraveRemember1PStorageSetting', 'NTPCustomBackgroundEnabled')
+
+function Get-DataRiskOps {
+    param($Plan)
+    return @($Plan.Registry | Where-Object { ($script:DataRiskPolicyNames -contains $_.Name) -and ($_.Action -in 'Add', 'Change') })
+}
+
+function Get-DataRiskText {
+    param($Ops)
+    $lines = @()
+    foreach ($op in @($Ops)) {
+        $item = Get-BfoItem 'Policy' $op.Name
+        $title = if ($item) { Get-ItemText $item 'title' } else { $op.Name }
+        $lines += ('- ' + $title)
+    }
+    return ($lines -join "`r`n")
+}
+
 function Invoke-ApplyAction {
     try { $plan = New-ApplyPlan }
     catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); Select-NavPage 'overrides'; return }
@@ -5926,8 +5995,8 @@ function Invoke-ApplyAction {
     # Values somebody else set (by hand, another tool, the organization) are replaced only with the user's say-so.
     $conflicts = @(Get-PolicyConflicts $plan)
     $keptEntries = 0
+    $keep = @()
     if ($conflicts.Count -gt 0) {
-        $keep = @()
         if ($script:ExistingMode -eq 'keep') {
             $keep = @($conflicts | ForEach-Object { $_.Names })
         } elseif ($script:ExistingMode -eq 'ask') {
@@ -5948,6 +6017,33 @@ function Invoke-ApplyAction {
             }
         }
     }
+    # Warn separately before settings that can erase site data or saved browser customization.
+    $dataRisk = @(Get-DataRiskOps $plan)
+    if ($dataRisk.Count -gt 0) {
+        $ans = Show-Message -Text (T 'msg.dataRisk.body' @((Get-DataRiskText $dataRisk))) -Title (T 'msg.title.dataRisk') -Buttons 'YesNoCancel' -Icon 'Warning' -Default 'Button2'
+        if ($ans -eq 'Cancel') { Write-Log 'Apply cancelled at the data-loss warning.' 'INFO'; return }
+        if ($ans -eq 'No') {
+            $riskNames = @($dataRisk | ForEach-Object { $_.Name } | Select-Object -Unique)
+            foreach ($name in $riskNames) {
+                $item = Get-BfoItem 'Policy' $name
+                if ($item) { Set-ItemChecked $item $false }
+            }
+            $script:ActiveProfile = 'Custom'
+            $keep = @($keep + $riskNames | Select-Object -Unique)
+            $keptEntries = @($conflicts | Where-Object { @($_.Names | Where-Object { $keep -contains $_ }).Count -gt 0 }).Count
+            Update-AllItemViews
+            Update-Filter
+            Update-Chrome
+            try { $plan = New-ApplyPlan -KeepNames $keep }
+            catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); return }
+            Write-Log ("Skipped data-risk setting(s): {0}" -f ($riskNames -join ', ')) 'INFO'
+            if (-not (Test-PlanHasChanges $plan)) {
+                [void](Show-Message -Text (T 'msg.dataRisk.onlySkipped') -Title (T 'msg.title.dataRisk'))
+                return
+            }
+        }
+    }
+
     if (@($plan.System | Where-Object { $_.Action -eq 'Disable' }).Count -gt 0) {
         $ans = Show-Message -Text (T 'msg.updater.confirm') -Title (T 'msg.title.updater') -Buttons 'YesNo' -Icon 'Warning' -Default 'Button2'
         if ($ans -ne 'Yes') { return }

@@ -83,10 +83,10 @@ Requirements: Windows 10 or 11 with the built-in Windows PowerShell 5.1, and Bra
 | You do this | What the tool does |
 | --- | --- |
 | **Tick** a row | Enforces it. For most rows that switches a feature **off** (the title says "Turn off ..."). Rows titled "Keep ... on" lock a protection Brave already uses, so nothing can weaken it. |
-| **Untick** a row | Hands control back to Brave. Pressing Apply removes the policy this tool wrote earlier. |
+| **Untick** a row | Requests removal of that policy. If the current value was not recorded as BFO's, Apply shows it first and asks before removing it. |
 | Press **Apply** | Writes the ticked rows. Nothing is written before that. |
 
-**Status** tells you where a row stands: *Active* (already applied), *Will apply / Will change / Will remove* (waiting for you to press Apply), *Not set* (Brave decides). **Risk** says what an everyday user could lose: *Safe* and *Low* are fine for everybody; *Medium* and *High* change how Brave behaves, so read the description first.
+**Status** tells you where a row stands: *Active* (already applied), *Will apply / Will change / Will remove* (waiting for you to press Apply), *Set elsewhere* (the value exists but BFO did not record writing it), *Not set* (Brave decides). Unticking a matching *Set elsewhere* row is treated as an explicit removal request and is reviewed before anything is removed. **Risk** says what an everyday user could lose: *Safe* and *Low* are fine for everybody; *Medium* and *High* change how Brave behaves, so read the description first.
 
 ### If a setting is already set elsewhere
 
@@ -106,6 +106,7 @@ For example, with these three values set by an organization:
 - **Keep all existing** keeps every listed entry and still applies the rest. BFO also removes those conflicts from its pending selection so the main window matches what will actually happen. **Cancel** stops and writes nothing.
 - Tick *Remember this choice* to stop being asked, or choose the behaviour at any time under **Tools > Settings already set elsewhere** (*Ask me each time*, *Always replace them*, *Always keep them*).
 - The result window stays simple; the detailed log and the backup taken before Apply still contain the technical record.
+- Two settings that can actually delete browser/site data or saved customization get a second warning before Apply: **Forget site data when a tab closes** and **Block custom New Tab backgrounds**. You can continue, unselect those risky settings and apply the rest, or cancel.
 
 ### Presets
 
