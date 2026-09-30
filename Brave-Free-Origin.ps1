@@ -2339,12 +2339,16 @@ function Get-RegistryOps {
                 Type = $want.Type; Value = $want.Value; Old = $old; Foreign = ($action -eq 'Change' -and -not $owned); Kept = $false
             })
         } elseif ($has) {
-            # Clear what this tool wrote. A value someone else set is left alone - except for the search / New Tab /
-            # startup choices, where unticking is an explicit request to remove the value; that removal is asked about.
+            # An unticked row is a removal request only when it was ticked when current state was loaded and is now
+            # unticked by the user or a preset. A foreign value that never matched this row starts unticked and stays
+            # untouched. Search/New Tab/startup overrides have explicit toggles, so disabling one is always deliberate.
             $override = ($script:OverridePolicyNames -contains $name)
+            $item = Get-BfoItem 'Policy' $name
+            $explicitRemoval = $override -or ($item -and $item.Loaded -and $item.Baseline -and -not $item.Checked)
+            $action = if ($owned -or $explicitRemoval) { 'Clear' } else { 'Leave' }
             [void]$ops.Add([pscustomobject]@{
-                Path = $script:PolicyKeyPath; Action = $(if ($owned -or $override) { 'Clear' } else { 'Leave' }); Name = $name
-                Type = $null; Value = $null; Old = $old; Foreign = ((-not $owned) -and $override); Kept = $false
+                Path = $script:PolicyKeyPath; Action = $action; Name = $name
+                Type = $null; Value = $null; Old = $old; Foreign = ($action -eq 'Clear' -and -not $owned); Kept = $false
             })
         }
     }
@@ -2793,6 +2797,8 @@ function Import-CurrentPolicyState {
         } else {
             Set-ItemChecked $item ($has -and "$($snap.Values[$item.Id])" -eq "$($item.Def.Value)")
         }
+        $item.Baseline = [bool]$item.Checked
+        $item.Loaded = $true
     }
 
     # Overrides: ticked only when the registry holds a value that maps back to
@@ -2829,6 +2835,7 @@ function Import-CurrentPolicyState {
         }
         if ($snap.Urls.Count -gt 0) { $so.Startup.Urls = ($snap.Urls -join ', ') }
     }
+    Save-OverrideBaseline
     Import-CurrentHostsState
     $script:ActiveProfile = 'CurrentState'
 }
@@ -2892,7 +2899,7 @@ function Get-ItemState {
             }
             if ($has) {
                 if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'willRemove' }
-                # The search / New Tab / startup names are cleared with the override that owns them, after asking.
+                if ($Item.Loaded -and $Item.Baseline -and -not $Item.Checked -and $script:ExistingMode -ne 'keep') { return 'willRemove' }
                 if (($script:OverridePolicyNames -contains $Item.Id) -and $script:ExistingMode -ne 'keep') { return 'willReplace' }
                 return 'foreign'
             }
