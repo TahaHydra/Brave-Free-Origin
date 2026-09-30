@@ -55,7 +55,7 @@ function Reset-Sandbox {
     $script:Snapshot = $null
     $script:FakeTasks = @(); $script:FakeServices = @(); $script:TaskCache = $null
     $script:HostsCurrent = @()
-    foreach ($i in $script:Items) { Set-ItemChecked $i $false; $i.Loaded = $false; $i.Baseline = $null; $i.Detail = $null }
+    foreach ($i in $script:Items) { Set-ItemChecked $i $false; $i.Loaded = $false; $i.Baseline = $null; $i.BaselineValue = $null; $i.Detail = $null }
     $script:Overrides.Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
     $script:Overrides.Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
     $script:Overrides.Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
@@ -358,6 +358,44 @@ Test-Case 'data risk: destructive policies warn, No unselects them, Yes applies 
     Reset-Sandbox
     Set-ItemChecked (Get-BfoItem 'Policy' 'NTPCustomBackgroundEnabled') $true
     Assert (@(Get-DataRiskOps (New-ApplyPlan)).Count -eq 1) 'permanent New Tab background removal should be classified as data risk'
+}
+
+Test-Case 'registry: keeping a changed choice restores the value loaded from the PC' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'HardwareAccelerationModeEnabled' -Value 0 -PropertyType DWord | Out-Null
+    $script:ChkBackup.Checked = $false
+    Invoke-LoadCurrentState
+    $gpu = Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled'
+    Assert ($gpu.Checked -and $gpu.Baseline -and $gpu.BaselineValue -eq 0) 'the loaded GPU choice baseline is wrong'
+    Set-ItemChoice $gpu 'enable'
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert (((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['HardwareAccelerationModeEnabled']) -eq 0) 'Keep changed the existing GPU policy'
+    Assert ($gpu.Checked -and $gpu.Value -eq 0) 'Keep did not restore the loaded GPU choice in the UI'
+}
+
+Test-Case 'overrides: incomplete external search values are not silently cleared, but disabling a loaded complete override is a reviewed removal' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderName' -Value 'Company Search' -PropertyType String | Out-Null
+    Invoke-LoadCurrentState
+    $plan = New-ApplyPlan
+    $op = @($plan.Registry | Where-Object { $_.Name -eq 'DefaultSearchProviderName' })[0]
+    Assert ($op -and $op.Action -eq 'Leave') 'an incomplete external search policy should be left alone on load'
+    Assert (-not (Test-PlanHasChanges $plan)) 'loading an incomplete external override must not create a pending removal'
+
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderEnabled' -Value 1 -PropertyType DWord | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderName' -Value 'Company Search' -PropertyType String | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderSearchURL' -Value 'https://company.example/?q={searchTerms}' -PropertyType String | Out-Null
+    Invoke-LoadCurrentState
+    Assert ($script:Overrides.Search.Enabled -and $script:OverrideBaseline.Search.Enabled) 'the complete search override should load as enabled'
+    $script:Overrides.Search.Enabled = $false
+    $plan = New-ApplyPlan
+    $c = @(Get-PolicyConflicts $plan)
+    Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'search')) 'disabling the loaded search override should be reviewed as one removal'
 }
 
 Test-Case 'config: importing never re-enables an updater the user disabled, and export lists only ticked updater rows' {
