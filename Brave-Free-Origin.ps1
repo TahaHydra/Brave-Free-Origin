@@ -2139,6 +2139,26 @@ $script:Overrides = @{
     Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
     Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
 }
+$script:OverrideBaseline = @{
+    Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
+    Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
+    Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
+}
+
+function Save-OverrideBaseline {
+    $script:OverrideBaseline = @{
+        Search  = @{ Enabled = [bool]$script:Overrides.Search.Enabled;  EngineId = "$($script:Overrides.Search.EngineId)"; CustomUrl = "$($script:Overrides.Search.CustomUrl)" }
+        Ntp     = @{ Enabled = [bool]$script:Overrides.Ntp.Enabled;     DestinationId = "$($script:Overrides.Ntp.DestinationId)"; CustomUrl = "$($script:Overrides.Ntp.CustomUrl)" }
+        Startup = @{ Enabled = [bool]$script:Overrides.Startup.Enabled; ModeId = "$($script:Overrides.Startup.ModeId)"; Urls = "$($script:Overrides.Startup.Urls)" }
+    }
+}
+
+function Restore-OverrideBaseline {
+    param([string]$Toggle)
+    if (-not $script:OverrideBaseline.ContainsKey($Toggle)) { return }
+    $src = $script:OverrideBaseline[$Toggle]
+    foreach ($k in @($src.Keys)) { $script:Overrides[$Toggle][$k] = $src[$k] }
+}
 # Policies that versions 1.5-1.12 wrote and that Brave 154 no longer has (removed upstream, cloud-only or renamed).
 # They are not offered any more, but they are still this tool's own leftovers: Apply and Restore stock clean them up
 # and Verify does not call them foreign. Some (SigninAllowed, the Lens policies, IPFSEnabled) are still honoured by
