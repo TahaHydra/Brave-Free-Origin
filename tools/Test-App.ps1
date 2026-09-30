@@ -59,6 +59,7 @@ function Reset-Sandbox {
     $script:Overrides.Search  = @{ Enabled = $false; EngineId = 'brave'; CustomUrl = '' }
     $script:Overrides.Ntp     = @{ Enabled = $false; DestinationId = 'blank'; CustomUrl = '' }
     $script:Overrides.Startup = @{ Enabled = $false; ModeId = 'newTab'; Urls = '' }
+    Save-OverrideBaseline
     $script:ActiveProfile = 'Custom'
     $script:SelfTestDialogs = @(); $script:SelfTestReports = @()
     $script:SelfTestAnswers.Clear()
@@ -305,6 +306,60 @@ Test-Case 'registry: a known policy that someone else set to a different value i
     $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BatterySaverModeAvailability')) -eq 'willRemove') 'the v1.12 Battery Saver value should count as ours'
 }
+Test-Case 'registry: unticking a matching policy loaded from the PC requests removal and asks before touching an unowned value' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveVPNDisabled' -Value 1 -PropertyType DWord | Out-Null
+    $script:ChkBackup.Checked = $false
+    Invoke-LoadCurrentState
+    $vpn = Get-BfoItem 'Policy' 'BraveVPNDisabled'
+    Assert ($vpn.Checked -and $vpn.Baseline) 'the existing matching VPN policy should load as ticked'
+    Assert ((Get-ItemState $vpn) -eq 'foreign') 'an unrecorded matching value should show Set elsewhere before the user changes it'
+    Set-ItemChecked $vpn $false
+    $plan = New-ApplyPlan
+    $op = @($plan.Registry | Where-Object { $_.Name -eq 'BraveVPNDisabled' })[0]
+    Assert ($op -and $op.Action -eq 'Clear' -and $op.Foreign) 'unticking the loaded external VPN policy must plan a foreign Clear'
+    Assert ((Get-ItemState $vpn) -eq 'willRemove') 'the row should show Will remove after the user unticks it'
+    $conflicts = @(Get-PolicyConflicts $plan)
+    Assert (($conflicts.Count -eq 1) -and ($conflicts[0].Key -eq 'BraveVPNDisabled') -and ($null -eq $conflicts[0].Wants)) 'the removal must appear in the review dialog'
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'BraveVPNDisabled') -eq 1) 'Keep removed the existing VPN policy'
+    Assert ($vpn.Checked) 'Keep should restore the checkbox to the loaded current state'
+    Set-ItemChecked $vpn $false
+    $script:SelfTestExistingAnswers.Enqueue('Replace')
+    Invoke-ApplyAction
+    Assert ($null -eq (Get-PolicyNow 'BraveVPNDisabled')) 'Apply selected changes did not remove the policy'
+}
+
+Test-Case 'data risk: destructive policies warn, No unselects them, Yes applies them, and clearing them does not warn' {
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    $storage = Get-BfoItem 'Policy' 'DefaultBraveRemember1PStorageSetting'
+    Set-ItemChecked $storage $true
+    $plan = New-ApplyPlan
+    Assert (@(Get-DataRiskOps $plan).Count -eq 1) 'site-data deletion policy was not classified as data risk'
+    $script:SelfTestAnswers.Enqueue('No')
+    Invoke-ApplyAction
+    Assert ($null -eq (Get-PolicyNow 'DefaultBraveRemember1PStorageSetting')) 'answering No still applied the site-data deletion policy'
+    Assert (-not $storage.Checked) 'answering No should unselect the risky row'
+    Assert (@($script:SelfTestDialogs | Where-Object { $_[0] -eq (T 'msg.title.dataRisk') }).Count -ge 1) 'the data-loss warning was not shown'
+
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    $storage = Get-BfoItem 'Policy' 'DefaultBraveRemember1PStorageSetting'
+    Set-ItemChecked $storage $true
+    $script:SelfTestAnswers.Enqueue('Yes')
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'DefaultBraveRemember1PStorageSetting') -eq 2) 'answering Yes did not apply the selected risky policy'
+    Set-ItemChecked $storage $false
+    Assert (@(Get-DataRiskOps (New-ApplyPlan)).Count -eq 0) 'removing a destructive policy should not itself trigger a data-loss warning'
+
+    Reset-Sandbox
+    Set-ItemChecked (Get-BfoItem 'Policy' 'NTPCustomBackgroundEnabled') $true
+    Assert (@(Get-DataRiskOps (New-ApplyPlan)).Count -eq 1) 'permanent New Tab background removal should be classified as data risk'
+}
+
 Test-Case 'config: importing never re-enables an updater the user disabled, and export lists only ticked updater rows' {
     Reset-Sandbox
     $uaName = 'BraveSoftwareUpdateTaskUserS-1-12-1-1-2-3-4UA{22222222-2222-2222-2222-222222222222}'
