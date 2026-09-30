@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag such as v1.13 and this runs the full CI (the same workflow that runs on pull requests, so the two can
+# Push a tag such as v2.0 and this runs the full CI (the same workflow that runs on pull requests, so the two can
 # never drift apart), builds the portable zip, checks that the tag matches the version inside the app, and publishes
 # the release with the zip and its SHA-256 sums. The one-line installer (install\bfo.ps1) downloads
 # Brave-Free-Origin.zip from the latest release and verifies it against the checksum GitHub records for that exact
@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)publish, for example v1.13. Leave empty for a dry run of the selected branch.'
+        description: 'Existing tag to (re)publish, for example v2.0. Leave empty for a dry run of the selected branch.'
         required: false
       dry_run:
         description: 'Run every check and build the zip, but do not publish'
@@ -53,7 +53,7 @@ jobs:
           $dryRun = ('${{ github.event.inputs.dry_run }}' -eq 'true') -or (-not $tag)
 
           if ($tag) {
-            if ($tag -notmatch '^v(\d+\.\d+(\.\d+)?)$') { throw "Tag '$tag' is not like v1.13." }
+            if ($tag -notmatch '^v(\d+\.\d+(\.\d+)?)$') { throw "Tag '$tag' is not like v2.0." }
             if ($Matches[1] -ne $appVersion) { throw "Tag says $($Matches[1]) but the app says $appVersion. Fix one of them and tag again." }
           } else {
             $tag = "v$appVersion"
@@ -74,7 +74,18 @@ jobs:
           $text = Get-Content 'CHANGELOG.md' -Raw
           $pattern = '(?ms)^##\s+\[?v?' + [regex]::Escape($version) + '\]?[^\r\n]*\r?\n(.*?)(?=^##\s|\z)'
           if ($text -notmatch $pattern) { throw "CHANGELOG.md has no section for $version." }
-          $Matches[1].Trim() | Set-Content -Path release-notes.md -Encoding utf8
+          $changes = $Matches[1].Trim()
+          # The release page is what people land on, so it starts with how to install; the changes follow.
+          $intro = @(
+            '## Install',
+            '',
+            '- **One line** (Windows PowerShell): `irm https://xhydra.fr/bfo | iex`',
+            '- **Portable:** download `Brave-Free-Origin.zip` below, extract it and double-click `Brave-Free-Origin.bat`. Its SHA-256 is in `SHA256SUMS.txt`.',
+            '',
+            "## What is new in $version",
+            ''
+          ) -join "`n"
+          ($intro + "`n" + $changes) | Set-Content -Path release-notes.md -Encoding utf8
 
       - name: Publish
         if: steps.version.outputs.publish == 'true'
@@ -88,7 +99,7 @@ jobs:
             gh release upload $tag Brave-Free-Origin.zip SHA256SUMS.txt --clobber
             gh release edit $tag --notes-file release-notes.md
           } else {
-            gh release create $tag Brave-Free-Origin.zip SHA256SUMS.txt --title "Brave Free Origin $tag" --notes-file release-notes.md --verify-tag
+            gh release create $tag Brave-Free-Origin.zip SHA256SUMS.txt --title "Brave Free Origin $tag" --notes-file release-notes.md --verify-tag --latest
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

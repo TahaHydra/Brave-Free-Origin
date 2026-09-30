@@ -2,7 +2,7 @@
 
 # Brave Free Origin - what every setting does
 
-This is the complete list of what Brave Free Origin v1.13 can change: **101 Brave policies** on 12 pages, 6 presets, a DNS blocklist and the optional updater switches. Everything here is reversible: unticking a row and pressing **Apply** removes it, and **Restore stock** removes everything the tool ever set.
+This is the complete list of what Brave Free Origin v2.0 can change: **101 Brave policies** on 12 pages, 6 presets, a DNS blocklist and the optional updater switches. Everything here is reversible: unticking a row and pressing **Apply** removes it, and **Restore stock** removes everything the tool ever set.
 
 > **Checked against Brave 154.1.96.59 (Chromium 154) on 2026-09-29.** Brave adds, renames and retires policies over time. On a newer Brave a few rows may be renamed or gone (Brave ignores a policy it does not know, so nothing breaks); on an older one some rows may not exist yet. Open `brave://policy` to see exactly what your Brave accepted.
 
@@ -10,7 +10,7 @@ This is the complete list of what Brave Free Origin v1.13 can change: **101 Brav
 
 - **Ticked** means this tool enforces the row. For most rows that switches a feature **off** (the title says so: "Turn off ..."). Rows marked **keeps on** lock a protection Brave already uses by default, so nothing can silently weaken it. Rows marked **sets** write a specific value.
 - **Unticked** means the tool sets nothing and Brave decides. Pressing Apply removes the policy this tool wrote earlier.
-- **Set elsewhere** (in the Status column of the app) means the policy already holds a value this tool would never write, for example one set by your organization. Apply and Restore stock leave it alone unless you tick the row. A value identical to one this tool writes cannot be told apart from its own.
+- **Set elsewhere** (in the Status column of the app) means the policy already holds a value this tool would never write, for example one set by your organization. Apply lists such a value and asks before replacing it (the row then says **Will replace**; you can keep it, replace it or stop), and Restore stock leaves it alone unless you choose to remove everything. A value identical to one this tool writes cannot be told apart from its own.
 - **Risk** says what an everyday user could lose: *Safe* and *Low* are fine for everybody; *Medium* and *High* change how Brave behaves, so read the description first.
 - **Policy** is the registry value name under `HKLM\SOFTWARE\Policies\BraveSoftware\Brave` (one key for Stable, Beta, Nightly and Dev). It is also the name you will see in `brave://policy`.
 - The preset columns show which presets tick the row: **Quick** = Quick Debloat, **Rec.** = Recommended, **Origin** = Origin Mode, **Boost** = Privacy + Boost, **Max perf.** = Max Performance, **Max priv.** = Max Privacy.

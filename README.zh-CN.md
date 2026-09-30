@@ -44,7 +44,7 @@ irm https://xhydra.fr/bfo | iex
 $env:BFO_NO_LAUNCH = '1'; irm https://xhydra.fr/bfo | iex
 ```
 
-其他选项（在同一个窗口中、于运行命令之前设置）：`$env:BFO_VERSION = 'v1.13'` 用于固定使用某个发行版，`$env:BFO_LANG = 'fr-FR'` 用于让应用以指定语言启动。同一份脚本也可以直接从 GitHub 获取：`irm https://raw.githubusercontent.com/TahaHydra/Brave-Free-Origin/main/install/bfo.ps1 | iex`。
+其他选项（在同一个窗口中、于运行命令之前设置）：`$env:BFO_VERSION = 'v2.0'` 用于固定使用某个发行版，`$env:BFO_LANG = 'fr-FR'` 用于让应用以指定语言启动。同一份脚本也可以直接从 GitHub 获取：`irm https://raw.githubusercontent.com/TahaHydra/Brave-Free-Origin/main/install/bfo.ps1 | iex`。
 
 ### 方式二：便携版 ZIP
 
@@ -76,6 +76,25 @@ $env:BFO_NO_LAUNCH = '1'; irm https://xhydra.fr/bfo | iex
 
 **状态**告诉你某一行目前的情况：*已生效*（已经应用）、*将应用 / 将更改 / 将移除*（等待你点击“应用”）、*未设置*（由 Brave 决定）。**风险**说明普通用户可能会失去什么：*安全*和*低*适合所有人；*中等*和*高*会改变 Brave 的行为，所以请先阅读说明。
 
+### 如果某项设置已被别处设置过
+
+你所在的单位、其他工具，或是你自己修改注册表，可能已经设置过其中一些相同的策略。本工具不会悄悄替换它们。当**应用**将要更改或移除一个并非本工具写入的值时，它会先停下来，把这些值与它打算写入的内容并排列出。这就是“检测到已有的 Brave 策略”窗口；列表中该行的状态会提前显示为**将替换**。
+
+![“检测到已有的 Brave 策略”窗口：三项已被设置的内容，每项都显示当前值和 BFO 要设置的值](images/existing-settings.png)
+
+例如，某个组织设置了下面这三个值：
+
+| 设置 | 当前值 | BFO 要设置的值 |
+| --- | --- | --- |
+| 阻止登录浏览器（`BrowserSignin`） | `1` | `0` |
+| 搜索引擎（`DefaultSearchProvider*`） | `https://company.example/search?q={searchTerms}` | `https://search.brave.com/search?q={searchTerms}` |
+| 新标签页（`NewTabPageLocation`） | `https://intranet.example` | （移除） |
+
+- **仍然应用 BFO 的更改**会替换已勾选的条目。所有条目一开始都是勾选的；取消勾选某项即可保持它原样。你选择的其余内容照常应用。
+- **保留现有设置**会保留列出的每一项，并照常应用其余内容。**取消**则会中止，不写入任何内容。
+- 勾选“以后都这样做，不再询问”即可不再被询问，也可以随时在**工具 > 已在别处设置的项目**中选择做法（*每次都询问我*、*一律替换*、*一律保留*）。
+- 之后，结果窗口会说明替换了多少项、保留了多少项，日志会逐项记录，应用前所做的备份（`.reg` 文件）里仍保存着旧值。
+
 ### 预设
 
 | 预设 | 作用 | 风险 | 行数 |
@@ -94,7 +113,7 @@ $env:BFO_NO_LAUNCH = '1'; irm https://xhydra.fr/bfo | iex
 
 ## 撤销全部更改
 
-- **还原原厂设置...**（底部栏）会移除本工具可能写入的策略值，清除它在 hosts 文件中的屏蔽块，并重新启用它曾禁用的所有更新程序任务或服务。别人设置的值（你所在的单位、其他工具）会原样保留：如果某项策略的值是本工具永远不会写入的，它会显示为**其他来源**，只有当你勾选该行或选择一并移除全部内容时，“应用”和“还原”才会替换它。有一个局限：与本工具所写入的值完全相同的值，无法与它自己写入的值区分开。
+- **还原原厂设置...**（底部栏）会移除本工具可能写入的策略值，清除它在 hosts 文件中的屏蔽块，并重新启用它曾禁用的所有更新程序任务或服务。别人设置的值（你所在的单位、其他工具）除非你同意，否则会原样保留：如果某项策略的值是本工具永远不会写入的，它会显示为**其他来源**；**还原原厂设置**不会动它，除非你选择一并移除全部内容，而**应用**在替换它之前会先询问（见[如果某项设置已被别处设置过](#如果某项设置已被别处设置过)）。有一个局限：与本工具所写入的值完全相同的值，无法与它自己写入的值区分开。
 - 或者选择**原厂 / 不启用**，然后点击**应用**。
 - 只要勾选了**应用前先备份**（默认已勾选），每次应用之前都会先把你的策略注册表项备份到 `Documents\Brave-Free-Origin-Backups\`；双击其中的 `.reg` 文件即可还原到当时的状态。**工具 > 打开备份文件夹**可以直接带你到那里。
 - 卸载只需删除该文件夹：本应用不会安装任何东西，也不会添加计划任务或启动项。
@@ -134,6 +153,12 @@ English、Français、Español、हिन्दी、العربية（从右向
 <summary><strong>Brave 现在显示“由贵单位管理”，是出问题了吗？</strong></summary>
 
 没有出问题。与所有 Chromium 浏览器一样，只要有任何计算机策略生效，Brave 就会显示这条提示。目前没有受支持的方法可以在保留策略的同时隐藏这条提示；移除这些策略（**还原原厂设置**）后它就会消失。
+</details>
+
+<details>
+<summary><strong>本工具怎么知道哪些值是它自己写的？</strong></summary>
+
+注册表不会记录是谁写入了某个值，所以本工具要自己判断。它会记住上一次写入的内容（保存在 `settings.json` 中，按 Windows 用户分开），也认得自己能生成的值：它自带的各项选择、列表中搜索引擎的地址、`about:blank`，以及旧版本写入的值。其他一切都算作在别处设置的，只有在你同意后才会被替换。与本工具会写入的值恰好完全相同的值无法区分，会被当作它自己的。
 </details>
 
 <details>
@@ -203,7 +228,7 @@ Brave Shields 本身就是内置于浏览器引擎中的原生广告和跟踪器
 | --- | --- |
 | 策略 | `HKLM\SOFTWARE\Policies\BraveSoftware\Brave` |
 | 备份（每次应用之前） | `%USERPROFILE%\Documents\Brave-Free-Origin-Backups\` |
-| 设置（所选语言） | `%LOCALAPPDATA%\Brave-Free-Origin\settings.json` |
+| 设置（语言、如何处理别处已设置的项目、本工具上次写入的内容） | `%LOCALAPPDATA%\Brave-Free-Origin\settings.json` |
 | 日志（提交问题报告时请附上一份） | `%LOCALAPPDATA%\Brave-Free-Origin\logs\` |
 | 一行命令安装程序的临时文件 | `%LOCALAPPDATA%\Brave-Free-Origin\run\`（关闭应用时删除） |
 

@@ -75,5 +75,5 @@ Small, focused PRs are easiest. The checklist in the PR template is short. CI (`
 ## Releasing (maintainers)
 
 1. Bump `$script:AppVersion`, update `CHANGELOG.md` (the release notes are taken from its `## [x.y]` section), regenerate the generated files, run the tests.
-2. Tag and push: `git tag v1.13 && git push origin v1.13`. The **Release** workflow first runs the whole CI workflow, then checks the tag against the app version, builds `Brave-Free-Origin.zip` and `SHA256SUMS.txt` with `tools\Build-Package.ps1`, and publishes the release. The asset name must stay `Brave-Free-Origin.zip`: the one-line installer downloads exactly that file and verifies it against the checksum GitHub records.
+2. Tag and push: `git tag v2.0 && git push origin v2.0`. The **Release** workflow first runs the whole CI workflow, then checks the tag against the app version, builds `Brave-Free-Origin.zip` and `SHA256SUMS.txt` with `tools\Build-Package.ps1`, and publishes the release. The asset name must stay `Brave-Free-Origin.zip`: the one-line installer downloads exactly that file and verifies it against the checksum GitHub records.
 3. The installer script is served from `install/bfo.ps1`; see [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md) for hosting notes.

@@ -62,6 +62,8 @@ function Reset-Sandbox {
     $script:ActiveProfile = 'Custom'
     $script:SelfTestDialogs = @(); $script:SelfTestReports = @()
     $script:SelfTestAnswers.Clear()
+    $script:AppliedLedger = @{}; $script:AppliedUrls = @(); $script:ExistingMode = 'ask'
+    $script:SelfTestExistingAnswers.Clear(); $script:SelfTestExistingDialogs = @()
 }
 
 function Get-Ticked { return @($script:Items | Where-Object { $_.Kind -eq 'Policy' -and $_.Checked } | ForEach-Object { $_.Id }) }
@@ -125,7 +127,7 @@ Test-Case 'catalog: pages, presets, risks, states and hosts groups all have stri
     foreach ($id in $script:PageOrder.Id) { foreach ($p in 'title', 'intro') { Assert ($script:EnglishStrings.ContainsKey("page.$id.$p")) "page.$id.$p" } }
     foreach ($k in $script:AllPresetKeys) { foreach ($p in 'name', 'description', 'risk') { Assert ($script:EnglishStrings.ContainsKey("preset.$k.$p")) "preset.$k.$p" } }
     foreach ($r in 'safe', 'low', 'medium', 'high') { Assert ($script:EnglishStrings.ContainsKey("risk.$r")) "risk.$r" }
-    foreach ($s in 'active', 'willApply', 'willChange', 'willRemove', 'notSet', 'enabled', 'disabled', 'willDisable', 'willEnable', 'missing', 'unknown', 'blocked', 'willBlock', 'willUnblock', 'notBlocked') {
+    foreach ($s in 'active', 'willApply', 'willChange', 'willReplace', 'foreign', 'willRemove', 'notSet', 'enabled', 'disabled', 'willDisable', 'willEnable', 'missing', 'unknown', 'blocked', 'willBlock', 'willUnblock', 'notBlocked') {
         Assert ($script:EnglishStrings.ContainsKey("state.$s")) "state.$s"
     }
     foreach ($h in $script:HostsBlocks) { foreach ($p in 'name', 'description') { Assert ($script:EnglishStrings.ContainsKey("hosts.$($h.Id).$p")) "hosts.$($h.Id).$p" } }
@@ -296,7 +298,7 @@ Test-Case 'registry: a known policy that someone else set to a different value i
     Assert (-not $snap.Values.ContainsKey('BraveWalletDisabled')) 'Restore left our own value behind'
     # ticking the row is an explicit request to replace it
     Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
-    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willChange') 'ticking should offer to replace the other value'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willReplace') 'ticking should offer to replace the other value (after asking)'
     [void](Invoke-ApplyNow)
     Assert ((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['BrowserSignin'] -eq 0) 'the ticked row was not applied'
     # a value an older version wrote still counts as ours
@@ -611,6 +613,199 @@ Test-Case 'updater: turning updates off asks first, and the answer is respected'
     Assert ($script:FakeTasks[0].State -eq 'Disabled') 'answering Yes should disable the task'
 }
 
+# =============================================================== 7b. settings that were already set elsewhere
+# The scenario of the "Existing Brave policies detected" question: BrowserSignin = 1, another search engine, an intranet
+# New Tab page - all written by somebody else.
+function Set-ExistingScenario {
+    Reset-Sandbox
+    $key = $script:PolicyKeyPath
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'BrowserSignin' -Value 1 -PropertyType DWord | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderEnabled' -Value 1 -PropertyType DWord | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderName' -Value 'Company Search' -PropertyType String | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderSearchURL' -Value 'https://company.example/search?q={searchTerms}' -PropertyType String | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'NewTabPageLocation' -Value 'https://intranet.example' -PropertyType String | Out-Null
+    $script:Snapshot = Read-PolicySnapshot -Path $key
+    Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
+    $script:Overrides.Search.Enabled = $true          # the Brave engine
+    $script:ChkBackup.Checked = $false
+    $script:SelfTestLastResult = $null
+}
+function Get-PolicyNow { param([string]$Name) return (Read-PolicySnapshot -Path $script:PolicyKeyPath).Values[$Name] }
+
+Test-Case 'existing settings: the plan finds exactly what somebody else set, and shows what would replace it' {
+    Set-ExistingScenario
+    $plan = New-ApplyPlan
+    $c = @(Get-PolicyConflicts $plan)
+    Assert ($c.Count -eq 3) "expected 3 entries, got $($c.Count): $(($c | ForEach-Object { $_.Key }) -join ', ')"
+    $signin = $c | Where-Object { $_.Key -eq 'BrowserSignin' }
+    Assert (($signin.Current -eq '1') -and ($signin.Wants -eq '0')) 'BrowserSignin should read current 1 / wants 0'
+    $search = $c | Where-Object { $_.Key -eq 'search' }
+    Assert ($search.Current -eq 'https://company.example/search?q={searchTerms}') "search current: $($search.Current)"
+    Assert ($search.Wants -eq 'https://search.brave.com/search?q={searchTerms}') "search wants: $($search.Wants)"
+    foreach ($n in 'DefaultSearchProviderName', 'DefaultSearchProviderSearchURL', 'DefaultSearchProviderKeyword', 'DefaultSearchProviderSuggestURL') {
+        Assert ($search.Names -contains $n) "the search entry must cover $n so it is kept or replaced whole"
+    }
+    $ntp = $c | Where-Object { $_.Key -eq 'ntp' }
+    Assert (($ntp.Current -eq 'https://intranet.example') -and ($null -eq $ntp.Wants)) 'the New Tab entry should be a removal'
+    Assert (Test-PlanHasChanges $plan) 'the plan has changes'
+    # keeping an entry drops its changes, including the values that would have been added to it
+    $kept = New-ApplyPlan -KeepNames $search.Names
+    Assert (-not (@($kept.Registry | Where-Object { $_.Name -like 'DefaultSearchProvider*' -and $_.Action -in 'Add', 'Change' }).Count)) 'a kept search engine must not be half replaced'
+    Assert (@(Get-PolicyConflicts $kept).Count -eq 2) 'the kept entry should no longer be asked about'
+    $report = New-ApplyPlanReport $plan
+    Assert ($report -match 'CHANGE BrowserSignin : 1 -> 0\s+- set elsewhere') 'the preview does not flag the replaced value'
+    Assert ($report -match 'Set elsewhere: 3 ') 'the preview does not summarise the conflicts'
+    # the rows say the same thing
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willReplace') 'a ticked row over somebody else''s value should say Will replace'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'NewTabPageLocation')) -eq 'willReplace') 'an unticked New Tab row over somebody else''s value should say Will replace (asks first)'
+    Assert ((T 'state.willReplace') -ne '' -and (T 'tip.replace') -ne '') 'strings are missing'
+}
+Test-Case 'existing settings: Cancel changes nothing; Keep changes nothing and says so' {
+    Set-ExistingScenario
+    $script:SelfTestExistingAnswers.Enqueue('Cancel')
+    Invoke-ApplyAction
+    Assert ($script:SelfTestExistingDialogs.Count -eq 1) 'the question was not asked'
+    Assert ($null -eq $script:SelfTestLastResult) 'Cancel must not apply anything'
+    Assert ((Get-PolicyNow 'BrowserSignin') -eq 1 -and (Get-PolicyNow 'NewTabPageLocation') -eq 'https://intranet.example') 'Cancel changed the registry'
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert ($script:SelfTestExistingDialogs.Count -eq 2) 'the question was not asked again'
+    Assert ((Get-PolicyNow 'BrowserSignin') -eq 1) 'Keep changed BrowserSignin'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://company.example/search?q={searchTerms}') 'Keep changed the search engine'
+    Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderKeyword')) 'Keep half replaced the search engine'
+    Assert ((Get-PolicyNow 'NewTabPageLocation') -eq 'https://intranet.example') 'Keep removed the New Tab page'
+    Assert (@($script:SelfTestDialogs | Where-Object { $_[1] -eq (T 'msg.apply.allKept') }).Count -ge 1) 'Keep did not say that nothing was changed'
+    Assert ($null -eq $script:SelfTestLastResult) 'nothing was applied, so there is no result'
+    Assert ($script:ExistingMode -eq 'ask') 'a single Keep must not become a standing preference'
+}
+Test-Case 'existing settings: untick one to keep just that one; replace does the rest and reports both' {
+    Set-ExistingScenario
+    $script:SelfTestExistingAnswers.Enqueue(@{ Action = 'Replace'; Keep = @('search') })
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'BrowserSignin') -eq 0) 'the ticked BrowserSignin was not replaced'
+    Assert ($null -eq (Get-PolicyNow 'NewTabPageLocation')) 'the ticked New Tab page was not removed'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://company.example/search?q={searchTerms}' -and (Get-PolicyNow 'DefaultSearchProviderName') -eq 'Company Search') 'the unticked search engine was touched'
+    Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderKeyword')) 'the unticked search engine got new values'
+    $r = $script:SelfTestLastResult
+    Assert ($r -and $r.ConflictsReplaced -eq 2 -and $r.ConflictsKept -eq 1) "replaced/kept = $($r.ConflictsReplaced)/$($r.ConflictsKept)"
+    Assert ($r.Failures.Count -eq 0) 'apply reported failures'
+    Assert ((Get-Content -LiteralPath $script:LogFile -Raw) -match 'REPLACED BrowserSignin: 1 -> 0') 'the log does not record what was replaced'
+}
+Test-Case 'existing settings: Replace overwrites everything, remembers what it wrote, and the next Apply has nothing to ask' {
+    Set-ExistingScenario
+    $script:SelfTestExistingAnswers.Enqueue('Replace')
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'BrowserSignin') -eq 0) 'BrowserSignin'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://search.brave.com/search?q={searchTerms}') 'search URL'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderKeyword') -eq 'brave') 'search keyword'
+    Assert ($null -eq (Get-PolicyNow 'NewTabPageLocation')) 'New Tab page'
+    Assert ($script:SelfTestLastResult.ConflictsReplaced -eq 3 -and $script:SelfTestLastResult.ConflictsKept -eq 0) 'result counts'
+    Assert ($script:AppliedLedger['BrowserSignin'] -eq '0') 'the ledger did not record BrowserSignin'
+    $asked = $script:SelfTestExistingDialogs.Count
+    Invoke-ApplyAction
+    Assert ($script:SelfTestExistingDialogs.Count -eq $asked) 'nothing is set elsewhere any more, so nothing should be asked'
+    Assert (@($script:SelfTestDialogs | Where-Object { $_[1] -eq (T 'msg.apply.nothing') }).Count -ge 1) 'the second Apply should have nothing to do'
+    # the ledger survives a restart
+    $before = $script:AppliedLedger['DefaultSearchProviderSearchURL']
+    $script:AppliedLedger = @{}
+    Import-AppliedLedger
+    Assert ($script:AppliedLedger['DefaultSearchProviderSearchURL'] -eq $before -and $before) 'the ledger was not saved to the settings file'
+}
+Test-Case 'existing settings: a custom search address typed in this app is ours from then on; one typed elsewhere is not' {
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    $script:Overrides.Search.Enabled = $true; $script:Overrides.Search.EngineId = 'custom'
+    $script:Overrides.Search.CustomUrl = 'https://my-searx.example/search?q={searchTerms}'
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://my-searx.example/search?q={searchTerms}') 'the custom engine was not applied'
+    Assert ($script:SelfTestExistingDialogs.Count -eq 0) 'a first Apply into an empty key must not ask'
+    $script:Overrides.Search.CustomUrl = 'https://other.example/find?q={searchTerms}'
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://other.example/find?q={searchTerms}') 'changing our own custom engine should just work'
+    Assert ($script:SelfTestExistingDialogs.Count -eq 0) 'our own custom engine was treated as somebody else''s'
+    $script:Overrides.Search.Enabled = $false
+    Invoke-ApplyAction
+    Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderSearchURL')) 'unticking should remove our own custom engine'
+    Assert ($script:SelfTestExistingDialogs.Count -eq 0) 'removing our own custom engine should not ask'
+    # somebody else's engine at the same place is asked about
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'DefaultSearchProviderSearchURL' -Value 'https://elsewhere.example/?q={searchTerms}' -PropertyType String | Out-Null
+    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    $c = @(Get-PolicyConflicts (New-ApplyPlan))
+    Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'search') -and ($null -eq $c[0].Wants)) 'an engine set elsewhere should be listed as a removal'
+}
+Test-Case 'existing settings: a custom search engine written by an older version (nothing remembered) is recognised as ours' {
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    $key = $script:PolicyKeyPath
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderEnabled' -Value 1 -PropertyType DWord | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderName' -Value 'Custom Search' -PropertyType String | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderKeyword' -Value 'custom' -PropertyType String | Out-Null
+    New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderSearchURL' -Value 'https://my-searx.example/search?q={searchTerms}' -PropertyType String | Out-Null
+    $script:Snapshot = Read-PolicySnapshot -Path $key
+    Assert (@(Get-PolicyConflicts (New-ApplyPlan)).Count -eq 0) 'an older custom engine should not be asked about'
+    Assert (@(@((Get-ForeignPolicyValues).Values) | Where-Object { $_ -like 'DefaultSearchProvider*' }).Count -eq 0) 'an older custom engine must not be called foreign'
+    Invoke-ApplyAction                   # the search override is off, so the engine is removed - it is ours, so without a question
+    Assert ($script:SelfTestExistingDialogs.Count -eq 0) 'removing our own older custom engine should not ask'
+    Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderSearchURL')) 'the older custom engine was not removed'
+}
+Test-Case 'existing settings: a list of startup pages set elsewhere is asked about, kept whole or removed whole' {
+    Reset-Sandbox
+    $script:ChkBackup.Checked = $false
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'RestoreOnStartup' -Value 4 -PropertyType DWord | Out-Null
+    New-Item -Path (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs') -Force | Out-Null
+    New-ItemProperty -LiteralPath (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs') -Name '1' -Value 'https://intranet.example/start' -PropertyType String | Out-Null
+    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    $c = @(Get-PolicyConflicts (New-ApplyPlan))
+    Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'startup')) 'the startup pages should be one entry'
+    Assert ($c[0].Current -match 'intranet\.example/start') "startup current: $($c[0].Current)"
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert ((Get-PolicyNow 'RestoreOnStartup') -eq 4 -and (Read-PolicySnapshot -Path $script:PolicyKeyPath).Urls.Count -eq 1) 'Keep did not keep the startup pages'
+    $script:SelfTestExistingAnswers.Enqueue('Replace')
+    Invoke-ApplyAction
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    Assert (($null -eq $snap.Values['RestoreOnStartup']) -and ($snap.Urls.Count -eq 0)) 'Replace did not remove the startup pages'
+}
+Test-Case 'existing settings: the preference (ask / always replace / always keep) is respected, saved and shown in Tools' {
+    Set-ExistingScenario
+    Set-ExistingMode 'keep'
+    Assert ((Get-BfoSettings -Path $script:SettingsPath)['existingMode'] -eq 'keep') 'the preference was not saved'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'foreign') 'with "always keep", the row should show Set elsewhere'
+    Update-PendingSummary
+    Assert ($script:LblPending.Text -eq (T 'bar.none')) "nothing should be pending when everything is kept: $($script:LblPending.Text)"
+    Assert ((New-ApplyPlanReport (New-ApplyPlan -KeepNames @('BrowserSignin'))) -match 'LEAVE\s+BrowserSignin = 1\s+- set elsewhere; kept') 'the preview does not explain a kept value'
+    Invoke-ApplyAction
+    Assert ($script:SelfTestExistingDialogs.Count -eq 0) '"always keep" must not ask'
+    Assert ((Get-PolicyNow 'BrowserSignin') -eq 1 -and (Get-PolicyNow 'NewTabPageLocation') -eq 'https://intranet.example') '"always keep" changed something'
+    Set-ExistingMode 'replace'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willReplace') '"always replace" shows Will replace'
+    Invoke-ApplyAction
+    Assert ($script:SelfTestExistingDialogs.Count -eq 0) '"always replace" must not ask'
+    Assert ((Get-PolicyNow 'BrowserSignin') -eq 0 -and $null -eq (Get-PolicyNow 'NewTabPageLocation')) '"always replace" did not replace'
+    $menu = New-ToolsMenu
+    $sub = $menu.Items | Where-Object { "$($_.Tag)" -eq 'tools.existing' }
+    Assert ($sub -and $sub.DropDownItems.Count -eq 3) 'the Tools menu has no submenu for this'
+    Assert ((@($sub.DropDownItems | Where-Object { $_.Checked }).Count -eq 1) -and (($sub.DropDownItems | Where-Object { $_.Checked }).Tag -eq 'tools.existing.replace')) 'the submenu does not show the current preference'
+    # "do this every time" on the question itself
+    Set-ExistingScenario
+    Set-ExistingMode 'ask'
+    $script:SelfTestExistingAnswers.Enqueue(@{ Action = 'Keep'; Remember = $true })
+    Invoke-ApplyAction
+    Assert ($script:ExistingMode -eq 'keep') 'ticking "do this every time" did not switch the preference'
+    Set-ExistingScenario
+    Set-ExistingMode 'ask'
+    $script:SelfTestExistingAnswers.Enqueue(@{ Action = 'Replace'; Keep = @('search'); Remember = $true })
+    Invoke-ApplyAction
+    Assert ($script:ExistingMode -eq 'ask') 'a partly ticked answer must not become a standing "always replace"'
+    Set-ExistingMode 'ask'
+    Set-ExistingMode 'nonsense'
+    Assert ($script:ExistingMode -eq 'ask') 'an unknown preference must be ignored'
+}
+
 # =============================================================== 8. window, pages, filter, actions
 $form.ShowInTaskbar = $false; $form.StartPosition = 'Manual'; $form.Location = New-Object System.Drawing.Point(-32000, -32000)
 $form.Show()
@@ -749,15 +944,18 @@ Test-Case 'window: row status follows the registry (Active / Will apply / Will c
     Reset-Sandbox
     New-Item -Path $script:PolicyKeyPath -Force | Out-Null
     New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveRewardsDisabled' -Value 1 -PropertyType DWord | Out-Null
-    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveWalletDisabled' -Value 0 -PropertyType DWord | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveWalletDisabled' -Value 0 -PropertyType DWord | Out-Null              # a value this tool never writes: somebody else's
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'HardwareAccelerationModeEnabled' -Value 1 -PropertyType DWord | Out-Null  # one of our own two choices
     New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveNewsDisabled' -Value 1 -PropertyType DWord | Out-Null
     Invoke-LoadCurrentState
-    Set-ItemChecked (Get-BfoItem 'Policy' 'BraveWalletDisabled') $true      # registry has a different value -> change
+    Set-ItemChecked (Get-BfoItem 'Policy' 'BraveWalletDisabled') $true      # registry has somebody else's value -> replace (asks first)
+    Set-ItemChoice (Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled') 'disable'   # registry has our other choice -> change
     Set-ItemChecked (Get-BfoItem 'Policy' 'BraveVPNDisabled') $true          # not in registry -> apply
     Set-ItemChecked (Get-BfoItem 'Policy' 'BraveNewsDisabled') $false        # in registry, unticked -> remove
     Update-AllItemViews
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveRewardsDisabled')) -eq 'active') 'active'
-    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveWalletDisabled')) -eq 'willChange') 'willChange'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveWalletDisabled')) -eq 'willReplace') 'willReplace'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled')) -eq 'willChange') 'willChange'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveVPNDisabled')) -eq 'willApply') 'willApply'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveNewsDisabled')) -eq 'willRemove') 'willRemove'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveTalkDisabled')) -eq 'notSet') 'notSet'
@@ -812,20 +1010,106 @@ Test-Case 'actions: opening Brave pages goes through the un-elevated launcher (r
     Assert ($menu.Items.Count -ge 8) 'tools menu is incomplete'
 }
 
+function Invoke-ExistingDialogForTest {
+    param($Conflicts, [string]$Button, [string[]]$Untick = @(), [bool]$Remember = $false)
+    $ui = New-ExistingPoliciesDialog $Conflicts
+    try {
+        $f = $ui.Form
+        $f.ShowInTaskbar = $false; $f.StartPosition = 'Manual'; $f.Location = New-Object System.Drawing.Point(-32000, -32000)
+        $f.Show()
+        1..3 | ForEach-Object { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }
+        foreach ($row in $ui.Grid.Rows) { if ($Untick -contains $row.Tag.Key) { $row.Cells[0].Value = $false } }
+        if ($Remember -and $ui.Remember.Enabled) { $ui.Remember.Checked = $true }
+        $unticked = @(); foreach ($row in $ui.Grid.Rows) { if (-not [bool]$row.Cells[0].Value) { $unticked += $row.Tag.Key } }
+        $every = ($ui.Remember.Checked -and $ui.Remember.Enabled)
+        switch ($Button) {
+            'Apply'  { $ui.Apply.PerformClick() }
+            'Keep'   { $ui.Keep.PerformClick() }
+            'Cancel' { $ui.Cancel.PerformClick() }
+            'Escape' { $f.Close() }
+        }
+        return (New-ExistingChoice -Action $ui.State.Action -Conflicts $Conflicts -KeepKeys $unticked -Remember $every)
+    } finally { $ui.Form.Dispose(); $script:ExistingUi = $null }
+}
+Test-Case 'existing settings window: lists every entry ticked, unticking turns "every time" off, and each button gives its answer' {
+    Set-ExistingScenario
+    $conflicts = @(Get-PolicyConflicts (New-ApplyPlan))
+    $ui = New-ExistingPoliciesDialog $conflicts
+    try {
+        $f = $ui.Form
+        $f.ShowInTaskbar = $false; $f.StartPosition = 'Manual'; $f.Location = New-Object System.Drawing.Point(-32000, -32000)
+        $f.Show()
+        1..4 | ForEach-Object { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 60 }
+        Assert ($ui.Grid.Rows.Count -eq 3) "rows: $($ui.Grid.Rows.Count)"
+        Assert (@($ui.Grid.Rows | Where-Object { -not [bool]$_.Cells[0].Value }).Count -eq 0) 'every entry should start ticked'
+        Assert ($ui.Remember.Enabled -and -not $ui.Remember.Checked) '"every time" should be available, and off, while everything is ticked'
+        foreach ($row in $ui.Grid.Rows) { Assert (("$($row.Cells['setting'].Value)" -ne '') -and ("$($row.Cells['current'].Value)" -ne '') -and ("$($row.Cells['wants'].Value)" -ne '')) "row $($row.Tag.Key) has an empty cell" }
+        $ntpRow = $ui.Grid.Rows | Where-Object { $_.Tag.Key -eq 'ntp' }
+        Assert ($ntpRow.Cells['wants'].Value -eq (T 'existing.remove')) 'the removal is not spelled out'
+        Assert ($ui.Intro.Text -eq (T 'existing.intro' @(3))) 'the count is wrong'
+        $origin = New-Object System.Drawing.Point(0, 0)
+        $introY = $ui.Intro.PointToScreen($origin).Y; $gridY = $ui.Grid.PointToScreen($origin).Y; $applyY = $ui.Apply.PointToScreen($origin).Y
+        Assert (($ui.Grid.Height -gt 60) -and ($introY -lt $gridY) -and ($applyY -gt ($gridY + $ui.Grid.Height))) "the window is laid out wrongly: intro $introY, list $gridY (height $($ui.Grid.Height)), buttons $applyY"
+        $ui.Remember.Checked = $true
+        $ui.Grid.Rows[0].Cells[0].Value = $false
+        Assert ((-not $ui.Remember.Enabled) -and (-not $ui.Remember.Checked)) 'unticking a row must switch "every time" off'
+        $ui.Grid.Rows[0].Cells[0].Value = $true
+        Assert $ui.Remember.Enabled '"every time" should come back when everything is ticked again'
+        # a click on the first row's title, then on its tick box (the grid's protected click method, called directly)
+        $onClick = [System.Windows.Forms.DataGridView].GetMethod('OnCellClick', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        $click = [System.Windows.Forms.DataGridViewCellEventArgs]::new(1, 0)
+        [void]$onClick.Invoke($ui.Grid, [object[]]@($click.psobject.BaseObject))
+        Assert (-not [bool]$ui.Grid.Rows[0].Cells[0].Value) 'clicking a row should untick it'
+        $click = [System.Windows.Forms.DataGridViewCellEventArgs]::new(0, 0)
+        [void]$onClick.Invoke($ui.Grid, [object[]]@($click.psobject.BaseObject))
+        Assert ([bool]$ui.Grid.Rows[0].Cells[0].Value) 'clicking the tick box should tick it again'
+    } finally { $ui.Form.Dispose(); $script:ExistingUi = $null }
+
+    $r = Invoke-ExistingDialogForTest $conflicts 'Apply'
+    Assert (($r.Action -eq 'Replace') -and ($r.KeepNames.Count -eq 0)) 'Apply BFO changes anyway with everything ticked should replace all'
+    $r = Invoke-ExistingDialogForTest $conflicts 'Apply' -Untick @('BrowserSignin')
+    Assert (($r.Action -eq 'Replace') -and ($r.KeepNames -contains 'BrowserSignin') -and ($r.KeepNames -notcontains 'NewTabPageLocation')) 'an unticked entry should be kept and only that one'
+    $r = Invoke-ExistingDialogForTest $conflicts 'Keep'
+    Assert (($r.Action -eq 'Keep') -and ($r.KeepNames -contains 'BrowserSignin') -and ($r.KeepNames -contains 'NewTabPageLocation') -and ($r.KeepNames -contains 'DefaultSearchProviderSearchURL')) 'Keep existing settings should keep every entry'
+    $r = Invoke-ExistingDialogForTest $conflicts 'Cancel'
+    Assert ($r.Action -eq 'Cancel') 'Cancel'
+    $r = Invoke-ExistingDialogForTest $conflicts 'Escape'
+    Assert ($r.Action -eq 'Cancel') 'closing the window must count as Cancel'
+    $r = Invoke-ExistingDialogForTest $conflicts 'Keep' -Remember $true
+    Assert ($r.Remember) '"do this every time" was lost'
+    $r = Invoke-ExistingDialogForTest $conflicts 'Apply' -Untick @('search') -Remember $true
+    Assert (-not $r.Remember) '"do this every time" must be ignored when a row was unticked'
+}
+
 # =============================================================== 9. languages
 $originalLocale = $script:CurrentLocale
 foreach ($loc in $script:LocaleList) {
     Test-Case "language $($loc.Code) ($($loc.EnglishName)): switches live, no missing text, right direction and font" {
         [void](Set-BfoLocale -Code $loc.Code)
         Update-UiLanguage
+        $wantRtl = [bool]$loc.Rtl
         $missing = New-Object System.Collections.ArrayList
         Find-MissingText $script:Form $missing
         Assert ($missing.Count -eq 0) "untranslated placeholders: $($missing -join ' | ')"
         foreach ($g in $script:Grids.Values) {
             foreach ($row in $g.Rows) { foreach ($c in $row.Cells) { Assert (-not ("$($c.Value)" -match '!!')) "grid cell '$($c.Value)'" } }
         }
-        foreach ($mi in $script:ToolsMenu.Items) { Assert (-not ("$($mi.Text)" -match '!!')) "menu '$($mi.Text)'" }
-        $wantRtl = [bool]$loc.Rtl
+        foreach ($mi in $script:ToolsMenu.Items) {
+            Assert (-not ("$($mi.Text)" -match '!!')) "menu '$($mi.Text)'"
+            if ($mi -is [System.Windows.Forms.ToolStripMenuItem]) { foreach ($sub in $mi.DropDownItems) { Assert (-not ("$($sub.Text)" -match '!!')) "submenu '$($sub.Text)'" } }
+        }
+        $sample = @(
+            [pscustomobject]@{ Key = 'BrowserSignin'; Title = (T 'policy.BrowserSignin.title'); Policy = 'BrowserSignin'; Current = '1'; Wants = '0'; Names = @('BrowserSignin') },
+            [pscustomobject]@{ Key = 'ntp'; Title = (T 'existing.group.ntp'); Policy = 'NewTabPageLocation'; Current = 'https://intranet.example'; Wants = $null; Names = @('NewTabPageLocation') })
+        $ui = New-ExistingPoliciesDialog $sample
+        try {
+            $bad = New-Object System.Collections.ArrayList
+            Find-MissingText $ui.Form $bad
+            Assert ($bad.Count -eq 0) "existing-settings window: untranslated placeholders: $($bad -join ' | ')"
+            foreach ($col in $ui.Grid.Columns) { Assert (-not ("$($col.HeaderText)" -match '!!')) "existing-settings column '$($col.HeaderText)'" }
+            Assert (($ui.Form.RightToLeft -eq [System.Windows.Forms.RightToLeft]::Yes) -eq $wantRtl) 'the existing-settings window does not follow the language direction'
+            Assert ($ui.Apply.Text -ne '' -and $ui.Keep.Text -ne '' -and $ui.Cancel.Text -ne '') 'a button of the existing-settings window has no text'
+        } finally { $ui.Form.Dispose(); $script:ExistingUi = $null }
         Assert ($script:IsRtl -eq $wantRtl) "IsRtl is $($script:IsRtl)"
         Assert (($script:Form.RightToLeft -eq [System.Windows.Forms.RightToLeft]::Yes) -eq $wantRtl) 'form direction does not match the language'
         Assert (Test-FontInstalled (Get-FontPlan).Body) "font '$((Get-FontPlan).Body)' is not installed"

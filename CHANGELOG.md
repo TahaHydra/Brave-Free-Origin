@@ -4,9 +4,9 @@ All notable changes to Brave Free Origin. Newest first. Every release is checked
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow the app's own numbering.
 
-## [1.13] - unreleased
+## [2.0] - 2026-09-30
 
-A ground-up rework of the interface and of the policy catalog. The goal: **you should always know what a checkbox does before you tick it, and what the tool wrote after you press Apply.** Checked against **Brave 154.1.96.59 (Chromium 154) on 2026-09-29**; everything the tool writes is still reversible. The problems found in v1.12 are tracked in [#19](https://github.com/TahaHydra/Brave-Free-Origin/issues/19) (issues #7 to #18).
+A ground-up rework of the interface and of the policy catalog: version 2.0 of Brave Free Origin. The goal: **you should always know what a checkbox does before you tick it, and what the tool wrote after you press Apply.** Checked against **Brave 154.1.96.59 (Chromium 154) on 2026-09-29**; everything the tool writes is still reversible. The problems found in v1.12 are tracked in [#19](https://github.com/TahaHydra/Brave-Free-Origin/issues/19) (issues #7 to #18).
 
 ### Easier to understand
 - **Every setting is a plain-language row.** A title that says what happens ("Turn off Brave Rewards"), one sentence about what actually changes, a **Status** column (Active / Will apply / Will change / Will remove / Not set) and a **Risk** column (Safe / Low / Medium / High). The technical policy name is one click away (**Show policy names**) and in the tooltip.
@@ -34,12 +34,14 @@ A ground-up rework of the interface and of the policy catalog. The goal: **you s
 - Presets no longer touch the updater switches or the search / new tab / startup overrides.
 
 ### Safer changes to your system
+- **Existing settings are never replaced in silence.** If Apply would change or remove a policy value this tool did not write (set by hand, by another tool or by your organization), it stops and shows an *Existing Brave policies detected* window: every entry with its current value and the value BFO wants (or *remove it*). **Apply BFO changes anyway** replaces the ticked entries (all start ticked), **Keep existing settings** keeps them all and still applies everything else, **Cancel** writes nothing, and unticking one entry keeps just that one. A search engine, a New Tab page or a startup choice is one entry that is kept or replaced whole, never half and half. *Do this every time without asking*, or **Tools > Settings already set elsewhere** (ask / always replace / always keep), makes the answer permanent. Rows say **Will replace** beforehand, Preview flags the values, the result window counts what was replaced and what was kept, and the log names each one.
+- **The tool remembers what it wrote.** The registry cannot say who wrote a value, so Apply records the values it writes (per Windows user, in `settings.json`). A custom search address or a list of startup pages typed into the app can later be changed or removed without a question; values from earlier versions are recognised by the lists the app knows. Restore stock forgets the record.
 - **Hosts file:** the blocklist groups were rebuilt from real Brave traffic (wrong and harmful entries such as the component-updater servers are never pre-ticked). Editing preserves your own entries byte for byte, whatever the file's encoding or line endings, handles read-only and UTF-16 files, and backs up first.
 - **Config import:** importing a config can only tick updater rows ("disable this"); it never unticks one, so it cannot re-enable an updater you turned off. Exports list only ticked updater rows.
 - **Hosts markers:** the block is edited only when its START / END markers pair up; a damaged block is reported and the file is left untouched. The read-only flag is put back even when a write fails.
 - **Scriptlets:** filter-list files are split on LF, CRLF and CR alike and written back with their own line endings.
 - **Updater switches:** scheduled tasks and services are now found by pattern (Brave names them with a GUID and your account's SID, so exact names never matched), only rows you changed produce operations, and turning updates off asks first. Restore stock turns everything back on.
-- **One policy key.** Brave reads a single policy key for Stable, Beta, Nightly and Dev, so the channel selector is gone (the old per-channel keys were inert). **Restore stock** still cleans them up. Apply and Restore stock remove only values this tool could have written (same name, same kind of data, a value from its own list); a known policy holding some other value is shown as **Set elsewhere**, reported by Verify and left alone unless you tick the row or choose to remove everything.
+- **One policy key.** Brave reads a single policy key for Stable, Beta, Nightly and Dev, so the channel selector is gone (the old per-channel keys were inert). **Restore stock** still cleans them up. Restore stock removes only values this tool could have written (same name, same kind of data, a value from its own list, or one it remembers writing); a known policy holding some other value is shown as **Set elsewhere**, reported by Verify and kept unless you choose to remove everything. Apply asks before replacing such a value (see above).
 - **Opening `brave://policy` works.** Brave is now started un-elevated through Explorer (Chromium 138+ refuses or mis-handles an elevated launch); if that ever fails the address is copied to the clipboard.
 
 ### Errors are explained, not hidden
@@ -51,7 +53,7 @@ A ground-up rework of the interface and of the policy catalog. The goal: **you s
 - **Portable:** download `Brave-Free-Origin.zip`, extract, double-click `Brave-Free-Origin.bat`. The launcher now explains exit codes (declined UAC, blocked scripts) and where the log is.
 
 ### For contributors
-- `tools\Test-App.ps1`: about 50 sandboxed tests (policies go to a throw-away HKCU hive, the hosts file is a temp file, tasks and services are fakes, no UAC): catalog integrity, preset invariants, apply / verify / restore, hosts encodings, updater matching, window layout, every language switch.
+- `tools\Test-App.ps1`: about 65 sandboxed tests (policies go to a throw-away HKCU hive, the hosts file is a temp file, tasks and services are fakes, no UAC): catalog integrity, preset invariants, apply / verify / restore, hosts encodings, updater matching, window layout, every language switch.
 - `tools\Test-Bootstrap.ps1`: 16 tests of the one-line installer against a fake GitHub on loopback.
 - `tools\Export-BravePolicyNames.ps1` reads the policy table out of an installed Brave's `chrome.dll`: `-Check` compares the catalog with that Brave, and the snapshot in `tools\data` lets the tests fail when the catalog offers a policy Brave does not know.
 - The release workflow now runs the whole CI workflow before it publishes, and can be started by hand as a dry run.
@@ -223,7 +225,7 @@ Two additions, both opt-in.
 ## [1.5]
 Four additions, all opt-in and reversible. Nothing changes in existing modes — the new features sit alongside what you already know.
 
-- **Multi-channel target selector** (removed in 1.13: Brave reads one policy key for every channel). A dropdown in the header now lets you point the apply at Brave Stable, Beta, Nightly, Dev, or all installed channels at once. Other channels share the same policy schema but live under separate registry hives.
+- **Multi-channel target selector** (removed in 2.0: Brave reads one policy key for every channel). A dropdown in the header now lets you point the apply at Brave Stable, Beta, Nightly, Dev, or all installed channels at once. Other channels share the same policy schema but live under separate registry hives.
 - **Hosts file blocklist tab.** Optional DNS-level kill switch for Brave telemetry domains. Even if a Brave update bypasses a policy, the network call still fails. Sentinel-tagged in the hosts file (`# === Brave-Free-Origin START ===` / `=== END ===`) so removal is surgical and never touches your other entries. Auto-backs up `hosts` before any write. Has its own Apply / Remove buttons inside the tab — does **not** fire from the main "Apply to Brave" button, so you can never edit hosts by accident.
 - **Export / Import config.** Save your tuned checkbox state to a JSON file and reuse it on another machine, or share a community preset. Round-trips policies, tasks, services, and hosts groups.
 - **Verify button.** Reads the registry of every target channel and reports back which selected policies are present, missing, or have a wrong value. Also lists currently-blocked hosts entries. Useful when [Brave bug 45106](https://github.com/brave/brave-browser/issues/45106) leaves a feature visible despite the policy being set — `Verify` proves the registry is correct so you know whose problem it is.

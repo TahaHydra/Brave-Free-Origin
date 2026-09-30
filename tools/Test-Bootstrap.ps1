@@ -282,7 +282,7 @@ try {
     Test-Case 'version text that is not a version is rejected without any web request' {
         Reset-Work
         $before = $hits.Count
-        $r = Invoke-Bootstrap -Version '1.13; calc' -Lang '' -Hook $okHook
+        $r = Invoke-Bootstrap -Version '2.0; calc' -Lang '' -Hook $okHook
         Assert ($r.Exit -eq 1 -and $r.Output -match 'not a version') "message was: $($r.Output)"
         Assert ($hits.Count -eq $before) 'a request was made for an invalid version'
     }

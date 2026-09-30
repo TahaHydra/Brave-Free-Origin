@@ -5,7 +5,7 @@
 ## What it does
 
 1. Checks the environment: Windows, FullLanguage mode, no Group Policy that only allows signed scripts. Enables TLS 1.2 for Windows PowerShell 5.1.
-2. Asks `api.github.com` for the latest release of `TahaHydra/Brave-Free-Origin` (or `$env:BFO_VERSION`, for example `v1.13`).
+2. Asks `api.github.com` for the latest release of `TahaHydra/Brave-Free-Origin` (or `$env:BFO_VERSION`, for example `v2.0`).
 3. Requires the release asset `Brave-Free-Origin.zip` **and** the SHA-256 that GitHub records for it. No checksum, no run.
 4. Downloads the zip into `%LOCALAPPDATA%\Brave-Free-Origin\run\<random id>\`, compares its SHA-256 with GitHub's, and stops (deleting the download) on any difference.
 5. Unpacks it, refusing any entry whose path would leave that folder, and requires `Brave-Free-Origin.ps1` inside.
@@ -60,7 +60,7 @@ irm https://raw.githubusercontent.com/TahaHydra/Brave-Free-Origin/main/install/b
 
 ### Before you announce it
 
-1. Publish the release that contains this version of the app (push the `v1.13` tag; the Release workflow builds and attaches `Brave-Free-Origin.zip`). The installer downloads the **latest release**, so until v1.13 is published the one-liner would start the old v1.12 app (it works, but it is the old interface and the old policy list).
+1. Publish the release that contains this version of the app (push the `v2.0` tag; the Release workflow builds and attaches `Brave-Free-Origin.zip`). The installer downloads the **latest release**, so until v2.0 is published the one-liner would start the old v1.12 app (it works, but it is the old interface and the old policy list).
 2. Check the route: `curl.exe -sI https://xhydra.fr/bfo` shows `200` (or a redirect to the raw URL) and `content-type: text/plain`.
 3. Run download-only mode against the live route: `$env:BFO_NO_LAUNCH = '1'; irm https://xhydra.fr/bfo | iex`, and confirm `Matches.` appears.
 4. Run the real thing once on a clean Windows profile, both from a standard user (UAC asks for an administrator password) and from an administrator account.

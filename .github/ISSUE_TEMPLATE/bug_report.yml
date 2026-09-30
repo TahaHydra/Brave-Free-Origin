@@ -24,8 +24,8 @@ body:
     id: app-version
     attributes:
       label: Brave Free Origin version
-      description: Shown in the window title, for example "Brave Free Origin v1.13".
-      placeholder: "1.13"
+      description: Shown in the window title, for example "Brave Free Origin v2.0".
+      placeholder: "2.0"
     validations:
       required: true
   - type: input

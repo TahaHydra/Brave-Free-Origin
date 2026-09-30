@@ -23,8 +23,8 @@ Partial translations are fine and ship happily: anything you leave out falls bac
 | `es-ES.json` | Español | Machine-assisted, unreviewed |
 | `hi-IN.json` | हिन्दी | Machine-assisted, unreviewed |
 | `ar.json` | العربية (right-to-left) | Machine-assisted, unreviewed |
-| `zh-CN.json` | 简体中文 | Requested in [#4](https://github.com/TahaHydra/Brave-Free-Origin/issues/4); strings new in 1.13 machine-assisted |
-| `zh-TW.json` | 繁體中文 | Contributed by @tsai97216; strings new in 1.13 machine-assisted |
+| `zh-CN.json` | 简体中文 | Requested in [#4](https://github.com/TahaHydra/Brave-Free-Origin/issues/4); strings new in 2.0 machine-assisted |
+| `zh-TW.json` | 繁體中文 | Contributed by @tsai97216; strings new in 2.0 machine-assisted |
 
 **The most useful contribution is a native speaker reading a file top to bottom** and fixing whatever sounds wrong. Once a second speaker has read it, set `"reviewed": true`, add yourself to `translators`, and the app stops showing the *community translation, unreviewed* note.
 
@@ -38,7 +38,7 @@ Partial translations are fine and ship happily: anything you leave out falls bac
     "locale": "fr-FR",
     "name": "Français",
     "englishName": "French",
-    "appVersion": "1.13",
+    "appVersion": "2.0",
     "translators": ["your-github-handle"],
     "reviewed": false,
     "direction": "ltr"
@@ -107,7 +107,7 @@ Two things that *are* translatable and easy to miss:
 
 ## How the words work in this app
 
-The whole point of the 1.13 interface is that nobody should have to guess what a checkbox does. Your translation carries that.
+The whole point of the 2.0 interface is that nobody should have to guess what a checkbox does. Your translation carries that.
 
 - A **row** is one Brave setting. Its **title** says what happens ("Turn off Brave Rewards"), its **description** says what actually changes, in plain words.
 - **Ticked** = this tool enforces the row. For most rows that switches a feature *off*. **Unticked** = Brave decides again, and Apply removes the policy this tool wrote earlier. Use your language's everyday words for *tick / untick a checkbox* and use the same ones everywhere (`tip.*`, `help.tick.*`, `policyTab.*`, `filter.selectedOnly`).
@@ -125,6 +125,7 @@ Get these wrong and someone loses their DRM playback, their sign-in or their bro
 - `preset.MaxPrivacy.description` / `.risk`, `preset.MaxPerformance.description` / `.risk`
 - `updater.warning`, `msg.updater.confirm`
 - `msg.restore.confirm`, `msg.restore.confirmForeign`
+- `existing.replace`, `existing.keep`, `existing.note`, `tip.replace` (the question before Apply replaces a setting somebody else made: the button that replaces must clearly say replace and the one that keeps must clearly say keep)
 - `msg.scriptlet.confirmDisable`, `msg.scriptlet.confirmRestoreAll`, `scriptlet.risk`
 
 A translation that makes a destructive option sound routine is worse than no translation at all.

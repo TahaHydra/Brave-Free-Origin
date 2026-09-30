@@ -44,7 +44,7 @@ The one-liner itself runs before anything can be checked, so it trusts the websi
 $env:BFO_NO_LAUNCH = '1'; irm https://xhydra.fr/bfo | iex
 ```
 
-Other options (set them in the same window before the command): `$env:BFO_VERSION = 'v1.13'` pins a release, `$env:BFO_LANG = 'fr-FR'` starts the app in a language. The same script is also served straight from GitHub: `irm https://raw.githubusercontent.com/TahaHydra/Brave-Free-Origin/main/install/bfo.ps1 | iex`.
+Other options (set them in the same window before the command): `$env:BFO_VERSION = 'v2.0'` pins a release, `$env:BFO_LANG = 'fr-FR'` starts the app in a language. The same script is also served straight from GitHub: `irm https://raw.githubusercontent.com/TahaHydra/Brave-Free-Origin/main/install/bfo.ps1 | iex`.
 
 ### Option 2: portable ZIP
 
@@ -76,6 +76,25 @@ Requirements: Windows 10 or 11 with the built-in Windows PowerShell 5.1, and Bra
 
 **Status** tells you where a row stands: *Active* (already applied), *Will apply / Will change / Will remove* (waiting for you to press Apply), *Not set* (Brave decides). **Risk** says what an everyday user could lose: *Safe* and *Low* are fine for everybody; *Medium* and *High* change how Brave behaves, so read the description first.
 
+### If a setting is already set elsewhere
+
+Your organization, another tool or a registry edit of your own may already have set some of the same policies. The tool never replaces those in silence. When **Apply** would change or remove a value it did not write, it stops first and lists them next to what it wants to write. This is the *Existing Brave policies detected* window; in the list the row's Status says **Will replace** in advance.
+
+![The Existing Brave policies detected window: three settings that are already set, each with its current value and the value BFO wants](images/existing-settings.png)
+
+For example, with these three values set by an organization:
+
+| Setting | Current value | BFO wants |
+| --- | --- | --- |
+| Block browser sign-in (`BrowserSignin`) | `1` | `0` |
+| Search engine (`DefaultSearchProvider*`) | `https://company.example/search?q={searchTerms}` | `https://search.brave.com/search?q={searchTerms}` |
+| New Tab page (`NewTabPageLocation`) | `https://intranet.example` | (remove it) |
+
+- **Apply BFO changes anyway** replaces the ticked entries. All of them start ticked; untick one to keep it as it is. Everything else you selected is applied as usual.
+- **Keep existing settings** keeps every listed entry and still applies the rest. **Cancel** stops, and nothing is written.
+- Tick *Do this every time without asking* to stop being asked, or choose the behaviour at any time under **Tools > Settings already set elsewhere** (*Ask me each time*, *Always replace them*, *Always keep them*).
+- Afterwards the result window says how many settings were replaced and how many were kept, the log lists each one, and the backup taken before Apply (the `.reg` file) still holds the old values.
+
 ### Presets
 
 | Preset | What it does | Risk | Rows |
@@ -94,7 +113,7 @@ Presets only tick boxes. They never touch the updater switches or your search en
 
 ## Undo everything
 
-- **Restore stock...** (bottom bar) removes the policy values this tool could have written, clears its block from the hosts file, and turns any updater task or service it disabled back on. Values that someone else set (your organization, another tool) are left alone: a policy holding a value this tool would never write shows **Set elsewhere**, and Apply and Restore stock only replace it if you tick that row or ask to remove everything. One limit: a value identical to one this tool writes cannot be told apart from its own.
+- **Restore stock...** (bottom bar) removes the policy values this tool could have written, clears its block from the hosts file, and turns any updater task or service it disabled back on. Values that someone else set (your organization, another tool) stay unless you agree otherwise: a policy holding a value this tool would never write shows **Set elsewhere**; **Restore stock** leaves it in place unless you choose to remove everything, and **Apply** asks before replacing it (see [If a setting is already set elsewhere](#if-a-setting-is-already-set-elsewhere)). One limit: a value identical to one this tool writes cannot be told apart from its own.
 - Or pick **Stock / None** and press **Apply**.
 - While **Back up first** is ticked (it is by default), a backup of your policy key is saved before every Apply in `Documents\Brave-Free-Origin-Backups\`; double-click a `.reg` file there to restore that state. **Tools > Open backups folder** takes you there.
 - Uninstalling is just deleting the folder: the app installs nothing and adds no scheduled task or startup entry.
@@ -134,6 +153,12 @@ By default only the policy values you tick, under `HKLM\SOFTWARE\Policies\BraveS
 <summary><strong>Brave now says "Managed by your organization". Is something wrong?</strong></summary>
 
 No. Brave, like every Chromium browser, shows that note whenever any machine policy is active. There is no supported way to keep the policies and hide the note; it disappears when you remove the policies (**Restore stock**).
+</details>
+
+<details>
+<summary><strong>How does the tool know which values are its own?</strong></summary>
+
+The registry does not record who wrote a value, so the tool works it out. It remembers what it last wrote (in `settings.json`, per Windows user) and also recognises the values it can produce itself: its own choices, a search engine's address from its list, `about:blank`, values that older versions wrote. Anything else counts as set elsewhere and is only replaced after you agree. A value that happens to be identical to one the tool would write cannot be told apart and is treated as its own.
 </details>
 
 <details>
@@ -192,7 +217,7 @@ Under **Advanced** in the sidebar. None of these are touched by presets.
 
 - **Updater tasks and services.** Stops Brave from checking for updates on its own. Only for people who update Brave by hand: without updates you miss security fixes. The app asks before doing it and Restore stock re-enables everything.
 - **Hosts blocklist.** A second line of defence: blocks Brave's telemetry domains at the Windows level, in a marked block of the `hosts` file (your own entries are preserved byte for byte, and a backup is saved first). The `hosts` file matches exact names only. Component-update servers are listed but never pre-ticked, because blocking them silently freezes ad-block list updates.
-- **Search engine and startup.** Optional overrides for your default search engine, New Tab page and what opens on startup. They win over the matching rows on other pages.
+- **Search engine and startup.** Optional overrides for your default search engine, New Tab page and what opens on startup. They win over the matching rows on other pages. If one of them would replace a value your organization or another tool set, Apply asks first.
 - **Scriptlets (expert).** Lists Brave's built-in ad-block scriptlet rules and lets you disable individual ones. Separate from the policy system, off by default, with per-file backups. Disabling scriptlets is not the same as disabling ad blocking: they are only the injected-rule layer used for site fixes and cookie-banner workarounds.
 
 ---
@@ -203,7 +228,7 @@ Under **Advanced** in the sidebar. None of these are touched by presets.
 | --- | --- |
 | Policies | `HKLM\SOFTWARE\Policies\BraveSoftware\Brave` |
 | Backups (before every Apply) | `%USERPROFILE%\Documents\Brave-Free-Origin-Backups\` |
-| Settings (chosen language) | `%LOCALAPPDATA%\Brave-Free-Origin\settings.json` |
+| Settings (language, what to do with settings set elsewhere, what this tool last wrote) | `%LOCALAPPDATA%\Brave-Free-Origin\settings.json` |
 | Logs (attach one to a bug report) | `%LOCALAPPDATA%\Brave-Free-Origin\logs\` |
 | One-line installer's temporary files | `%LOCALAPPDATA%\Brave-Free-Origin\run\` (deleted when you close the app) |
 

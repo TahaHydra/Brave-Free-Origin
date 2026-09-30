@@ -23,7 +23,7 @@ Values that someone else put in the same policy key are not removed unless they 
 
 - **You trust `xhydra.fr` to serve the right script.** The script is [`install/bfo.ps1`](install/bfo.ps1) in this repository; read it before running it, or fetch it with `$env:BFO_NO_LAUNCH = '1'` (download and verify only, nothing starts) and read the unpacked files.
 - **The script then trusts GitHub** to serve the release you asked for, over HTTPS from `github.com/TahaHydra/Brave-Free-Origin/releases`, and refuses to run anything whose SHA-256 differs from the checksum GitHub records for that exact file (or when no checksum is available). That protects against a corrupted or tampered *download*; it cannot protect against a compromised repository account or a compromised web server, which is inherent to any pipe-to-shell installer.
-- To take the website out of the picture, use the **portable ZIP** from the Releases page and compare it with `SHA256SUMS.txt`, or pin a release with `$env:BFO_VERSION = 'v1.13'`.
+- To take the website out of the picture, use the **portable ZIP** from the Releases page and compare it with `SHA256SUMS.txt`, or pin a release with `$env:BFO_VERSION = 'v2.0'`.
 - The script never changes your PowerShell execution policy (the bypass is passed to one child process), never disables or excludes anything from Windows security, and removes its temporary folder when you close the app. It keeps a small log in `%LOCALAPPDATA%\Brave-Free-Origin\logs`.
 
 ## Reporting a vulnerability

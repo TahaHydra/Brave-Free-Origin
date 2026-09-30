@@ -31,7 +31,7 @@
     Options are read from environment variables, because a piped script cannot
     take parameters. Set them in the same window first:
 
-        $env:BFO_VERSION = 'v1.13'   # a specific release instead of the latest
+        $env:BFO_VERSION = 'v2.0'   # a specific release instead of the latest
         $env:BFO_LANG    = 'fr-FR'   # start the app in this language
         $env:BFO_NO_LAUNCH = '1'     # download + verify + unpack only, then print the
                                      # folder so you can read every file before running it
@@ -113,7 +113,7 @@ function Get-BfoReleaseInfo {
     $route = if ($Version) {
         $tag = $Version.Trim()
         if ($tag -notmatch '^[vV]?\d+(\.\d+){1,3}([-.][0-9A-Za-z.]+)?$') {
-            throw (New-BfoError "'$Version' is not a version like v1.13.")
+            throw (New-BfoError "'$Version' is not a version like v2.0.")
         }
         if ($tag -notmatch '^[vV]') { $tag = "v$tag" }
         "releases/tags/$tag"
