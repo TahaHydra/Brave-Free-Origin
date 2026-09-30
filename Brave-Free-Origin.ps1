@@ -6030,6 +6030,7 @@ function Invoke-ApplyAction {
             }
             $script:ActiveProfile = 'Custom'
             $keep = @($keep + $riskNames | Select-Object -Unique)
+            $keptEntries = @($conflicts | Where-Object { @($_.Names | Where-Object { $keep -contains $_ }).Count -gt 0 }).Count
             Update-AllItemViews
             Update-Filter
             Update-Chrome
