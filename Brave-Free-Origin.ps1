@@ -40,7 +40,7 @@ param(
 #region Bootstrap -------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
 
-$script:AppVersion       = '2.0'
+$script:AppVersion       = '2.0.1'
 $script:CatalogBrave     = '154.1.96.59'   # Brave build the policy catalog was verified against
 $script:CatalogBraveMajor = 154
 $script:CatalogDate      = '2026-09-29'

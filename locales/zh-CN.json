@@ -3,7 +3,7 @@
     "locale": "zh-CN",
     "name": "简体中文",
     "englishName": "Chinese (Simplified)",
-    "appVersion": "2.0",
+    "appVersion": "2.0.1",
     "translators": [],
     "reviewed": false,
     "note": "zh-CN support added in response to issue #4, opened by @A81N9. The Chinese wording has not been reviewed by a native speaker, and the strings that are new in 1.13 are machine-translated and unreviewed - see TRANSLATING.md if you would like to review or improve it."

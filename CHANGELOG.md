@@ -4,6 +4,24 @@ All notable changes to Brave Free Origin. Newest first. Every release is checked
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow the app's own numbering.
 
+## [2.0.1] - 2026-09-30
+
+Fixes for 2.0: switching language while the app is open no longer closes the window, and the question before Apply is easier to read and more careful about what it treats as yours.
+
+### Fixed
+- **Switching language live** (most visibly to or from Arabic, which mirrors the whole window) could close the main window. The window now runs on the normal application loop, which survives that change.
+- **Keeping a setting really keeps it.** Choosing *Keep all existing* (or unticking a row) in the question before Apply now also unticks that setting in the main window, so the window shows what will happen and you are not asked again next time.
+- A policy that already holds the value BFO would write, but that BFO never recorded writing, now shows **Set elsewhere** instead of **Active**.
+
+### Changed
+- **Simpler wording.** The question before replacing settings is now *Review existing settings* (columns *Current* and *Selected*; buttons *Apply selected changes*, *Keep all existing*, *Cancel*). The result window shows one line ("3 change(s) applied.") and tells you to reopen Brave. *Open brave://policy* is now *View in Brave* and *Verify* is *Check changes*. Policy names and values are hidden by default; **Show policy names** brings them back.
+- **Ownership is conservative.** BFO treats a value as its own only when it recorded writing that exact value (plus the clean-up names older versions used). After upgrading from an older version BFO may therefore ask once about policies that version set; nothing is replaced or removed without your answer. Restore stock removes what BFO recorded and asks before touching anything else. README and SECURITY.md say so.
+- All seven languages follow the new wording.
+
+### Project
+- The README starts with the one-line install command.
+- Release pages are short: install lines and a summary, with the details folded away. Older releases are hidden from the Releases page (their source stays on the Tags page).
+
 ## [2.0] - 2026-09-30
 
 A ground-up rework of the interface and of the policy catalog: version 2.0 of Brave Free Origin. The goal: **you should always know what a checkbox does before you tick it, and what the tool wrote after you press Apply.** Checked against **Brave 154.1.96.59 (Chromium 154) on 2026-09-29**; everything the tool writes is still reversible. The problems found in v1.12 are tracked in [#19](https://github.com/TahaHydra/Brave-Free-Origin/issues/19) (issues #7 to #18).

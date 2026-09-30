@@ -3,7 +3,7 @@
     "locale": "hi-IN",
     "name": "हिन्दी",
     "englishName": "Hindi",
-    "appVersion": "2.0",
+    "appVersion": "2.0.1",
     "translators": [],
     "reviewed": false,
     "note": "Machine-assisted translation, not yet reviewed by a native speaker. See TRANSLATING.md to help improve it."
