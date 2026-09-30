@@ -324,12 +324,12 @@ Test-Case 'registry: unticking a matching policy loaded from the PC requests rem
     Assert (($conflicts.Count -eq 1) -and ($conflicts[0].Key -eq 'BraveVPNDisabled') -and ($null -eq $conflicts[0].Wants)) 'the removal must appear in the review dialog'
     $script:SelfTestExistingAnswers.Enqueue('Keep')
     Invoke-ApplyAction
-    Assert ((Get-PolicyNow 'BraveVPNDisabled') -eq 1) 'Keep removed the existing VPN policy'
+    Assert (((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['BraveVPNDisabled']) -eq 1) 'Keep removed the existing VPN policy'
     Assert ($vpn.Checked) 'Keep should restore the checkbox to the loaded current state'
     Set-ItemChecked $vpn $false
     $script:SelfTestExistingAnswers.Enqueue('Replace')
     Invoke-ApplyAction
-    Assert ($null -eq (Get-PolicyNow 'BraveVPNDisabled')) 'Apply selected changes did not remove the policy'
+    Assert ($null -eq ((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['BraveVPNDisabled'])) 'Apply selected changes did not remove the policy'
 }
 
 Test-Case 'data risk: destructive policies warn, No unselects them, Yes applies them, and clearing them does not warn' {
@@ -341,7 +341,7 @@ Test-Case 'data risk: destructive policies warn, No unselects them, Yes applies 
     Assert (@(Get-DataRiskOps $plan).Count -eq 1) 'site-data deletion policy was not classified as data risk'
     $script:SelfTestAnswers.Enqueue('No')
     Invoke-ApplyAction
-    Assert ($null -eq (Get-PolicyNow 'DefaultBraveRemember1PStorageSetting')) 'answering No still applied the site-data deletion policy'
+    Assert ($null -eq ((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['DefaultBraveRemember1PStorageSetting'])) 'answering No still applied the site-data deletion policy'
     Assert (-not $storage.Checked) 'answering No should unselect the risky row'
     Assert (@($script:SelfTestDialogs | Where-Object { $_[0] -eq (T 'msg.title.dataRisk') }).Count -ge 1) 'the data-loss warning was not shown'
 
@@ -351,7 +351,7 @@ Test-Case 'data risk: destructive policies warn, No unselects them, Yes applies 
     Set-ItemChecked $storage $true
     $script:SelfTestAnswers.Enqueue('Yes')
     Invoke-ApplyAction
-    Assert ((Get-PolicyNow 'DefaultBraveRemember1PStorageSetting') -eq 2) 'answering Yes did not apply the selected risky policy'
+    Assert (((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['DefaultBraveRemember1PStorageSetting']) -eq 2) 'answering Yes did not apply the selected risky policy'
     Set-ItemChecked $storage $false
     Assert (@(Get-DataRiskOps (New-ApplyPlan)).Count -eq 0) 'removing a destructive policy should not itself trigger a data-loss warning'
 
