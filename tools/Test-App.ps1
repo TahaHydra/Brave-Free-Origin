@@ -111,6 +111,16 @@ Test-Case 'catalog: no policy that Brave 154 no longer knows is offered' {
     Assert ($script:PolicyByName.ContainsKey('EnableMediaRouter')) 'EnableMediaRouter (the real Cast policy) is missing'
     Assert ($script:PolicyByName['BatterySaverModeAvailability'].Value -eq 1) 'BatterySaverModeAvailability must be 1 (2 is deprecated)'
 }
+Test-Case 'catalog: every policy the app writes is known to the Brave it was checked against (snapshot of its policy table)' {
+    $snapshot = Join-Path (Split-Path -Parent $SelfTest) 'data\brave-policy-names.txt'
+    Assert (Test-Path -LiteralPath $snapshot) 'tools\data\brave-policy-names.txt is missing; run tools\Export-BravePolicyNames.ps1'
+    $known = @(Get-Content -LiteralPath $snapshot -Encoding UTF8 | Where-Object { $_ -and -not $_.StartsWith('#') })
+    Assert ($known.Count -gt 300) "the snapshot only lists $($known.Count) names"
+    $offered = @($script:PolicyByName.Keys) + @($script:OverridePolicyNames) + @('RestoreOnStartupURLs')
+    $missing = @($offered | Where-Object { $known -notcontains $_ } | Select-Object -Unique)
+    Assert ($missing.Count -eq 0) ("Brave $($script:CatalogBrave) does not know: " + ($missing -join ', ') + ' (a policy Brave does not know is silently ignored)')
+    Assert ($script:CatalogBrave -and ((Get-Content -LiteralPath $snapshot -TotalCount 1) -match [regex]::Escape($script:CatalogBrave))) 'the snapshot was made from a different Brave than CatalogBrave says'
+}
 Test-Case 'catalog: pages, presets, risks, states and hosts groups all have strings' {
     foreach ($id in $script:PageOrder.Id) { foreach ($p in 'title', 'intro') { Assert ($script:EnglishStrings.ContainsKey("page.$id.$p")) "page.$id.$p" } }
     foreach ($k in $script:AllPresetKeys) { foreach ($p in 'name', 'description', 'risk') { Assert ($script:EnglishStrings.ContainsKey("preset.$k.$p")) "preset.$k.$p" } }
@@ -258,6 +268,66 @@ Test-Case 'registry: values older versions wrote for policies Brave no longer ha
     $left = @((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values.Keys)
     Assert ($left -contains 'SomeCompanyPolicy') 'restore removed the foreign value'
     foreach ($n in $leftovers) { Assert ($left -notcontains $n) "$n was left behind by restore" }
+}
+Test-Case 'registry: a known policy that someone else set to a different value is left alone by Apply and Restore, and shows as Set elsewhere' {
+    Reset-Sandbox
+    New-Item -Path $script:PolicyKeyPath -Force | Out-Null
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BrowserSignin' -Value 1 -PropertyType DWord | Out-Null                    # the catalog writes 0
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'HardwareAccelerationModeEnabled' -Value 7 -PropertyType DWord | Out-Null   # not one of our two choices
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveWalletDisabled' -Value 1 -PropertyType DWord | Out-Null              # identical to ours: treated as ours
+    Invoke-LoadCurrentState
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'foreign') 'a different value should show as Set elsewhere'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled')) -eq 'foreign') 'a value outside our choices should show as Set elsewhere'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveWalletDisabled')) -eq 'active') 'an identical value is ours and shows as Active'
+    $plan = New-ApplyPlan
+    Assert (($plan.Counts.Leave -eq 2) -and ($plan.Counts.Clear -eq 0)) "expected 2 Leave and 0 Clear, got $($plan.Counts.Leave) / $($plan.Counts.Clear)"
+    Assert (-not (Test-PlanHasChanges $plan)) 'leaving other people''s values alone must not count as a pending change'
+    Assert ((New-ApplyPlanReport $plan) -match 'LEAVE\s+BrowserSignin') 'Preview does not say the value is left alone'
+    [void](Invoke-ApplyNow)
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    Assert (($snap.Values['BrowserSignin'] -eq 1) -and ($snap.Values['HardwareAccelerationModeEnabled'] -eq 7)) 'Apply removed a value that was not ours'
+    $foreign = Get-ForeignPolicyValues
+    Assert (($foreign.Values -contains 'BrowserSignin') -and ($foreign.Values -contains 'HardwareAccelerationModeEnabled') -and ($foreign.Values -notcontains 'BraveWalletDisabled')) 'the foreign list is wrong'
+    Assert ((New-VerifyReport) -match 'BrowserSignin') 'Verify does not list the value it leaves alone'
+    $fail = @(Invoke-FullRestore -RemoveForeign $false)
+    Assert ($fail.Count -eq 0) "restore failures: $($fail -join '; ')"
+    $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    Assert ($snap.Values.ContainsKey('BrowserSignin') -and $snap.Values.ContainsKey('HardwareAccelerationModeEnabled')) 'Restore removed a value that was not ours'
+    Assert (-not $snap.Values.ContainsKey('BraveWalletDisabled')) 'Restore left our own value behind'
+    # ticking the row is an explicit request to replace it
+    Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willChange') 'ticking should offer to replace the other value'
+    [void](Invoke-ApplyNow)
+    Assert ((Read-PolicySnapshot -Path $script:PolicyKeyPath).Values['BrowserSignin'] -eq 0) 'the ticked row was not applied'
+    # a value an older version wrote still counts as ours
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BatterySaverModeAvailability' -Value 2 -PropertyType DWord -Force | Out-Null
+    $script:Snapshot = Read-PolicySnapshot -Path $script:PolicyKeyPath
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BatterySaverModeAvailability')) -eq 'willRemove') 'the v1.12 Battery Saver value should count as ours'
+}
+Test-Case 'config: importing never re-enables an updater the user disabled, and export lists only ticked updater rows' {
+    Reset-Sandbox
+    $uaName = 'BraveSoftwareUpdateTaskUserS-1-12-1-1-2-3-4UA{22222222-2222-2222-2222-222222222222}'
+    $script:FakeTasks = @([pscustomobject]@{ Name = $uaName; State = 'Disabled'; Task = $null })
+    # a config (also what older versions exported) that lists every updater row as false = "not ticked"
+    $old = '{ "schemaVersion": 3, "policies": { "BraveRewardsDisabled": true }, "tasks": { "core": false, "ua": false }, "services": { "brave": false, "bravem": false } }'
+    [void](Import-ConfigObject ($old | ConvertFrom-Json))
+    Assert (@(Get-SystemOps -Refresh).Count -eq 0) 'importing updater rows set to false must not produce an ENABLE operation'
+    # the same after the user has looked at the Updater page (so the disabled task is the baseline)
+    Import-CurrentSystemState -Refresh
+    [void](Import-ConfigObject ($old | ConvertFrom-Json))
+    Assert (@(Get-SystemOps).Count -eq 0) 'importing false changed an updater that was already disabled'
+    Assert ((Get-BfoItem 'Task' 'ua').Checked) 'the ua task is disabled on this PC and must stay ticked'
+    # a ticked row is exported, unticked ones are not, and importing a ticked row disables the task
+    Reset-Sandbox
+    Set-ItemChecked (Get-BfoItem 'Task' 'ua') $true
+    $cfg = New-ConfigObject
+    Assert ($cfg.tasks.Contains('ua') -and -not $cfg.tasks.Contains('core')) 'export should list only the ticked updater rows'
+    Assert ($cfg.services.Count -eq 0) 'no service was ticked, so none should be exported'
+    Reset-Sandbox
+    $script:FakeTasks = @([pscustomobject]@{ Name = $uaName; State = 'Ready'; Task = $null })
+    [void](Import-ConfigObject (($cfg | ConvertTo-Json -Depth 5) | ConvertFrom-Json))
+    $ops = @(Get-SystemOps -Refresh)
+    Assert (($ops.Count -eq 1) -and ($ops[0].Action -eq 'Disable')) 'a ticked updater row in a config should still disable the task'
 }
 Test-Case 'registry: restore also removes the legacy per-channel keys older versions wrote' {
     Reset-Sandbox
@@ -410,6 +480,69 @@ Test-Case 'hosts: UTF-16 files and read-only files are handled' {
     Set-HostsManagedDomains -Domains @('example.test')
     Assert ((Get-Item -LiteralPath $script:HostsFile).IsReadOnly) 'the read-only attribute was not restored'
     Set-ItemProperty -LiteralPath $script:HostsFile -Name IsReadOnly -Value $false
+}
+Test-Case 'hosts: a damaged block (START without END, END without START, START twice) is refused and the file is left untouched' {
+    Reset-Sandbox
+    $cases = [ordered]@{
+        'start without end' = "127.0.0.1 localhost`r`n# === Brave-Free-Origin START - managed block ===`r`n0.0.0.0 a.example.test`r`n192.168.1.50 my-nas`r`n192.168.1.60 printer`r`n"
+        'end without start' = "127.0.0.1 localhost`r`n0.0.0.0 a.example.test`r`n# === Brave-Free-Origin END ===`r`n192.168.1.50 my-nas`r`n"
+        'start twice'       = "# === Brave-Free-Origin START ===`r`n0.0.0.0 a.example.test`r`n# === Brave-Free-Origin START ===`r`n0.0.0.0 b.example.test`r`n# === Brave-Free-Origin END ===`r`n192.168.1.50 my-nas`r`n"
+    }
+    foreach ($name in $cases.Keys) {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($cases[$name])
+        Write-HostsBytes $bytes
+        $refused = $false
+        try { Set-HostsManagedDomains -Domains @('new.example.test') } catch { $refused = ("$($_.Exception.Message)" -match 'damaged') }
+        Assert $refused "$name : the damaged block was not refused"
+        $after = Read-HostsBytes
+        Assert (($after.Length -eq $bytes.Length) -and ((Find-Bytes $after $bytes) -eq 0)) "$name : the file was changed"
+    }
+    Write-HostsBytes ([System.Text.Encoding]::ASCII.GetBytes($cases['start without end']))
+    Assert (@(Get-HostsManagedDomains).Count -eq 0) 'an unclosed block must not be reported as blocked domains'
+    # two well-formed blocks are fine: both are replaced by one, and the user's line stays
+    Write-HostsBytes ([System.Text.Encoding]::ASCII.GetBytes("# === Brave-Free-Origin START ===`r`n0.0.0.0 a.example.test`r`n# === Brave-Free-Origin END ===`r`n192.168.1.50 my-nas`r`n# === Brave-Free-Origin START ===`r`n0.0.0.0 b.example.test`r`n# === Brave-Free-Origin END ===`r`n"))
+    Set-HostsManagedDomains -Domains @('c.example.test')
+    $text = [System.Text.Encoding]::ASCII.GetString((Read-HostsBytes))
+    Assert ((([regex]::Matches($text, 'Brave-Free-Origin START')).Count -eq 1) -and ($text -match '192\.168\.1\.50 my-nas')) 'two well-formed blocks should collapse into one and keep the user''s line'
+}
+Test-Case 'hosts: the read-only flag is put back even when the write fails' {
+    Reset-Sandbox
+    Write-HostsBytes ([System.Text.Encoding]::ASCII.GetBytes("127.0.0.1 localhost`r`n"))
+    Set-ItemProperty -LiteralPath $script:HostsFile -Name IsReadOnly -Value $true
+    # a handle that allows reading but not writing makes every write attempt fail, like an antivirus scanning the file
+    $lock = [System.IO.File]::Open($script:HostsFile, 'Open', 'Read', 'Read')
+    $failed = $false
+    try { Set-HostsManagedDomains -Domains @('example.test') } catch { $failed = $true } finally { $lock.Dispose() }
+    Assert $failed 'the write should have failed while the file was held open'
+    Assert ((Get-Item -LiteralPath $script:HostsFile).IsReadOnly) 'the read-only flag was not restored after the failed write'
+    Set-ItemProperty -LiteralPath $script:HostsFile -Name IsReadOnly -Value $false
+}
+Test-Case 'scriptlets: list files with LF and CRLF endings are split, edited and written back with their own line endings' {
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) ('bfo-scriptlet-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $rules = @('! title', 'example.com##+js(set-constant, a, 1)', '||ads.example^', 'other.org##+js(abort-on-property-read, b)')
+        foreach ($style in @(@{ Name = 'lf'; Nl = "`n" }, @{ Name = 'crlf'; Nl = "`r`n" })) {
+            $file = Join-Path $root "list-$($style.Name).txt"
+            $original = [System.Text.Encoding]::UTF8.GetBytes(($rules -join $style.Nl) + $style.Nl)
+            [System.IO.File]::WriteAllBytes($file, $original)
+            $data = Read-ListFileLines -Path $file
+            Assert ($data.Lines.Count -eq 4) "$($style.Name): expected 4 lines, got $($data.Lines.Count)"
+            Assert (($data.Lines[0] -eq '! title') -and ($data.Lines[1] -eq $rules[1])) "$($style.Name): lines were not split cleanly"
+            Assert (-not @($data.Lines | Where-Object { $_ -match "[`r`n]" }).Count) "$($style.Name): a line kept a stray CR or LF"
+            $rec = ConvertTo-ScriptletRecord -File $file -Root $root -Line $rules[1] -LineNumber 2
+            Assert ($null -ne $rec) 'the test rule was not recognised as a scriptlet rule'
+            Assert ((Set-ScriptletRuleState -Records @($rec) -Enable $false -AffectDuplicates $false) -eq 1) "$($style.Name): disabling changed the wrong number of lines"
+            $edited = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($file))
+            Assert ($edited -notmatch "`r`r") "$($style.Name): the edit produced CR CR"
+            Assert ($edited.Contains($script:ScriptletDisablePrefix + $rules[1])) "$($style.Name): the rule was not commented out"
+            if ($style.Name -eq 'lf') { Assert ($edited -notmatch "`r") 'an LF file gained CRs' } else { Assert (($edited -split "`r`n").Count -eq 5) 'a CRLF file lost its line endings' }
+            $rec2 = ConvertTo-ScriptletRecord -File $file -Root $root -Line ($script:ScriptletDisablePrefix + $rules[1]) -LineNumber 2
+            Assert ((Set-ScriptletRuleState -Records @($rec2) -Enable $true -AffectDuplicates $false) -eq 1) "$($style.Name): re-enabling failed"
+            $back = [System.IO.File]::ReadAllBytes($file)
+            Assert (($back.Length -eq $original.Length) -and ((Find-Bytes $back $original) -eq 0)) "$($style.Name): re-enabling did not restore the original bytes"
+        }
+    } finally { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
 }
 Test-Case 'hosts: presets tick hosts groups only when the feature is off, and Preview lists adds/keeps/removes' {
     Reset-Sandbox

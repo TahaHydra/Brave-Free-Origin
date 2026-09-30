@@ -739,6 +739,7 @@ Add-Strings @{
     'risk.safe'        = 'Safe'
     'state.active'     = 'Active'
     'state.blocked'    = 'Blocked'
+    'state.foreign'    = 'Set elsewhere'
     'state.disabled'   = 'Disabled'
     'state.enabled'    = 'Enabled'
     'state.missing'    = 'Not installed'
@@ -753,6 +754,7 @@ Add-Strings @{
     'state.willRemove' = 'Will remove'
     'state.willUnblock' = 'Will unblock'
     'tip.domains'      = 'Domains: {0}'
+    'tip.foreign'      = 'Something else (your organization, another tool) set a different value for this policy. Apply leaves it alone unless you tick this row.'
     'tip.hosts'        = 'Ticked groups are added to the Windows hosts file when you press Apply hosts blocks on this page. Unticked groups are removed.'
     'tip.lock'         = 'Brave already behaves this way by default. Ticking only makes it mandatory, so nothing can change it later.'
     'tip.pattern'      = 'Task name pattern: {0}'
@@ -1762,15 +1764,30 @@ function Split-HostsLines {
     return @($lines)
 }
 
+# Only a block that is properly closed counts: a START marker without its END would otherwise make every later
+# 0.0.0.0 line in the file look like ours.
 function Get-HostsManagedDomains {
     $domains = @()
-    $inBlock = $false
+    $pending = $null
     foreach ($line in (Split-HostsLines (Read-HostsFileText).Text)) {
-        if ($script:HostsStartRx.IsMatch($line)) { $inBlock = $true; continue }
-        if ($script:HostsEndRx.IsMatch($line))   { $inBlock = $false; continue }
-        if ($inBlock -and $line -match '^\s*0\.0\.0\.0\s+(\S+)') { $domains += $Matches[1] }
+        if ($script:HostsStartRx.IsMatch($line)) { $pending = New-Object System.Collections.ArrayList; continue }
+        if ($script:HostsEndRx.IsMatch($line))   { if ($null -ne $pending) { $domains += $pending }; $pending = $null; continue }
+        if ($null -ne $pending -and $line -match '^\s*0\.0\.0\.0\s+(\S+)') { [void]$pending.Add($Matches[1]) }
     }
     return $domains
+}
+
+# The markers must pair up (START, END, START, END ...). A damaged block - a START whose END was deleted, or an END with
+# no START - would make an edit swallow everything after the START line, so the file is not touched until the user has
+# looked at it.
+function Test-HostsBlockWellFormed {
+    param([string[]]$Lines)
+    $open = $false
+    foreach ($line in $Lines) {
+        if ($script:HostsStartRx.IsMatch($line)) { if ($open) { return $false }; $open = $true }
+        elseif ($script:HostsEndRx.IsMatch($line)) { if (-not $open) { return $false }; $open = $false }
+    }
+    return (-not $open)
 }
 
 function Backup-HostsFile {
@@ -1786,13 +1803,17 @@ function Backup-HostsFile {
 # $Domains is empty). Everything outside the block is preserved byte for byte.
 function Set-HostsManagedDomains {
     param([string[]]$Domains)
-    [void](Backup-HostsFile)
     $current = Read-HostsFileText
+    $existing = @(Split-HostsLines $current.Text)
+    if (-not (Test-HostsBlockWellFormed $existing)) {
+        throw 'The Brave Free Origin block in the hosts file is damaged (a START or END marker is missing or repeated), so nothing was changed. Open the hosts file, delete or repair the marker lines, and try again.'
+    }
+    [void](Backup-HostsFile)
     $newline = if ($current.Text -match "\r\n") { "`r`n" } elseif ($current.Text -match "\n") { "`n" } else { "`r`n" }
 
     $kept = New-Object System.Collections.ArrayList
     $skipping = $false
-    foreach ($line in (Split-HostsLines $current.Text)) {
+    foreach ($line in $existing) {
         if ($script:HostsStartRx.IsMatch($line)) { $skipping = $true; continue }
         if ($script:HostsEndRx.IsMatch($line))   { $skipping = $false; continue }
         if (-not $skipping) { [void]$kept.Add($line) }
@@ -1814,24 +1835,30 @@ function Set-HostsManagedDomains {
 
     # The file may be read-only, or briefly locked by antivirus.
     $attributes = $null
-    if (Test-Path -LiteralPath $script:HostsFile) {
-        $attributes = (Get-Item -LiteralPath $script:HostsFile).Attributes
-        if ($attributes -band [System.IO.FileAttributes]::ReadOnly) {
-            Set-ItemProperty -LiteralPath $script:HostsFile -Name Attributes -Value ($attributes -bxor [System.IO.FileAttributes]::ReadOnly)
+    $clearedReadOnly = $false
+    try {
+        if (Test-Path -LiteralPath $script:HostsFile) {
+            $attributes = (Get-Item -LiteralPath $script:HostsFile).Attributes
+            if ($attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                Set-ItemProperty -LiteralPath $script:HostsFile -Name Attributes -Value ($attributes -bxor [System.IO.FileAttributes]::ReadOnly)
+                $clearedReadOnly = $true
+            }
         }
-    }
-    $written = $false
-    for ($attempt = 1; $attempt -le 4 -and -not $written; $attempt++) {
-        try {
-            [System.IO.File]::WriteAllBytes($script:HostsFile, [byte[]]$bytes)
-            $written = $true
-        } catch [System.IO.IOException] {
-            if ($attempt -eq 4) { throw }
-            Start-Sleep -Milliseconds (250 * $attempt)
+        $written = $false
+        for ($attempt = 1; $attempt -le 4 -and -not $written; $attempt++) {
+            try {
+                [System.IO.File]::WriteAllBytes($script:HostsFile, [byte[]]$bytes)
+                $written = $true
+            } catch [System.IO.IOException] {
+                if ($attempt -eq 4) { throw }
+                Start-Sleep -Milliseconds (250 * $attempt)
+            }
         }
-    }
-    if ($attributes -band [System.IO.FileAttributes]::ReadOnly) {
-        Set-ItemProperty -LiteralPath $script:HostsFile -Name Attributes -Value $attributes
+    } finally {
+        # The user set the read-only flag on purpose: put it back even when the write failed.
+        if ($clearedReadOnly) {
+            try { Set-ItemProperty -LiteralPath $script:HostsFile -Name Attributes -Value $attributes } catch { Write-Log "Could not restore the read-only flag on the hosts file: $_" 'WARN' }
+        }
     }
     # Prove it: read back and compare, so "hosts updated" is never a guess.
     $back = @(Get-HostsManagedDomains)
@@ -2088,6 +2115,8 @@ $script:LegacyPolicyNames = @(
     'MediaRouterEnabled', 'PromotionalTabsEnabled', 'ReadingListEnabled', 'SigninAllowed', 'TabOrganizerSettings',
     'WebTorrentDisabled', 'WelcomePageOnOSUpgradeEnabled'
 )
+# Values older versions wrote that differ from what the current catalog writes.
+$script:LegacyPolicyValues = @{ 'BatterySaverModeAvailability' = @(2) }
 $script:OverridePolicyNames = @(
     'DefaultSearchProviderEnabled', 'DefaultSearchProviderName', 'DefaultSearchProviderKeyword',
     'DefaultSearchProviderSearchURL', 'DefaultSearchProviderSuggestURL',
@@ -2176,6 +2205,26 @@ function Get-DesiredPolicyMap {
     return [pscustomobject]@{ Values = $map; Urls = $ov.Urls; HasStartupOverride = $script:Overrides.Startup.Enabled }
 }
 
+# Ownership. A value in the shared Brave policy key can come from this tool, an administrator, Group Policy or another
+# tool, and the registry does not say which. A value counts as this tool's own only if it is one this tool could have
+# written: a name only older versions used, a search / New Tab / startup override name, or a catalog name holding the same
+# kind of data with a value from the catalog (any choice, or a value an older version wrote). Anything else - for example
+# BrowserSignin = 1 set by an administrator - is left alone by Apply and Restore stock unless the user asks for it.
+# A value identical to what this tool writes cannot be told apart from its own; that is the one unavoidable ambiguity.
+function Test-OwnedPolicyValue {
+    param([string]$Name, $Value, [string]$Kind)
+    if ($script:LegacyPolicyNames -contains $Name) { return $true }
+    if ($script:OverridePolicyNames -contains $Name) { return $true }
+    $def = $script:PolicyByName[$Name]
+    if (-not $def) { return $false }
+    $kindWanted = if ($def.Type -eq 'DWORD') { 'DWord' } else { 'String' }
+    if ($Kind -and $Kind -ne $kindWanted) { return $false }
+    # @( ) around the whole if: a one-element result would otherwise be unrolled to a scalar and += would fail.
+    $known = @(if ($def.Choices) { $def.Choices.Values } else { $def.Value })
+    if ($script:LegacyPolicyValues.ContainsKey($Name)) { $known += $script:LegacyPolicyValues[$Name] }
+    return (@($known | Where-Object { "$_" -eq "$Value" }).Count -gt 0)
+}
+
 function Get-ManagedPolicyNames {
     return @(@($script:PolicyByName.Keys) + $script:OverridePolicyNames + $script:LegacyPolicyNames | Select-Object -Unique)
 }
@@ -2200,8 +2249,10 @@ function Get-RegistryOps {
                 Type = $want.Type; Value = $want.Value; Old = $(if ($has) { $Snapshot.Values[$name] } else { $null })
             })
         } elseif ($has) {
+            # Clear what this tool wrote; leave a value someone else set (see Test-OwnedPolicyValue).
+            $owned = Test-OwnedPolicyValue -Name $name -Value $Snapshot.Values[$name] -Kind $Snapshot.Kinds[$name]
             [void]$ops.Add([pscustomobject]@{
-                Path = $script:PolicyKeyPath; Action = 'Clear'; Name = $name
+                Path = $script:PolicyKeyPath; Action = $(if ($owned) { 'Clear' } else { 'Leave' }); Name = $name
                 Type = $null; Value = $null; Old = $Snapshot.Values[$name]
             })
         }
@@ -2252,7 +2303,7 @@ function New-ApplyPlan {
         Desired = $desired
         Registry = @(Get-RegistryOps -Desired $desired -Snapshot $snap)
         UrlOps = @(); System = @()
-        Counts = @{ Add = 0; Change = 0; Keep = 0; Clear = 0 }
+        Counts = @{ Add = 0; Change = 0; Keep = 0; Clear = 0; Leave = 0 }
     }
     $urlOp = Get-StartupUrlOp -Desired $desired -Snapshot $snap
     if ($urlOp) { $plan.UrlOps = @($urlOp) }
@@ -2322,7 +2373,10 @@ function Invoke-ApplyPlan {
 function Get-ForeignPolicyValues {
     $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
     $managed = Get-ManagedPolicyNames
-    $foreign = @($snap.Values.Keys | Where-Object { $managed -notcontains $_ } | Sort-Object)
+    # Foreign = a name this tool does not use, or a known name holding a value it would never write.
+    $foreign = @($snap.Values.Keys | Where-Object {
+        ($managed -notcontains $_) -or -not (Test-OwnedPolicyValue -Name $_ -Value $snap.Values[$_] -Kind $snap.Kinds[$_])
+    } | Sort-Object)
     $extraSub = @($snap.SubKeys | Where-Object { $_ -ne 'RestoreOnStartupURLs' } | Sort-Object)
     return [pscustomobject]@{ Values = $foreign; SubKeys = $extraSub; Count = ($foreign.Count + $extraSub.Count) }
 }
@@ -2340,7 +2394,9 @@ function Invoke-FullRestore {
             $snap = Read-PolicySnapshot -Path $path
             $managed = Get-ManagedPolicyNames
             foreach ($name in $snap.Values.Keys) {
-                if ($managed -contains $name) { Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop }
+                if ($managed -contains $name -and (Test-OwnedPolicyValue -Name $name -Value $snap.Values[$name] -Kind $snap.Kinds[$name])) {
+                    Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop
+                }
             }
             $urls = Join-Path $path 'RestoreOnStartupURLs'
             if (Test-Path -LiteralPath $urls) { Remove-Item -LiteralPath $urls -Recurse -Force -ErrorAction Stop }
@@ -2436,8 +2492,9 @@ function New-ConfigObject {
     foreach ($item in $script:Items) {
         switch ($item.Kind) {
             'Policy'  { $cfg.policies[$item.Id] = [bool]$item.Checked; if ($item.Def.Choices) { $cfg.policyValues[$item.Id] = $item.Value } }
-            'Task'    { $cfg.tasks[$item.Id]    = [bool]$item.Checked }
-            'Service' { $cfg.services[$item.Id] = [bool]$item.Checked }
+            # Updater rows are exported only when ticked ("keep it disabled"); an unticked row means "not managed".
+            'Task'    { if ($item.Checked) { $cfg.tasks[$item.Id]    = $true } }
+            'Service' { if ($item.Checked) { $cfg.services[$item.Id] = $true } }
             'Host'    { $cfg.hosts[$item.Id]    = [bool]$item.Checked }
         }
     }
@@ -2470,18 +2527,20 @@ function Import-ConfigObject {
             }
         }
     }
+    # Only "true" (disable this updater item) is applied. "false" - what older versions exported for every row,
+    # touched or not - is ignored, so importing a config can never re-enable an updater the user turned off.
     $legacyTasks = @{ 'BraveSoftwareUpdateTaskMachineCore' = 'core'; 'BraveSoftwareUpdateTaskMachineUA' = 'ua' }
     if ($Cfg.tasks) {
         foreach ($p in $Cfg.tasks.PSObject.Properties) {
             $id = if ($legacyTasks.ContainsKey($p.Name)) { $legacyTasks[$p.Name] } else { $p.Name }
             $item = Get-BfoItem 'Task' $id
-            if ($item) { Set-ItemChecked $item (ConvertTo-BoolStrict $p.Value); $item.Loaded = $true } else { $unknown++ }
+            if (-not $item) { $unknown++ } elseif (ConvertTo-BoolStrict $p.Value) { Set-ItemChecked $item $true; $item.Loaded = $true }
         }
     }
     if ($Cfg.services) {
         foreach ($p in $Cfg.services.PSObject.Properties) {
             $item = Get-BfoItem 'Service' $p.Name
-            if ($item) { Set-ItemChecked $item (ConvertTo-BoolStrict $p.Value); $item.Loaded = $true } else { $unknown++ }
+            if (-not $item) { $unknown++ } elseif (ConvertTo-BoolStrict $p.Value) { Set-ItemChecked $item $true; $item.Loaded = $true }
         }
     }
     if ($Cfg.hosts) {
@@ -2545,10 +2604,12 @@ function Import-CurrentPolicyState {
         if ($item.Kind -ne 'Policy') { continue }
         $has = $snap.Values.ContainsKey($item.Id)
         if ($item.Def.Choices) {
+            # Ticked only when the registry holds one of the choices this tool offers; any other value is someone else's.
+            $matched = $false
             if ($has) {
-                foreach ($cid in $item.Def.Choices.Keys) { if ("$($item.Def.Choices[$cid])" -eq "$($snap.Values[$item.Id])") { $item.Value = $item.Def.Choices[$cid]; break } }
+                foreach ($cid in $item.Def.Choices.Keys) { if ("$($item.Def.Choices[$cid])" -eq "$($snap.Values[$item.Id])") { $item.Value = $item.Def.Choices[$cid]; $matched = $true; break } }
             }
-            Set-ItemChecked $item $has
+            Set-ItemChecked $item $matched
         } else {
             Set-ItemChecked $item ($has -and "$($snap.Values[$item.Id])" -eq "$($item.Def.Value)")
         }
@@ -2644,7 +2705,10 @@ function Get-ItemState {
                 if ("$($snap.Values[$Item.Id])" -eq "$($Item.Value)" -and $snap.Kinds[$Item.Id] -eq $(if ($Item.Def.Type -eq 'DWORD') { 'DWord' } else { 'String' })) { return 'active' }
                 return 'willChange'
             }
-            if ($has) { return 'willRemove' }
+            if ($has) {
+                if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'willRemove' }
+                return 'foreign'
+            }
             return 'notSet'
         }
         'Task' {
@@ -2687,6 +2751,7 @@ function New-ApplyPlanReport {
             'Add'    { [void]$r.AppendLine("  ADD    $($op.Name) = $($op.Value)") }
             'Change' { [void]$r.AppendLine("  CHANGE $($op.Name) : $($op.Old) -> $($op.Value)") }
             'Keep'   { [void]$r.AppendLine("  KEEP   $($op.Name) = $($op.Value)") }
+            'Leave'  { [void]$r.AppendLine("  LEAVE  $($op.Name) = $($op.Old)  - set by something else, not touched (tick the row to replace it)") }
             'Clear'  {
                 $note = if ($script:LegacyPolicyNames -contains $op.Name) { '  - leftover from an older version of this tool' } else { '' }
                 [void]$r.AppendLine("  CLEAR  $($op.Name) (currently $($op.Old))$note")
@@ -2772,7 +2837,7 @@ function New-VerifyReport {
         }
         $foreign = Get-ForeignPolicyValues
         if ($foreign.Count -gt 0) {
-            [void]$r.AppendLine("  Other Brave policies present that this tool does not manage: $($foreign.Count)")
+            [void]$r.AppendLine("  Other policy values present that this tool did not write and leaves alone: $($foreign.Count)")
             foreach ($n in $foreign.Values) { [void]$r.AppendLine("     - $n") }
             foreach ($n in $foreign.SubKeys) { [void]$r.AppendLine("     - (subkey) $n") }
         }
@@ -2833,9 +2898,7 @@ function Read-ListFileLines {
     param([string]$Path)
     $text = [System.IO.File]::ReadAllText($Path)
     $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $lines = [regex]::Split($text, "
-|
-")
+    $lines = [regex]::Split($text, '\r\n|\n|\r')
     $trailing = $text.EndsWith("`n")
     if ($trailing -and $lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
         $lines = if ($lines.Count -gt 1) { $lines[0..($lines.Count - 2)] } else { @() }
@@ -4181,7 +4244,7 @@ function Update-ItemTexts {
     $row.Cells[$script:ColSetting].ToolTipText = $tip
     $row.Cells[$script:ColWhat].ToolTipText    = $tip
     $row.Cells[$script:ColPolicy].ToolTipText  = $tip
-    $row.Cells[$script:ColState].ToolTipText   = (T 'tip.status')
+    $row.Cells[$script:ColState].ToolTipText   = (T $(if ($Item.Status -eq 'foreign') { 'tip.foreign' } else { 'tip.status' }))
     if ($Item.Kind -eq 'Policy' -and $Item.Def.Choices) {
         $cell = $row.Cells[$script:ColValue]
         Push-SuppressSelectionEvents
@@ -4203,11 +4266,12 @@ function Update-ItemView {
     $Item.Status = $state
     $cell = $row.Cells[$script:ColState]
     $cell.Value = T "state.$state"
+    $cell.ToolTipText = T $(if ($state -eq 'foreign') { 'tip.foreign' } else { 'tip.status' })
     switch ($state) {
         { $_ -in 'active', 'blocked' }                       { $cell.Style.ForeColor = $script:Clr.Green; $cell.Style.Font = Get-BfoUiFont -Size 9; break }
         { $_ -in 'willApply', 'willChange', 'willEnable', 'willBlock' } { $cell.Style.ForeColor = $script:Clr.Blue;  $cell.Style.Font = Get-BfoUiFont -Size 9 -Semibold; break }
         { $_ -in 'willRemove', 'willDisable', 'willUnblock' } { $cell.Style.ForeColor = $script:Clr.Red;   $cell.Style.Font = Get-BfoUiFont -Size 9 -Semibold; break }
-        'disabled'                                           { $cell.Style.ForeColor = $script:Clr.Amber;  $cell.Style.Font = Get-BfoUiFont -Size 9; break }
+        { $_ -in 'disabled', 'foreign' }                     { $cell.Style.ForeColor = $script:Clr.Amber;  $cell.Style.Font = Get-BfoUiFont -Size 9; break }
         default                                              { $cell.Style.ForeColor = $script:Clr.Mist;   $cell.Style.Font = Get-BfoUiFont -Size 9 }
     }
     if ($Item.Kind -eq 'Policy') {
