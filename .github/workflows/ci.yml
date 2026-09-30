@@ -5,10 +5,22 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs exactly this workflow before it publishes anything.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  powershell-validate:
-    name: PowerShell validation
+  # ---------------------------------------------------------------------------
+  # Static checks: everything that can be verified without running the app.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Static checks
     runs-on: windows-latest
 
     steps:
@@ -19,39 +31,29 @@ jobs:
       # This is the production runtime: Brave-Free-Origin.bat launches
       # powershell.exe, not pwsh. Anything that only works under PowerShell 7
       # is broken for every user, so 5.1 is validated first and in full.
-      - name: Parse application script (Windows PowerShell 5.1)
-        shell: powershell
-        run: |
-          $errors = $null
-          $tokens = $null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'Brave-Free-Origin.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors) {
-            $errors | Format-List *
-            exit 1
-          }
-          "Windows PowerShell $($PSVersionTable.PSVersion) parse OK"
-
-      - name: Parse tooling scripts (Windows PowerShell 5.1)
+      - name: Parse every PowerShell script (Windows PowerShell 5.1)
         shell: powershell
         run: |
           $failed = $false
-          foreach ($file in (Get-ChildItem 'tools' -Filter '*.ps1' -File)) {
+          $files = @('Brave-Free-Origin.ps1') + @(Get-ChildItem 'tools', 'install' -Filter '*.ps1' -File | ForEach-Object { $_.FullName })
+          foreach ($file in $files) {
             $errors = $null
             $tokens = $null
-            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-            if ($errors) { $errors | Format-List *; $failed = $true }
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { Write-Host "Parse errors in $file"; $errors | Format-List *; $failed = $true }
           }
           if ($failed) { exit 1 }
-          'Tooling parse OK'
+          "Windows PowerShell $($PSVersionTable.PSVersion): $($files.Count) scripts parse OK"
 
-      # Invoked exactly the way the docs tell a maintainer to invoke it: no
+      # Invoked the way the docs tell a maintainer to invoke it: no path
       # arguments. $PSScriptRoot is empty while param() defaults are evaluated
       # under 5.1, so a tool that only works with explicit paths would pass a
-      # pwsh-only CI and fail on a real machine.
-      - name: Validate locales (Windows PowerShell 5.1, no arguments)
+      # pwsh-only CI and fail on a real machine. -MinCoverage 95 means a shipped
+      # translation may miss at most a handful of strings (they fall back to English).
+      - name: Validate locales (Windows PowerShell 5.1, no path arguments)
         shell: powershell
         run: |
-          .\tools\Test-Locales.ps1
+          .\tools\Test-Locales.ps1 -MinCoverage 95
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check generated en-US.json (Windows PowerShell 5.1, no arguments)
@@ -66,26 +68,41 @@ jobs:
           }
           'en-US.json is current under Windows PowerShell 5.1'
 
+      # The policy reference is generated from the same catalog the app uses,
+      # so it can never describe something the app does not do.
+      - name: Check generated docs/POLICIES.md
+        shell: powershell
+        run: |
+          .\tools\Export-PolicyDocs.ps1
+          $diff = git diff --name-only -- 'docs/POLICIES.md'
+          if ($diff) {
+            git --no-pager diff --stat -- 'docs/POLICIES.md'
+            throw 'docs/POLICIES.md is out of date. Run tools\Export-PolicyDocs.ps1 and commit the result.'
+          }
+          'docs/POLICIES.md is current'
+
       # --- PowerShell 7 -----------------------------------------------------
       # Not the shipping runtime, but a cheap second opinion: it catches
       # constructs that changed meaning between hosts, and the exporter's
       # output must be byte-identical under both (hence the ordinal key sort).
-      - name: Parse application script (PowerShell 7)
+      - name: Parse every PowerShell script (PowerShell 7)
         shell: pwsh
         run: |
-          $errors = $null
-          $tokens = $null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'Brave-Free-Origin.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors) {
-            $errors | Format-List *
-            exit 1
+          $failed = $false
+          $files = @('Brave-Free-Origin.ps1') + @(Get-ChildItem 'tools', 'install' -Filter '*.ps1' -File | ForEach-Object { $_.FullName })
+          foreach ($file in $files) {
+            $errors = $null
+            $tokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { Write-Host "Parse errors in $file"; $errors | Format-List *; $failed = $true }
           }
-          "PowerShell $($PSVersionTable.PSVersion) parse OK"
+          if ($failed) { exit 1 }
+          "PowerShell $($PSVersionTable.PSVersion): $($files.Count) scripts parse OK"
 
       - name: Validate locales (PowerShell 7)
         shell: pwsh
         run: |
-          ./tools/Test-Locales.ps1 -MinCoverage 50
+          ./tools/Test-Locales.ps1 -MinCoverage 95
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check generated en-US.json is host-independent (PowerShell 7)
@@ -99,26 +116,30 @@ jobs:
           }
           'en-US.json is identical under PowerShell 7'
 
-      # --- Encoding and packaging guards ------------------------------------
+      # --- Encoding guards --------------------------------------------------
       # Windows PowerShell 5.1 decodes a BOM-less .ps1 with the system ANSI
       # code page. Any non-ASCII byte in the app would mojibake on machines
       # whose code page differs from the author's, so translated text must
-      # live in locales\*.json and this file must stay pure ASCII.
-      - name: Enforce ASCII-only application script
+      # live in locales\*.json and these files must stay pure ASCII. The
+      # one-line installer is also served over HTTP, where 5.1 guesses the
+      # charset, which is a second reason.
+      - name: Enforce ASCII-only PowerShell that end users run
         shell: pwsh
         run: |
-          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path 'Brave-Free-Origin.ps1'))
-          if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-            throw 'Brave-Free-Origin.ps1 has a UTF-8 BOM. It must be saved without one.'
-          }
-          $bad = @()
-          $line = 1
-          for ($i = 0; $i -lt $bytes.Length; $i++) {
-            if ($bytes[$i] -eq 0x0A) { $line++ }
-            elseif ($bytes[$i] -gt 127) { $bad += $line }
-          }
-          if ($bad.Count -gt 0) {
-            throw "Non-ASCII bytes in Brave-Free-Origin.ps1 at line(s): $(($bad | Select-Object -Unique -First 10) -join ', '). Put translated text in locales\*.json instead."
+          foreach ($file in @('Brave-Free-Origin.ps1', 'install/bfo.ps1')) {
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $file))
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+              throw "$file has a UTF-8 BOM. It must be saved without one."
+            }
+            $bad = @()
+            $line = 1
+            for ($i = 0; $i -lt $bytes.Length; $i++) {
+              if ($bytes[$i] -eq 0x0A) { $line++ }
+              elseif ($bytes[$i] -gt 127) { $bad += $line }
+            }
+            if ($bad.Count -gt 0) {
+              throw "Non-ASCII bytes in $file at line(s): $(($bad | Select-Object -Unique -First 10) -join ', '). Put translated text in locales\*.json instead."
+            }
           }
           'ASCII check OK'
 
@@ -150,57 +171,83 @@ jobs:
           if ($bat -notmatch 'Brave-Free-Origin\.ps1') { throw 'Launcher does not reference Brave-Free-Origin.ps1.' }
           'Launcher check OK'
 
-      # The portable zip is a build output, not a tracked source file. It is
-      # produced here and uploaded as an artifact / attached to a release.
-      # tools\ is maintainer-only and deliberately not shipped.
-      - name: Build portable zip
-        shell: pwsh
-        run: |
-          $out = 'Brave-Free-Origin.zip'
-          if (Test-Path $out) { Remove-Item $out -Force }
-          Compress-Archive -Path @(
-            'Brave-Free-Origin.bat',
-            'Brave-Free-Origin.ps1',
-            'README.md',
-            'README.zh-CN.md',
-            'TRANSLATING.md',
-            'LICENSE',
-            'images',
-            'locales'
-          ) -DestinationPath $out -Force
-          Get-FileHash $out -Algorithm SHA256 | Format-List
+  # ---------------------------------------------------------------------------
+  # Runs the whole app in its sandbox: policies go to a throw-away HKCU hive,
+  # the hosts file is a temp file, scheduled tasks and services are fakes, no
+  # UAC prompt and no real Brave install is touched. See tools\Test-App.ps1.
+  # ---------------------------------------------------------------------------
+  selftest:
+    name: App self-test (sandbox)
+    runs-on: windows-latest
 
-      - name: Verify portable zip contents
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run the sandboxed self-test (Windows PowerShell 5.1)
+        shell: powershell
+        env:
+          BFO_TEST_OUT: ${{ runner.temp }}\bfo-selftest
+        run: |
+          $settings = Join-Path $env:RUNNER_TEMP 'bfo-settings\settings.json'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Brave-Free-Origin.ps1 `
+            -Lang en-US -BfoSettingsPath $settings -SelfTest .\tools\Test-App.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-report
+          path: ${{ runner.temp }}\bfo-selftest
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # The one-line installer (irm https://xhydra.fr/bfo | iex), tested against a
+  # fake GitHub on loopback. No network, no UAC, no real install.
+  # ---------------------------------------------------------------------------
+  bootstrap:
+    name: One-line installer tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Installer tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          .\tools\Test-Bootstrap.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Installer tests (PowerShell 7)
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path 'Brave-Free-Origin.zip'))
-          $names = $zip.Entries.FullName
-          $zip.Dispose()
-          $required = @(
-            'Brave-Free-Origin.bat',
-            'Brave-Free-Origin.ps1',
-            'README.md',
-            'README.zh-CN.md',
-            'TRANSLATING.md',
-            'LICENSE',
-            'locales/en-US.json',
-            'locales/zh-CN.json',
-            'images/screenshot.png'
-          )
-          foreach ($needed in $required) {
-            if ($names -notcontains $needed -and $names -notcontains ($needed -replace '/', '\')) {
-              throw "$needed is missing from the portable zip."
-            }
-          }
-          # tools\ is for maintainers; shipping it would imply it is supported.
-          foreach ($name in $names) {
-            if ($name -match '^tools[\\/]') { throw "tools\ must not be shipped in the portable zip ($name)." }
-          }
-          "Portable zip contents OK ($($names.Count) entries)"
+          ./tools/Test-Bootstrap.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # ---------------------------------------------------------------------------
+  # The portable zip is a build output, not a tracked source file.
+  # tools\Build-Package.ps1 decides what ships and verifies it; the release
+  # workflow calls the same script.
+  # ---------------------------------------------------------------------------
+  package:
+    name: Build portable zip
+    runs-on: windows-latest
+    needs: [validate, selftest, bootstrap]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and verify the zip
+        shell: pwsh
+        run: ./tools/Build-Package.ps1
 
       - name: Upload portable zip
         uses: actions/upload-artifact@v4
         with:
           name: Brave-Free-Origin
-          path: Brave-Free-Origin.zip
+          path: |
+            Brave-Free-Origin.zip
+            SHA256SUMS.txt

@@ -14,6 +14,7 @@
       * meta block present with locale / name / englishName
       * meta.locale matches the file name
       * meta.reviewed is a boolean, meta.translators is an array of strings
+      * meta.direction, when present, is "ltr" or "rtl" (Arabic ships "rtl")
       * every value is a string
       * no unknown keys (a typo must fail, not silently do nothing)
       * no duplicate keys, detected by walking the JSON rather than by
@@ -197,7 +198,7 @@ Write-Host "Embedded English catalog: $($english.Count) keys."
 # Every key the app asks for at runtime must exist in English.
 $sourceText = Get-Content $ScriptPath -Raw
 $referenced = @{}
-foreach ($m in [regex]::Matches($sourceText, "(?:\bT\s+|Set-Loc(?:Tooltip)?\s+\`$[^\s]+\s+|Set-FlowTabTitleKey\s+\`$[^\s]+\s+|(?:Label|Name|Description)Key=)'([a-z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)+)'")) {
+foreach ($m in [regex]::Matches($sourceText, "(?:\bT\s+|Set-Loc(?:Tooltip)?\s+\`$[^\s]+\s+|Set-FlowTabTitleKey\s+\`$[^\s]+\s+|(?:Label|Name|Description)Key\s*=\s*)'([a-z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+)+)'")) {
     $referenced[$m.Groups[1].Value] = $true
 }
 foreach ($key in $referenced.Keys) {
@@ -240,6 +241,9 @@ foreach ($file in $files) {
         Add-Failure "$code : meta.locale is '$($doc.meta.locale)' but the file is named $($file.Name)."
     }
     $metaNames = @($doc.meta.PSObject.Properties.Name)
+    if ($metaNames -contains 'direction' -and "$($doc.meta.direction)" -notin @('ltr', 'rtl')) {
+        Add-Failure "$code : meta.direction must be 'ltr' or 'rtl'."
+    }
     if ($metaNames -contains 'reviewed' -and $doc.meta.reviewed -isnot [bool]) {
         Add-Failure "$code : meta.reviewed must be true or false, not a string."
     }

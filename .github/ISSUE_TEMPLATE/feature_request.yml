@@ -1,0 +1,32 @@
+name: Feature request or new Brave policy
+description: Suggest a setting, a preset change or an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: For a new setting, name the Brave policy if you know it (see brave://policy, "Show policies with no value set") and what it should do in plain words.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: What problem does it solve for you?
+    validations:
+      required: false
+  - type: input
+    id: brave-version
+    attributes:
+      label: Brave version you checked it on
+      placeholder: "Brave 154.1.96.59"
+    validations:
+      required: false
+  - type: textarea
+    id: risk
+    attributes:
+      label: Could it surprise someone?
+      description: If ticking it could remove something people rely on, describe it. It decides the row's risk level.
+    validations:
+      required: false

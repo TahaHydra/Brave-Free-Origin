@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Read the FAQ first
+    url: https://github.com/TahaHydra/Brave-Free-Origin#faq
+    about: "Managed by your organization", antivirus warnings, SmartScreen and "nothing changed" are answered there.
+  - name: Project page
+    url: https://xhydra.fr/products/brave-free-origin
+    about: Overview, downloads and documentation.
