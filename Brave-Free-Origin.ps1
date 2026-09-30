@@ -2106,7 +2106,7 @@ function New-BfoItem {
     param([string]$Kind, [string]$Id, [string]$Page, $Def)
     $item = [pscustomobject]@{
         Kind = $Kind; Id = $Id; Page = $Page; Def = $Def
-        Checked = $false; Value = $null; Baseline = $null; Loaded = $false; Detail = $null
+        Checked = $false; Value = $null; Baseline = $null; BaselineValue = $null; Loaded = $false; Detail = $null
         Row = $null; Status = ''
     }
     if ($Def -and $Def.ContainsKey('Value')) { $item.Value = $Def.Value }
@@ -2343,8 +2343,16 @@ function Get-RegistryOps {
             # unticked by the user or a preset. A foreign value that never matched this row starts unticked and stays
             # untouched. Search/New Tab/startup overrides have explicit toggles, so disabling one is always deliberate.
             $override = ($script:OverridePolicyNames -contains $name)
+            $overrideRemoval = $false
+            if ($override) {
+                $group = @($script:OverrideGroups | Where-Object { $_.Names -contains $name } | Select-Object -First 1)
+                if ($group.Count -gt 0) {
+                    $toggle = $group[0].Toggle
+                    $overrideRemoval = [bool]$script:OverrideBaseline[$toggle].Enabled -and -not [bool]$script:Overrides[$toggle].Enabled
+                }
+            }
             $item = Get-BfoItem 'Policy' $name
-            $explicitRemoval = $override -or ($item -and $item.Loaded -and $item.Baseline -and -not $item.Checked)
+            $explicitRemoval = $overrideRemoval -or ($item -and $item.Loaded -and $item.Baseline -and -not $item.Checked)
             $action = if ($owned -or $explicitRemoval) { 'Clear' } else { 'Leave' }
             [void]$ops.Add([pscustomobject]@{
                 Path = $script:PolicyKeyPath; Action = $action; Name = $name
@@ -2798,6 +2806,7 @@ function Import-CurrentPolicyState {
             Set-ItemChecked $item ($has -and "$($snap.Values[$item.Id])" -eq "$($item.Def.Value)")
         }
         $item.Baseline = [bool]$item.Checked
+        $item.BaselineValue = $item.Value
         $item.Loaded = $true
     }
 
@@ -5867,6 +5876,10 @@ function Sync-KeptExistingToUi {
         $item = Get-BfoItem 'Policy' $name
         if ($item) {
             $target = [bool]$item.Baseline
+            if ($item.Def.Choices -and $null -ne $item.BaselineValue -and "$($item.Value)" -ne "$($item.BaselineValue)") {
+                $item.Value = $item.BaselineValue
+                $changed = $true
+            }
             if ($item.Checked -ne $target) {
                 Set-ItemChecked $item $target
                 $changed = $true
