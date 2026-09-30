@@ -2939,6 +2939,11 @@ function New-ApplyPlanReport {
     [void]$r.AppendLine("Policy key: $($script:PolicyKeyPath)  (shared by every Brave channel)")
     [void]$r.AppendLine('')
     [void]$r.AppendLine('This is a dry run. Nothing has been written.')
+    $dataRisk = @(Get-DataRiskOps $Plan)
+    if ($dataRisk.Count -gt 0) {
+        [void]$r.AppendLine('WARNING: the following selected settings can delete browser data or saved customization:')
+        foreach ($op in $dataRisk) { [void]$r.AppendLine("  ! $($op.Name)") }
+    }
     [void]$r.AppendLine('')
     $elsewhere = switch ($script:ExistingMode) {
         'replace' { '  - set elsewhere; replaced without asking (your preference)' }
