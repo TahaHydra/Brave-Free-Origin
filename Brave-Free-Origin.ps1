@@ -2271,45 +2271,18 @@ function Get-DesiredPolicyMap {
     return [pscustomobject]@{ Values = $map; Urls = $ov.Urls; HasStartupOverride = $script:Overrides.Startup.Enabled }
 }
 
-# Ownership. A value in the shared Brave policy key can come from this tool, an administrator, Group Policy or another
-# tool, and the registry does not say which. A value counts as this tool's own if it is one it could have written: a
-# name only older versions used, a value the ledger says was written here, a catalog name holding the same kind of data
-# with a value from the catalog (any choice, or a value an older version wrote), or a value one of the search / New Tab /
-# startup choices produces. Anything else - for example BrowserSignin = 1 set by an administrator - is not touched by
-# Apply and Restore stock without asking. A value identical to what this tool writes cannot be told apart from its own;
-# that is the one unavoidable ambiguity.
+# Ownership is deliberately conservative. The registry does not record who created a policy, so BFO only treats a
+# current policy as its own when its per-user ledger records that exact value (or when the name is a legacy BFO-only
+# cleanup value from older releases). Merely looking like a value BFO could write is not proof of ownership.
+#
+# This means the first 2.x run after an older release may ask once about policies that older BFO versions set. That is
+# intentional: when there is doubt, the user decides. After BFO writes a value it is recorded and future changes to it
+# do not prompt again unless something else changes the value.
 function Test-OwnedPolicyValue {
-    # Siblings: the other values of the key. A custom search engine written by versions before 2.0 (which remembered
-    # nothing) is recognised by the name and keyword this tool always gave it.
     param([string]$Name, $Value, [string]$Kind, $Siblings = $null)
     if ($script:LegacyPolicyNames -contains $Name) { return $true }
     $text = "$Value"
-    if ($script:AppliedLedger.ContainsKey($Name) -and $script:AppliedLedger[$Name] -eq $text) { return $true }
-    $kindIs = { param([string]$type) (-not $Kind) -or ($Kind -eq $(if ($type -eq 'DWORD') { 'DWord' } else { 'String' })) }
-
-    $def = $script:PolicyByName[$Name]
-    if ($def -and (& $kindIs $def.Type)) {
-        # @( ) around the whole if: a one-element result would otherwise be unrolled to a scalar and += would fail.
-        $known = @(if ($def.Choices) { $def.Choices.Values } else { $def.Value })
-        if ($script:LegacyPolicyValues.ContainsKey($Name)) { $known += $script:LegacyPolicyValues[$Name] }
-        if (@($known | Where-Object { "$_" -eq $text }).Count -gt 0) { return $true }
-    }
-
-    $engines = @($script:SearchEngines.Values | Where-Object { -not $_.IsCustom })
-    $customEngine = ($Siblings -and ("$($Siblings['DefaultSearchProviderName'])" -eq 'Custom Search') -and ("$($Siblings['DefaultSearchProviderKeyword'])" -eq 'custom'))
-    switch ($Name) {
-        'DefaultSearchProviderEnabled'    { return ((& $kindIs 'DWORD') -and ($text -eq '1')) }
-        'DefaultSearchProviderName'       { return ((& $kindIs 'STRING') -and ((@($engines | ForEach-Object { $_.ProviderName }) + 'Custom Search') -contains $text)) }
-        'DefaultSearchProviderKeyword'    { return ((& $kindIs 'STRING') -and ((@($engines | ForEach-Object { $_.Keyword }) + 'custom') -contains $text)) }
-        'DefaultSearchProviderSearchURL'  { return ((& $kindIs 'STRING') -and ($customEngine -or (@($engines | ForEach-Object { $_.URL }) -contains $text))) }
-        'DefaultSearchProviderSuggestURL' { return ((& $kindIs 'STRING') -and (@($engines | ForEach-Object { $_.Suggest }) -contains $text)) }
-        'NewTabPageLocation' {
-            $homes = @($engines | ForEach-Object { $_.Home }) + @($script:DestinationOptions.Values | ForEach-Object { $_.Value })
-            return ((& $kindIs 'STRING') -and ($homes -contains $text))
-        }
-        'RestoreOnStartup' { return ((& $kindIs 'DWORD') -and (@($script:StartupModes.Values | ForEach-Object { "$($_.Code)" }) -contains $text)) }
-    }
-    return $false
+    return ($script:AppliedLedger.ContainsKey($Name) -and $script:AppliedLedger[$Name] -eq $text)
 }
 
 function Get-ManagedPolicyNames {
@@ -2358,8 +2331,9 @@ function Get-StartupUrlOp {
     $have = @($Snapshot.Urls)
     if (-not $Desired.HasStartupOverride) { $want = @() }
     if (($want -join "`n") -eq ($have -join "`n")) { return $null }
-    # The existing list is ours if it is empty, is the blank page, or is what the ledger says was written here.
-    $owned = ($have.Count -eq 0) -or (($have -join "`n") -eq ($script:AppliedUrls -join "`n")) -or (($have.Count -eq 1) -and ($have[0] -eq 'about:blank'))
+    # Existing startup URLs are ours only when the ledger records that exact list. A familiar-looking URL is not proof
+    # that BFO created it; when in doubt Apply asks before replacing or removing it.
+    $owned = ($have.Count -eq 0) -or (($script:AppliedUrls.Count -gt 0) -and (($have -join "`n") -eq ($script:AppliedUrls -join "`n")))
     return [pscustomobject]@{ Path = (Join-Path $script:PolicyKeyPath 'RestoreOnStartupURLs'); Want = $want; Have = $have; Foreign = (-not $owned) }
 }
 
@@ -5840,6 +5814,40 @@ function Update-Chrome {
     Update-ModeInfo
 }
 
+# When the user chooses to keep an existing setting in the Apply conflict dialog, make the main UI match that
+# decision immediately. Otherwise a kept policy would remain ticked and look as if BFO still intended to replace it
+# the next time Apply is pressed.
+function Sync-KeptExistingToUi {
+    param([string[]]$KeepNames)
+    $KeepNames = @($KeepNames | Where-Object { $_ } | Select-Object -Unique)
+    if ($KeepNames.Count -eq 0) { return }
+
+    $changed = $false
+    foreach ($name in $KeepNames) {
+        $item = Get-BfoItem 'Policy' $name
+        if ($item -and $item.Checked) {
+            Set-ItemChecked $item $false
+            $changed = $true
+        }
+    }
+    foreach ($g in $script:OverrideGroups) {
+        if (@($g.Names | Where-Object { $KeepNames -contains $_ }).Count -eq 0) { continue }
+        if ($script:Overrides[$g.Toggle].Enabled) {
+            $script:Overrides[$g.Toggle].Enabled = $false
+            $changed = $true
+        }
+    }
+
+    if ($changed) {
+        $script:ActiveProfile = 'Custom'
+        Push-SuppressSelectionEvents
+        try { Sync-OverrideControls } finally { Pop-SuppressSelectionEvents }
+        Update-AllItemViews
+        Update-Filter
+        Update-Chrome
+    }
+}
+
 function Update-BraveInfo {
     $info = Get-BraveInfo (Get-PrimaryChannel)
     if ($info.Installed) {
@@ -5925,6 +5933,7 @@ function Invoke-ApplyAction {
         }
         if ($keep.Count -gt 0) {
             $keptEntries = @($conflicts | Where-Object { @($_.Names | Where-Object { $keep -contains $_ }).Count -gt 0 }).Count
+            Sync-KeptExistingToUi -KeepNames $keep
             try { $plan = New-ApplyPlan -KeepNames $keep }
             catch { [void](Show-Message -Text $_.Exception.Message -Title (T 'msg.title.error') -Icon 'Warning'); Select-NavPage 'overrides'; return }
             Write-Log ("Kept {0} setting(s) that were set elsewhere." -f $keptEntries) 'INFO'
@@ -6249,7 +6258,11 @@ $form.Add_KeyDown({
     if ($_.KeyCode -eq [System.Windows.Forms.Keys]::F1) { Invoke-Guarded 'Help' { Show-HelpDialog }; $_.Handled = $true }
     elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::F) { $script:TxtFilter.Focus(); $script:TxtFilter.SelectAll(); $_.Handled = $true }
 })
-$form.Add_FormClosing({ Remove-TempShortcuts })
+$form.Add_FormClosing({
+    param($sender, $e)
+    Write-Log ("Main window closing. Reason: {0}" -f $e.CloseReason) 'INFO'
+    Remove-TempShortcuts
+})
 $form.Add_SizeChanged({
     # Copy the keys first: assigning to a hashtable while enumerating its own Keys throws "Collection was modified".
     foreach ($k in @($script:GridsDirty.Keys)) { $script:GridsDirty[$k] = $true }
@@ -6288,5 +6301,7 @@ if ($script:SelfTestMode) {
     Remove-TempShortcuts
     exit $script:SelfTestExit
 }
-[void]$form.ShowDialog()
+# This is the application's main window, not a child dialog. Application.Run owns the message loop and remains stable
+# if WinForms recreates the form handle (notably when live-switching into or out of an RTL language).
+[System.Windows.Forms.Application]::Run($form)
 #endregion
