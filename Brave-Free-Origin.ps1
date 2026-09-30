@@ -2856,7 +2856,10 @@ function Get-ItemState {
             $has = ($snap -and $snap.Values.ContainsKey($Item.Id))
             if ($Item.Checked) {
                 if (-not $has) { return 'willApply' }
-                if ("$($snap.Values[$Item.Id])" -eq "$($Item.Value)" -and $snap.Kinds[$Item.Id] -eq $(if ($Item.Def.Type -eq 'DWORD') { 'DWord' } else { 'String' })) { return 'active' }
+                if ("$($snap.Values[$Item.Id])" -eq "$($Item.Value)" -and $snap.Kinds[$Item.Id] -eq $(if ($Item.Def.Type -eq 'DWORD') { 'DWord' } else { 'String' })) {
+                    if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'active' }
+                    return 'foreign'
+                }
                 if (Test-OwnedPolicyValue -Name $Item.Id -Value $snap.Values[$Item.Id] -Kind $snap.Kinds[$Item.Id]) { return 'willChange' }
                 # Someone else's value: Apply asks before replacing it (or leaves it, if the preference is to keep such settings).
                 return $(if ($script:ExistingMode -eq 'keep') { 'foreign' } else { 'willReplace' })
