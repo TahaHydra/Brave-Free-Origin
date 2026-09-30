@@ -276,11 +276,11 @@ Test-Case 'registry: a known policy that someone else set to a different value i
     New-Item -Path $script:PolicyKeyPath -Force | Out-Null
     New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BrowserSignin' -Value 1 -PropertyType DWord | Out-Null                    # the catalog writes 0
     New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'HardwareAccelerationModeEnabled' -Value 7 -PropertyType DWord | Out-Null   # not one of our two choices
-    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveWalletDisabled' -Value 1 -PropertyType DWord | Out-Null              # identical to ours: treated as ours
+    New-ItemProperty -LiteralPath $script:PolicyKeyPath -Name 'BraveWalletDisabled' -Value 1 -PropertyType DWord | Out-Null              # identical to a value BFO can write, but not in the ledger
     Invoke-LoadCurrentState
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'foreign') 'a different value should show as Set elsewhere'
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'HardwareAccelerationModeEnabled')) -eq 'foreign') 'a value outside our choices should show as Set elsewhere'
-    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveWalletDisabled')) -eq 'active') 'an identical value is ours and shows as Active'
+    Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BraveWalletDisabled')) -eq 'foreign') 'a matching value without ledger ownership should still show Set elsewhere'
     $plan = New-ApplyPlan
     Assert (($plan.Counts.Leave -eq 2) -and ($plan.Counts.Clear -eq 0)) "expected 2 Leave and 0 Clear, got $($plan.Counts.Leave) / $($plan.Counts.Clear)"
     Assert (-not (Test-PlanHasChanges $plan)) 'leaving other people''s values alone must not count as a pending change'
@@ -289,13 +289,12 @@ Test-Case 'registry: a known policy that someone else set to a different value i
     $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
     Assert (($snap.Values['BrowserSignin'] -eq 1) -and ($snap.Values['HardwareAccelerationModeEnabled'] -eq 7)) 'Apply removed a value that was not ours'
     $foreign = Get-ForeignPolicyValues
-    Assert (($foreign.Values -contains 'BrowserSignin') -and ($foreign.Values -contains 'HardwareAccelerationModeEnabled') -and ($foreign.Values -notcontains 'BraveWalletDisabled')) 'the foreign list is wrong'
+    Assert (($foreign.Values -contains 'BrowserSignin') -and ($foreign.Values -contains 'HardwareAccelerationModeEnabled') -and ($foreign.Values -contains 'BraveWalletDisabled')) 'the foreign list is wrong'
     Assert ((New-VerifyReport) -match 'BrowserSignin') 'Verify does not list the value it leaves alone'
     $fail = @(Invoke-FullRestore -RemoveForeign $false)
     Assert ($fail.Count -eq 0) "restore failures: $($fail -join '; ')"
     $snap = Read-PolicySnapshot -Path $script:PolicyKeyPath
-    Assert ($snap.Values.ContainsKey('BrowserSignin') -and $snap.Values.ContainsKey('HardwareAccelerationModeEnabled')) 'Restore removed a value that was not ours'
-    Assert (-not $snap.Values.ContainsKey('BraveWalletDisabled')) 'Restore left our own value behind'
+    Assert ($snap.Values.ContainsKey('BrowserSignin') -and $snap.Values.ContainsKey('HardwareAccelerationModeEnabled') -and $snap.Values.ContainsKey('BraveWalletDisabled')) 'Restore removed a value that was not recorded as ours'
     # ticking the row is an explicit request to replace it
     Set-ItemChecked (Get-BfoItem 'Policy' 'BrowserSignin') $true
     Assert ((Get-ItemState (Get-BfoItem 'Policy' 'BrowserSignin')) -eq 'willReplace') 'ticking should offer to replace the other value (after asking)'
@@ -678,6 +677,9 @@ Test-Case 'existing settings: Cancel changes nothing; Keep changes nothing and s
     Assert (@($script:SelfTestDialogs | Where-Object { $_[1] -eq (T 'msg.apply.allKept') }).Count -ge 1) 'Keep did not say that nothing was changed'
     Assert ($null -eq $script:SelfTestLastResult) 'nothing was applied, so there is no result'
     Assert ($script:ExistingMode -eq 'ask') 'a single Keep must not become a standing preference'
+    Assert (-not (Get-BfoItem 'Policy' 'BrowserSignin').Checked) 'keeping BrowserSignin should untick it in the main UI'
+    Assert (-not $script:Overrides.Search.Enabled) 'keeping the existing search engine should turn off BFO''s search override'
+    Assert ($script:ActiveProfile -eq 'Custom') 'keeping existing settings should make the visible selection Custom'
 }
 Test-Case 'existing settings: untick one to keep just that one; replace does the rest and reports both' {
     Set-ExistingScenario
@@ -735,7 +737,7 @@ Test-Case 'existing settings: a custom search address typed in this app is ours 
     $c = @(Get-PolicyConflicts (New-ApplyPlan))
     Assert (($c.Count -eq 1) -and ($c[0].Key -eq 'search') -and ($null -eq $c[0].Wants)) 'an engine set elsewhere should be listed as a removal'
 }
-Test-Case 'existing settings: a custom search engine written by an older version (nothing remembered) is recognised as ours' {
+Test-Case 'existing settings: a pre-2.0 search engine with no ledger is treated as existing state and asked about once' {
     Reset-Sandbox
     $script:ChkBackup.Checked = $false
     $key = $script:PolicyKeyPath
@@ -745,11 +747,13 @@ Test-Case 'existing settings: a custom search engine written by an older version
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderKeyword' -Value 'custom' -PropertyType String | Out-Null
     New-ItemProperty -LiteralPath $key -Name 'DefaultSearchProviderSearchURL' -Value 'https://my-searx.example/search?q={searchTerms}' -PropertyType String | Out-Null
     $script:Snapshot = Read-PolicySnapshot -Path $key
-    Assert (@(Get-PolicyConflicts (New-ApplyPlan)).Count -eq 0) 'an older custom engine should not be asked about'
-    Assert (@(@((Get-ForeignPolicyValues).Values) | Where-Object { $_ -like 'DefaultSearchProvider*' }).Count -eq 0) 'an older custom engine must not be called foreign'
-    Invoke-ApplyAction                   # the search override is off, so the engine is removed - it is ours, so without a question
-    Assert ($script:SelfTestExistingDialogs.Count -eq 0) 'removing our own older custom engine should not ask'
-    Assert ($null -eq (Get-PolicyNow 'DefaultSearchProviderSearchURL')) 'the older custom engine was not removed'
+    $conflicts = @(Get-PolicyConflicts (New-ApplyPlan))
+    Assert (($conflicts.Count -eq 1) -and ($conflicts[0].Key -eq 'search')) 'an unrecorded existing search engine should be asked about'
+    Assert (@(@((Get-ForeignPolicyValues).Values) | Where-Object { $_ -like 'DefaultSearchProvider*' }).Count -gt 0) 'the unrecorded search engine should be treated as external state'
+    $script:SelfTestExistingAnswers.Enqueue('Keep')
+    Invoke-ApplyAction
+    Assert ($script:SelfTestExistingDialogs.Count -eq 1) 'the existing search engine was not shown to the user'
+    Assert ((Get-PolicyNow 'DefaultSearchProviderSearchURL') -eq 'https://my-searx.example/search?q={searchTerms}') 'Keep changed the existing search engine'
 }
 Test-Case 'existing settings: a list of startup pages set elsewhere is asked about, kept whole or removed whole' {
     Reset-Sandbox
