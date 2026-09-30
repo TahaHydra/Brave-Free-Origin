@@ -926,7 +926,7 @@ Add-Strings @{
     'existing.remove'        = '(remove it)'
     'existing.replace'       = 'Apply selected changes'
     'existing.title'         = 'Review existing settings'
-    'msg.dataRisk.body'       = "Some selected settings can delete browser data or saved customization:\r\n\r\n{0}\r\n\r\nThis can sign you out of websites or permanently remove saved browser customization.\r\n\r\nYes = apply them. No = unselect these risky settings and continue with everything else. Cancel = stop."
+    'msg.dataRisk.body'       = "Some selected settings can delete browser data or saved customization:`r`n`r`n{0}`r`n`r`nThis can sign you out of websites or permanently remove saved browser customization.`r`n`r`nYes = apply them. No = unselect these risky settings and continue with everything else. Cancel = stop."
     'msg.dataRisk.onlySkipped'= 'Those data-risk settings were unselected. There is nothing else to apply.'
     'msg.title.dataRisk'      = 'Possible data loss'
 }
